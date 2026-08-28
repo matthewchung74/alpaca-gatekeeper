@@ -10,7 +10,7 @@ material here — they are specific, verifiable, and useful to anyone else build
 
 ---
 
-## Post 1 — the thesis (post today)
+## Post 1 — the thesis · SHELF-STABLE (describes 09:45 ET Fri 28)
 
 **Screenshot:** the gate log refusing to trade before kickoff.
 
@@ -46,7 +46,7 @@ material here — they are specific, verifiable, and useful to anyone else build
 
 ---
 
-## Post 2 — the API bug (post today or Saturday)
+## Post 2 — the API bug · SHELF-STABLE (describes experiments run Fri 28)
 
 **Screenshot:** the three-line experiment table.
 
@@ -94,9 +94,16 @@ material here — they are specific, verifiable, and useful to anyone else build
 
 ---
 
-## Post 3 — the agent surprises you (post Monday/Tuesday)
+## Post 3 — the agent surprises you · PERISHABLE (describes a LIVE position)
 
 **Screenshot:** the decision log entry with the condor reasoning.
+
+> ⚠️ **This one has a shelf life.** It describes the 767/762 put and 774/778 call
+> spreads while they are still open. Check the dashboard before publishing. If the
+> position has been stopped out, do not post this as written — post the honest
+> version instead, which is a better story anyway: *"the condor I showed you got
+> stopped on Monday; here is exactly which rule fired and what it cost."*
+> Everything in posts 1, 2 and 4 stays true regardless of P&L.
 
 ### X
 
@@ -133,7 +140,7 @@ material here — they are specific, verifiable, and useful to anyone else build
 
 ---
 
-## Post 4 — the grounding problem (post Tuesday/Wednesday)
+## Post 4 — the grounding problem · SHELF-STABLE (describes the fix made Thu 27)
 
 **Screenshot:** before/after reasoning, side by side.
 
@@ -176,7 +183,7 @@ material here — they are specific, verifiable, and useful to anyone else build
 
 ---
 
-## Post 5 — results (post Thursday evening / Friday)
+## Post 5 — results · WRITE AFTER THE FACT (blanks are deliberate)
 
 **Screenshot:** the equity curve and closed-position table.
 **Fill in the real numbers before posting. Do not pre-write the outcome.**
@@ -217,8 +224,16 @@ material here — they are specific, verifiable, and useful to anyone else build
 
 ## Notes
 
+- **Shelf-stable vs perishable.** Posts 1, 2 and 4 describe gates, bugs and fixes —
+  they remain true whatever the P&L does. Post 3 describes an open position and can
+  be overtaken by the market. Publish the shelf-stable ones early and freely;
+  re-check the dashboard before publishing post 3.
 - Posts 2 and 4 are the strongest. Both are genuine setbacks with reproducible evidence, which is
   what the event explicitly asked for and what other builders will actually find useful.
 - Attach a screenshot to every one. The gate log and the decision log are unusually legible.
 - Put links in a comment rather than the post body on LinkedIn — link posts get throttled.
 - Post 5 has deliberate blanks. Fill them with real numbers; do not pre-write the result.
+- Suggested order, front-loaded because engagement compounds: **1 and 2 today**
+  (they have the longest runway and the least risk of going stale), **3 today or
+  tomorrow while the position is intact**, 4 midweek, 5 after the Sep-3 expiry
+  settles.
