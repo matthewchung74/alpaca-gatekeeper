@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alpaca AI Trading Agent</title>
+<style>
+:root{
+  --surface:#fcfcfb; --plane:#f9f9f7;
+  --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --axis:#c3c2b7; --ring:rgba(11,11,11,.10);
+  --series:#2a78d6;
+  --good:#0ca30c; --warn:#fab219; --crit:#d03b3b; --good-text:#006300;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --surface:#1a1a19; --plane:#0d0d0d;
+    --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
+    --series:#3987e5;
+    --good:#0ca30c; --warn:#fab219; --crit:#e66767; --good-text:#0ca30c;
+  }
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--plane); color:var(--ink);
+  font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  font-variant-numeric:tabular-nums;
+}
+.wrap{max-width:1140px;margin:0 auto;padding:28px 20px 72px}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;margin-bottom:6px}
+h1{font-size:19px;margin:0;letter-spacing:-.01em}
+h2{font-size:13px;margin:0 0 12px;color:var(--ink-2);text-transform:uppercase;letter-spacing:.07em;font-weight:600}
+.sub{color:var(--muted);font-size:13px}
+.card{background:var(--surface);border:1px solid var(--ring);border-radius:10px;padding:18px 20px;margin-bottom:18px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:14px;margin-bottom:18px}
+.tile{background:var(--surface);border:1px solid var(--ring);border-radius:10px;padding:14px 16px}
+.tile .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.tile .v{font-size:26px;font-weight:650;letter-spacing:-.02em;margin-top:4px}
+.tile .n{font-size:12px;color:var(--muted);margin-top:2px}
+.up{color:var(--good-text)} .down{color:var(--crit)}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{text-align:left;color:var(--muted);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;padding:0 10px 8px 0;border-bottom:1px solid var(--grid)}
+td{padding:9px 10px 9px 0;border-bottom:1px solid var(--grid)}
+tr:last-child td{border-bottom:none}
+.scroll{overflow-x:auto}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:99px;border:1px solid var(--ring);color:var(--ink-2);white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:99px;flex:none}
+.cycle{border-bottom:1px solid var(--grid);padding:15px 0}
+.cycle:last-child{border-bottom:none}
+.cycle .top{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:7px}
+.ts{color:var(--muted);font-size:12.5px}
+.reason{color:var(--ink-2);font-size:13.5px;margin:7px 0 10px;max-width:78ch;white-space:pre-wrap}
+.gates{display:flex;flex-wrap:wrap;gap:5px}
+.gate{font-size:11px;padding:2px 7px;border-radius:5px;border:1px solid var(--ring);color:var(--ink-2);display:inline-flex;gap:4px;align-items:center}
+.gate.block{border-color:var(--crit);color:var(--crit);font-weight:600}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.empty{color:var(--muted);font-style:italic;padding:10px 0}
+figure{margin:0}
+figcaption{color:var(--muted);font-size:12px;margin-top:8px}
+#tip{position:fixed;pointer-events:none;opacity:0;transition:opacity .1s;background:var(--surface);border:1px solid var(--ring);border-radius:7px;padding:7px 10px;font-size:12.5px;box-shadow:0 4px 14px rgba(0,0,0,.13);z-index:9}
+.note{color:var(--muted);font-size:12.5px;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Alpaca AI Trading Agent</h1>
+    <span class="sub" id="hdr"></span>
+  </header>
+  <p class="sub" id="sub"></p>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section class="card">
+    <h2>Account equity</h2>
+    <figure>
+      <svg id="chart" width="100%" height="240" role="img" aria-label="Account equity over time"></svg>
+      <figcaption id="cap"></figcaption>
+    </figure>
+  </section>
+
+  <section class="card">
+    <h2>Open positions</h2>
+    <div class="scroll"><table id="open"></table></div>
+  </section>
+
+  <section class="card">
+    <h2>Closed positions</h2>
+    <div class="scroll"><table id="closed"></table></div>
+  </section>
+
+  <section class="card">
+    <h2>Risk gates that stopped a trade</h2>
+    <div class="scroll"><table id="trips"></table></div>
+    <p class="note">Gates run in deterministic Python after every proposal. The model cannot reach or override them.</p>
+  </section>
+
+  <section class="card">
+    <h2>Regime policy</h2>
+    <div class="scroll"><table id="policy"></table></div>
+    <p class="note">The agent's own market read sets its risk budget and forbids directions. A regime can only reduce risk, never raise it above the base budget.</p>
+  </section>
+
+  <section class="card">
+    <h2>Decision log</h2>
+    <div id="cycles"></div>
+  </section>
+</div>
+<div id="tip" role="status"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const money = n => (n<0?"-":"")+"$"+Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0});
+const money2 = n => (n<0?"-":"")+"$"+Math.abs(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+const pct = n => (n*100).toFixed(2)+"%";
+const sgn = n => (n>=0?"+":"")+money(n);
+const esc = s => String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const cls = n => n>0?"up":n<0?"down":"";
+const time = t => new Date(t).toLocaleString(undefined,{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+
+const REGIME_DOT = {bull:"var(--good)", bear:"var(--crit)", sideways:"var(--warn)"};
+
+function tiles(d){
+  const t = [
+    ["Equity", money2(d.equity), "started at "+money(d.starting_equity)],
+    ["Total P&L", sgn(d.total_pnl), pct(d.total_pnl/d.starting_equity), cls(d.total_pnl)],
+    ["Today", sgn(d.day_pnl), "from "+money(d.day_start_equity), cls(d.day_pnl)],
+    ["Realized", sgn(d.realized_pnl), d.closed_spreads.length+" closed", cls(d.realized_pnl)],
+    ["Win rate", d.win_rate===null?"--":pct(d.win_rate), d.closed_spreads.length? d.closed_spreads.length+" trades":"no trades yet"],
+  ];
+  $("#tiles").innerHTML = t.map(([k,v,n,c])=>
+    `<div class="tile"><div class="k">${k}</div><div class="v ${c||""}">${v}</div><div class="n">${esc(n)}</div></div>`).join("");
+}
+
+function chart(curve){
+  const svg = $("#chart"), W = svg.clientWidth || 900, H = 240;
+  const m = {t:14,r:16,b:26,l:62};
+  svg.setAttribute("viewBox",`0 0 ${W} ${H}`);
+  if(curve.length < 2){
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="var(--muted)" font-size="13">Not enough marks yet -- the curve appears once the agent has run a few cycles.</text>`;
+    $("#cap").textContent = ""; return;
+  }
+  const ys = curve.map(p=>p.equity);
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  const pad = (hi-lo)*0.15 || Math.max(1, hi*0.001);
+  lo -= pad; hi += pad;
+  const X = i => m.l + i*(W-m.l-m.r)/(curve.length-1);
+  const Y = v => m.t + (hi-v)*(H-m.t-m.b)/(hi-lo);
+
+  // Recessive grid, 4 steps, with the starting equity called out as the baseline.
+  let g = "";
+  for(let i=0;i<=4;i++){
+    const v = lo+(hi-lo)*i/4, y = Y(v);
+    g += `<line x1="${m.l}" y1="${y}" x2="${W-m.r}" y2="${y}" stroke="var(--grid)" stroke-width="1"/>`
+       + `<text x="${m.l-9}" y="${y+4}" text-anchor="end" fill="var(--muted)" font-size="11">${money(v)}</text>`;
+  }
+  const base = curve[0].equity;
+  if(base>lo && base<hi){
+    g += `<line x1="${m.l}" y1="${Y(base)}" x2="${W-m.r}" y2="${Y(base)}" stroke="var(--axis)" stroke-width="1" stroke-dasharray="3 3"/>`;
+  }
+  const d = curve.map((p,i)=>`${i?"L":"M"}${X(i).toFixed(1)},${Y(p.equity).toFixed(1)}`).join("");
+  const last = curve.length-1;
+  svg.innerHTML = g
+    + `<path d="${d}" fill="none" stroke="var(--series)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`
+    + `<circle cx="${X(last)}" cy="${Y(curve[last].equity)}" r="4.5" fill="var(--series)" stroke="var(--surface)" stroke-width="2"/>`
+    + `<line id="cross" y1="${m.t}" y2="${H-m.b}" stroke="var(--axis)" stroke-width="1" opacity="0"/>`
+    + `<circle id="hov" r="5" fill="var(--series)" stroke="var(--surface)" stroke-width="2" opacity="0"/>`
+    + `<rect id="hit" x="${m.l}" y="${m.t}" width="${W-m.l-m.r}" height="${H-m.t-m.b}" fill="transparent"/>`;
+  $("#cap").textContent = `${curve.length} marks -- ${time(curve[0].ts)} to ${time(curve[last].ts)}`;
+
+  const tip=$("#tip"), cross=svg.querySelector("#cross"), hov=svg.querySelector("#hov");
+  svg.querySelector("#hit").addEventListener("mousemove", e=>{
+    const r = svg.getBoundingClientRect();
+    const px = (e.clientX-r.left)*(W/r.width);
+    const i = Math.max(0, Math.min(curve.length-1, Math.round((px-m.l)/((W-m.l-m.r)/(curve.length-1)))));
+    const p = curve[i], x = X(i), y = Y(p.equity);
+    cross.setAttribute("x1",x); cross.setAttribute("x2",x); cross.setAttribute("opacity","1");
+    hov.setAttribute("cx",x); hov.setAttribute("cy",y); hov.setAttribute("opacity","1");
+    const delta = p.equity - base;
+    tip.innerHTML = `<strong>${money2(p.equity)}</strong> <span class="${cls(delta)}">${sgn(delta)}</span><br><span class="ts">${time(p.ts)}</span>`;
+    tip.style.left = Math.min(e.clientX+14, window.innerWidth-190)+"px";
+    tip.style.top = (e.clientY-46)+"px"; tip.style.opacity = 1;
+  });
+  svg.addEventListener("mouseleave", ()=>{
+    tip.style.opacity=0; cross.setAttribute("opacity","0"); hov.setAttribute("opacity","0");
+  });
+}
+
+function openTable(rows){
+  if(!rows.length){ $("#open").innerHTML = `<tr><td class="empty">No open positions.</td></tr>`; return; }
+  $("#open").innerHTML = `<thead><tr><th>Spread</th><th>Qty</th><th>Credit</th><th>Cost to close</th><th>Unrealized</th><th>Opened</th></tr></thead><tbody>`
+    + rows.map(r=>{
+        const upl = r.mark==null ? null : (r.entry_credit - r.mark)*100*r.qty;
+        return `<tr>
+          <td class="mono">${esc(r.underlying)} ${r.short_strike}/${r.long_strike}${esc(r.right)}</td>
+          <td>${r.qty}</td><td>${money2(r.entry_credit)}</td>
+          <td>${r.mark==null?'<span class="ts">no quote</span>':money2(r.mark)}</td>
+          <td class="${upl==null?"":cls(upl)}">${upl==null?"--":sgn(upl)}</td>
+          <td class="ts">${time(r.ts_open)}</td></tr>`;
+      }).join("") + `</tbody>`;
+}
+
+function closedTable(rows){
+  if(!rows.length){ $("#closed").innerHTML = `<tr><td class="empty">No closed positions yet.</td></tr>`; return; }
+  $("#closed").innerHTML = `<thead><tr><th>Spread</th><th>Qty</th><th>Credit</th><th>Exit</th><th>Realized</th><th>Exit rule</th></tr></thead><tbody>`
+    + rows.map(r=>`<tr>
+        <td class="mono">${esc(r.underlying)} ${r.short_strike}/${r.long_strike}${esc(r.right)}</td>
+        <td>${r.qty}</td><td>${money2(r.entry_credit)}</td><td>${money2(r.exit_debit||0)}</td>
+        <td class="${cls(r.realized_pnl||0)}">${sgn(r.realized_pnl||0)}</td>
+        <td><span class="badge">${esc(r.exit_rule||"--")}</span></td></tr>`).join("") + `</tbody>`;
+}
+
+function tripsTable(trips){
+  if(!trips.length){ $("#trips").innerHTML = `<tr><td class="empty">No gate has blocked a trade yet.</td></tr>`; return; }
+  $("#trips").innerHTML = `<thead><tr><th>Gate</th><th>Times it stopped a trade</th></tr></thead><tbody>`
+    + trips.map(([n,c])=>`<tr><td class="mono">${esc(n)}</td><td>${c}</td></tr>`).join("") + `</tbody>`;
+}
+
+function policyTable(p){
+  $("#policy").innerHTML = `<thead><tr><th>Regime</th><th>Risk budget</th><th>Spreads allowed</th><th>Why</th></tr></thead><tbody>`
+    + Object.entries(p).map(([r,v])=>`<tr>
+        <td><span class="badge"><span class="dot" style="background:${REGIME_DOT[r]||"var(--muted)"}"></span>${esc(r)}</span></td>
+        <td>${pct(v.budget_pct)}</td><td class="mono">${v.rights.join(" / ")}</td>
+        <td class="ts">${esc(v.rationale)}</td></tr>`).join("") + `</tbody>`;
+}
+
+function cycles(list){
+  if(!list.length){ $("#cycles").innerHTML = `<p class="empty">No cycles recorded yet.</p>`; return; }
+  $("#cycles").innerHTML = list.map(c=>{
+    const p = c.proposal, gs = c.gates||[];
+    const blocked = gs.filter(g=>!g.passed);
+    const action = {submitted:["var(--good)","submitted"],blocked:["var(--crit)","blocked"],
+                    stood_down:["var(--muted)","stood down"],dry_run:["var(--warn)","dry run"],
+                    error:["var(--crit)","error"]}[c.action] || ["var(--muted)", c.action];
+    return `<div class="cycle">
+      <div class="top">
+        <span class="badge"><span class="dot" style="background:${action[0]}"></span>${esc(action[1])}</span>
+        ${c.regime?`<span class="badge"><span class="dot" style="background:${REGIME_DOT[c.regime]||"var(--muted)"}"></span>${esc(c.regime)}</span>`:""}
+        ${p?`<span class="mono">${esc(p.underlying)} ${p.short_strike}/${p.long_strike}${esc(p.right)} &times;${p.qty} @ ${money2(p.net_price ?? p.limit_credit)} ${p.sleeve==='satellite'?'db':'cr'}</span> <span class="badge">${esc(p.sleeve||'core')}</span>`:""}
+        <span class="ts">${time(c.ts)}</span>
+      </div>
+      ${c.reasoning?`<div class="reason">${esc(c.reasoning)}</div>`:""}
+      ${c.error?`<div class="reason down">${esc(c.error)}</div>`:""}
+      ${gs.length?`<div class="gates">${gs.map(g=>
+        `<span class="gate ${g.passed?"":"block"}" title="${esc(g.detail)}">${g.passed?"✓":"✗"} ${esc(g.name)}</span>`).join("")}</div>`:""}
+      ${blocked.length?`<div class="reason down" style="margin-top:8px">${esc(blocked.map(g=>g.detail).join(" · "))}</div>`:""}
+    </div>`;
+  }).join("");
+}
+
+async function load(){
+  const d = await (await fetch("/api/state")).json();
+  $("#hdr").textContent = `account ${d.profile}`;
+  $("#sub").textContent = `Target expiry ${d.target_expiry} · profit target ${pct(d.limits.profit_target_pct)} of credit · stop ${d.limits.stop_loss_multiple}× credit · daily halt ${pct(d.limits.max_daily_loss_pct)} · event halt ${pct(d.limits.max_event_drawdown_pct)}`;
+  tiles(d); chart(d.curve); openTable(d.open_spreads); closedTable(d.closed_spreads);
+  tripsTable(d.gate_trips); policyTable(d.regime_policy); cycles(d.cycles);
+}
+load(); setInterval(load, 30000);
+addEventListener("resize", ()=>load());
+</script>
+</body>
+</html>

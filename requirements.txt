@@ -1,0 +1,6 @@
+anthropic==1.2.0
+fastapi==0.141.1
+google-cloud-firestore==2.29.0
+Jinja2==3.1.6
+pydantic==2.13.4
+uvicorn==0.52.4
