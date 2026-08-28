@@ -9,7 +9,9 @@ from __future__ import annotations
 import anthropic
 
 from .config import TARGET_EXPIRY, UNIVERSE, RiskLimits
-from .models import AgentDecision
+from .models import AgentDecision, parse_strike
+
+PER_WING_CAP = 30   # per underlying, per side
 
 SYSTEM = f"""\
 You are the reasoning layer of an autonomous options trading agent competing in \
@@ -169,25 +171,39 @@ def build_snapshot(
     lines += ["", f"OPTION CHAINS ({TARGET_EXPIRY}), tradeable delta band:"]
     for sym, chain in chains.items():
         lines.append(f"  --- {sym} ---")
-        rows = []
+        puts, calls = [], []
         for osym, snap in chain.items():
             greeks = snap.get("greeks") or {}
             delta = greeks.get("delta")
             if delta is None or not (0.05 <= abs(delta) <= 0.35):
                 continue
             q = snap.get("latestQuote") or {}
-            rows.append((
-                osym, q.get("bp"), q.get("ap"), round(delta, 3),
-                snap.get("impliedVolatility"), snap.get("openInterest"),
-            ))
-        rows.sort(key=lambda r: r[0])
-        if not rows:
+            row = (osym, parse_strike(osym), q.get("bp"), q.get("ap"), round(delta, 3),
+                   snap.get("impliedVolatility"), snap.get("openInterest"))
+            (puts if osym[len(sym) + 6] == "P" else calls).append(row)
+
+        # Cap each wing independently. Sorting by symbol and taking the first N
+        # would put every call ahead of every put alphabetically, so a busy
+        # chain would silently delete the entire put wing -- and the band widens
+        # exactly when volatility rises. Trim the far-OTM tail instead, which is
+        # the least tradeable end, and keep both sides represented.
+        dropped = 0
+        for side in (puts, calls):
+            side.sort(key=lambda r: -abs(r[4]))       # nearest the money first
+            if len(side) > PER_WING_CAP:
+                dropped += len(side) - PER_WING_CAP
+                del side[PER_WING_CAP:]
+            side.sort(key=lambda r: r[1])             # display by strike
+
+        if not puts and not calls:
             lines.append("    (no contracts in the tradeable band)")
-        for osym, bid, ask, delta, iv, oi in rows[:40]:
+        for osym, strike, bid, ask, delta, iv, oi in puts + calls:
             iv_s = f"{iv:.3f}" if isinstance(iv, (int, float)) else "-"
             lines.append(
                 f"    {osym}  bid {bid}  ask {ask}  delta {delta}  iv {iv_s}  oi {oi}"
             )
+        if dropped:
+            lines.append(f"    ({dropped} far-OTM contracts omitted; both wings shown)")
 
     from .macro import macro_headlines, upcoming
     events = upcoming(within_days=3, today=now.date())

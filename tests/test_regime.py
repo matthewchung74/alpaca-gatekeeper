@@ -245,3 +245,61 @@ def test_satellite_blocked_in_sideways_by_the_gate():
 def test_satellite_passes_the_gate_in_a_bull_tape():
     g = next(x for x in gates_for(satellite(), "bull") if x.name == "regime_direction")
     assert g.passed
+
+
+# --- chain rendering must never amputate one wing ------------------------
+
+def _fake_chain(sym: str, n_puts: int, n_calls: int) -> dict:
+    """Synthetic chain with more contracts than the per-wing cap."""
+    from agent.models import occ_symbol
+    ch = {}
+    for i in range(n_puts):
+        ch[occ_symbol(sym, TARGET_EXPIRY, "P", 700.0 + i)] = {
+            "greeks": {"delta": -0.05 - (i / n_puts) * 0.29},
+            "latestQuote": {"bp": 1.0, "ap": 1.05}, "impliedVolatility": 0.12,
+        }
+    for i in range(n_calls):
+        ch[occ_symbol(sym, TARGET_EXPIRY, "C", 800.0 + i)] = {
+            "greeks": {"delta": 0.34 - (i / n_calls) * 0.29},
+            "latestQuote": {"bp": 1.0, "ap": 1.05}, "impliedVolatility": 0.12,
+        }
+    return ch
+
+
+def _rendered(chain: dict) -> str:
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    return build_snapshot(
+        now=datetime(2026, 8, 28, 13, 0, tzinfo=ET), equity=100_000.0,
+        day_start_equity=100_000.0, positions=[], quotes={},
+        chains={"SPY": chain}, bars={}, news=[], limits=LIMITS,
+    )
+
+
+def test_both_wings_survive_an_oversized_chain():
+    """Sorting by symbol put every call before every put; a cap then deleted
+    the whole put wing, and the band widens exactly when vol rises."""
+    out = _rendered(_fake_chain("SPY", 60, 60))
+    assert "SPY260903P" in out, "put wing was dropped entirely"
+    assert "SPY260903C" in out, "call wing was dropped entirely"
+
+
+def test_truncation_is_announced_not_silent():
+    out = _rendered(_fake_chain("SPY", 60, 60))
+    assert "omitted" in out and "both wings shown" in out
+
+
+def test_truncation_keeps_the_near_the_money_strikes():
+    """The far-OTM tail is the least tradeable end, so it goes first."""
+    from agent.brain import PER_WING_CAP
+    out = _rendered(_fake_chain("SPY", 60, 60))
+    shown = [l for l in out.splitlines() if "SPY260903P" in l]
+    assert len(shown) == PER_WING_CAP
+    deltas = [abs(float(l.split("delta")[1].split()[0])) for l in shown]
+    assert min(deltas) > 0.05, "kept the far-OTM tail instead of the tradeable band"
+
+
+def test_small_chain_is_untouched():
+    out = _rendered(_fake_chain("SPY", 5, 5))
+    assert "omitted" not in out
+    assert len([l for l in out.splitlines() if "SPY260903" in l]) == 10
