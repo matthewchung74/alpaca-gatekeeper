@@ -20,7 +20,7 @@ material here — they are specific, verifiable, and useful to anyone else build
 >
 > One rule: the LLM never holds the risk limits.
 >
-> Claude proposes a spread. 14 deterministic Python gates decide whether it's allowed to exist. The model can't reach them, can't argue with them, and never states a dollar risk figure — it proposes strikes, and code derives the max loss.
+> Claude proposes a spread. 15 deterministic Python gates decide whether it's allowed to exist. The model can't reach them, can't argue with them, and never states a dollar risk figure — it proposes strikes, and code derives the max loss.
 >
 > Here it is refusing to trade its own account 75 minutes before the competition opened:
 >

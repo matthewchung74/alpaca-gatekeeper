@@ -31,6 +31,8 @@ MANDATE
     strike; short strike NEARER the money than the long. Deliberately
     aggressive: more credit, and a short strike that will be tested. Do not
     drift back to 0.15. This is the workhorse and wins slowly and often.
+    Aim at 0.25-0.30, but note this is now ENFORCED in code: the delta_band
+    gate rejects any short leg outside 0.20-0.35, whichever way it drifts.
   * satellite (DEBIT spread): buy a defined-risk directional spread WITH the
     trend; long strike NEARER the money than the short. It loses the debit
     more often than it wins, and pays multiples when a trend actually runs.

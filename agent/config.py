@@ -39,7 +39,15 @@ class RiskLimits:
     max_concurrent_positions: int = 8
     min_open_interest: int = 500
     max_spread_pct_of_mid: float = 0.10     # bid-ask width sanity
-    max_portfolio_delta: float = 0.30       # per $1 of equity, in share-equivalents
+    # Short-leg delta band, enforced by the delta_band gate. The prompt aims at
+    # 0.25-0.30; this is deliberately wider. Strikes are 1 point apart and
+    # delta moves ~0.03-0.05 per strike, so a hard 0.25-0.30 gate leaves one
+    # legal strike per wing and sometimes none -- measured on the live 09-03
+    # chain, QQQ puts had no strike inside it. The upper bound matches the
+    # chain filter in brain.py so the gate cannot reject a strike the model was
+    # never shown.
+    min_short_delta: float = 0.20
+    max_short_delta: float = 0.35
     no_trade_open_minutes: int = 5
     no_trade_close_minutes: int = 5
     max_tranche_risk_pct: float = 0.12      # worst case on any one CORE tranche

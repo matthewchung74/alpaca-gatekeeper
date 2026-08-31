@@ -152,6 +152,9 @@ def evaluate(
     # --- Gate 13: liquidity ----------------------------------------------
     g.append(_liquidity_gate(proposal, chain, limits))
 
+    # --- Gate 14: short-leg delta ----------------------------------------
+    g.append(_delta_gate(proposal, chain, limits))
+
     return g
 
 
@@ -188,6 +191,45 @@ def _liquidity_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits) ->
         return GateResult(name="liquidity", passed=False, detail="; ".join(problems))
     return GateResult(name="liquidity", passed=True,
                       detail="both legs quoted with acceptable spreads")
+
+
+def _delta_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits) -> GateResult:
+    """The short strike must sit inside the delta band the strategy claims.
+
+    The prompt has always instructed a 0.25-0.30 short delta, and nothing
+    enforced it: on 2026-08-28 a 0.304-delta call passed every gate because
+    none of them looked. A limit that lives only in the prompt is the exact
+    failure this project argues against, so it lives here now.
+
+    This gate records the delta in its detail whether it passes or fails, so
+    every cycle's journal carries the number and drift is measurable after the
+    fact rather than only when it trips.
+
+    Missing greeks PASS with a note, deliberately. This is a strategy
+    conformance gate, not a solvency gate -- max loss is already bounded by
+    defined_risk and tranche_risk regardless of delta -- so a data hiccup
+    should not halt trading for the session. The gates that bound money still
+    fail closed.
+    """
+    sym = occ_symbol(proposal.underlying, proposal.expiry, proposal.right,
+                     proposal.short_strike)
+    snap = chain.get(sym) or {}
+    raw = (snap.get("greeks") or {}).get("delta")
+    if raw is None:
+        return GateResult(name="delta_band", passed=True,
+                          detail=f"no delta published for short leg {sym}; "
+                                 "band unenforced this cycle")
+
+    d = abs(float(raw))
+    lo, hi = limits.min_short_delta, limits.max_short_delta
+    inside = lo <= d <= hi
+    return GateResult(
+        name="delta_band", passed=inside,
+        detail=(f"short {proposal.short_strike:g}{proposal.right} delta {d:.3f} "
+                f"{'within' if inside else 'OUTSIDE'} [{lo:.2f}, {hi:.2f}]"
+                + ("" if inside else
+                   f"; {'too far OTM to earn its risk' if d < lo else 'too close to the money'}")),
+    )
 
 
 def all_passed(gates: list[GateResult]) -> bool:

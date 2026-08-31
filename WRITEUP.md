@@ -53,7 +53,7 @@ Four bugs surfaced only against the live API, each of which would have cost mone
 
 ## Evidence
 
-Every cycle journals the snapshot, the model's verbatim reasoning, the proposal, all fourteen gate verdicts, the order and the fill — public on the dashboard. From the second live trade, unedited:
+Every cycle journals the snapshot, the model's verbatim reasoning, the proposal, all fifteen gate verdicts, the order and the fill — public on the dashboard. From the second live trade, unedited:
 
 > *"I am already short the 767 put (long delta, currently tested with SPY at 769), the marginal trade I want is on the call side, not more short puts. Selling the 774 call turns the book into a defined-risk condor around 767–774 and takes delta off the table rather than doubling down."*
 
