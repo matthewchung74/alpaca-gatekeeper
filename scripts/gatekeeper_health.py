@@ -180,15 +180,38 @@ def check_entry_coverage(state: dict, now_et: datetime) -> None:
 
 # --- check 6: errors the agent recorded about itself ---
 
-def check_journal_errors(state: dict, now_utc: datetime) -> None:
+def check_journal_errors(state: dict, now_utc: datetime, *,
+                         reconciled: bool) -> None:
+    """Errors from the last 24h, escalated by whether the damage still stands.
+
+    A past error stays CRIT while its consequence is live. Once a later cycle
+    has completed cleanly AND reconciliation says the broker and the journal
+    agree, the error is history: it stays visible as a WARN but stops paging
+    every 15 minutes, which is how a real alert gets ignored.
+
+    The reconciliation result is the load-bearing half. If it could not run we
+    have no evidence the damage is repaired, so nothing is downgraded.
+    """
+    clean = ("submitted", "blocked", "stood_down", "dry_run")
+    later_ok = max(
+        (parse_ts(c.get("ts")) for c in state.get("cycles") or []
+         if c.get("action") in clean and not c.get("error")
+         and parse_ts(c.get("ts"))),
+        default=None,
+    )
+
     for c in state.get("cycles") or []:
         if not c.get("error"):
             continue
         ts = parse_ts(c.get("ts"))
-        if ts and (now_utc - ts) < timedelta(hours=24):
-            report("CRIT", "journal",
-                   f"cycle {ts.astimezone(ET):%m-%d %H:%M ET} recorded error: "
-                   f"{str(c['error'])[:220]}")
+        if not ts or (now_utc - ts) >= timedelta(hours=24):
+            continue
+        recovered = reconciled and later_ok is not None and ts < later_ok
+        report("WARN" if recovered else "CRIT", "journal",
+               f"cycle {ts.astimezone(ET):%m-%d %H:%M ET} recorded error: "
+               f"{str(c['error'])[:220]}"
+               + (" [recovered: a later cycle completed and the broker agrees "
+                  "with the journal]" if recovered else ""))
 
 
 # --- check 7: risk limits, from the equity the agent itself reported ---
@@ -263,17 +286,20 @@ def broker_legs() -> dict[tuple, int] | None:
     return held
 
 
-def check_reconciliation(state: dict) -> None:
+def check_reconciliation(state: dict) -> bool:
     """Broker positions vs journaled spreads, in both directions.
 
     The journal drives exit management, so a leg the broker holds and the
     journal does not know about is unmanaged risk: no profit target, no stop,
     no expiry flatten. `manage.is_actually_held` already guards the opposite
     direction, which is why that one is only a warning here.
+
+    Returns True if the comparison actually ran; False if the broker could not
+    be reached, so no caller treats silence here as evidence of agreement.
     """
     held = broker_legs()
     if held is None:
-        return
+        return False
 
     expected: dict[tuple, int] = {}
     for s in state.get("open_spreads") or []:
@@ -306,6 +332,7 @@ def check_reconciliation(state: dict) -> None:
         else:
             report("CRIT", "reconcile",
                    f"size mismatch on {fmt(key)}: broker {h:+d}, journal {x:+d}")
+    return True
 
 
 def alert(title: str, msg: str) -> None:
@@ -327,11 +354,13 @@ def main() -> int:
     check_schedulers()
     check_executions(now_utc, now_et)
     if state is not None:
-        check_journal_errors(state, now_utc)
+        # Reconciliation first: it is the evidence that decides whether a past
+        # journal error still matters or is already repaired.
+        reconciled = check_reconciliation(state)
+        check_journal_errors(state, now_utc, reconciled=reconciled)
         check_entry_coverage(state, now_et)
         check_risk(state)
         check_expiry(state, now_et)
-        check_reconciliation(state)
 
         eq = state.get("equity")
         print(f"    equity {eq:,.2f}  day P&L {state.get('day_pnl', 0):+,.2f}  "
