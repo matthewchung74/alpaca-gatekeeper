@@ -235,6 +235,12 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         print(f"  BLOCKED by {len(risk.blockers(gates))} gate(s)")
         return 0
 
+    # What we asked for, frozen before the fill overwrites it. The gates above
+    # were evaluated against these numbers, so journaling the filled proposal
+    # next to them would put a verdict and a different price in one document
+    # and make slippage unauditable afterwards.
+    requested = p
+
     coid = f"hack-{uuid.uuid4().hex[:24]}"
     try:
         result = cli.submit_mleg(
@@ -255,8 +261,36 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
     order_id = result.get("id") if isinstance(result, dict) else None
     if not dry_run and order_id:
         fill = cli.fill_result(order_id, profile)
+        if fill["timed_out"]:
+            # The order is still working. Walking away here is what orphans a
+            # position: we would journal "unfilled" while a live order goes on
+            # to fill, leaving a spread no exit rule can see. Cancel first,
+            # then re-poll -- the cancel can lose the race, and the second poll
+            # is what tells us which way it went.
+            print(f"  order still {fill['status']} after polling; cancelling to keep "
+                  "the broker and the journal in agreement")
+            cli.cancel_order(order_id, profile)
+            fill = cli.fill_result(order_id, profile)
+
         print(f"  fill: status={fill['status']} qty={fill['qty']}/{p.qty} "
               f"credit={fill['credit']}")
+
+        if fill["timed_out"]:
+            # Neither polling nor cancelling settled it. This is the one state
+            # where the broker and the journal can still disagree, so claim
+            # nothing and say so loudly.
+            journal.record_cycle(
+                profile=profile, action="error", snapshot=snapshot,
+                reasoning=decision.reasoning, proposal=requested.model_dump(),
+                gates=gate_payload, regime=decision.regime, equity=equity,
+                order_id=order_id,
+                error=(f"order {order_id} still {fill['status']} after cancel; "
+                       "broker may hold an unjournaled position -- RECONCILE MANUALLY"),
+            )
+            print(f"  UNSETTLED after cancel ({fill['status']}) -- "
+                  "manual reconciliation required", file=sys.stderr)
+            return 1
+
         if fill["qty"] == 0:
             # Nothing filled. Journaling a spread we do not hold would make the
             # sweep chase a phantom position for the rest of the week.
@@ -282,7 +316,8 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         journal.record_spread(profile=profile, proposal=p, order_id=order_id)
     journal.record_cycle(
         profile=profile, action="dry_run" if dry_run else "submitted",
-        snapshot=snapshot, reasoning=decision.reasoning, proposal=p.model_dump(),
+        snapshot=snapshot, reasoning=decision.reasoning,
+        proposal=requested.model_dump(),
         gates=gate_payload, regime=decision.regime, equity=equity, order_id=order_id,
     )
     print(f"  {'DRY RUN' if dry_run else 'SUBMITTED'}  order_id={order_id}  coid={coid}")

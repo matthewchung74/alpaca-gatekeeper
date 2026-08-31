@@ -130,10 +130,29 @@ def get_order(order_id: str, profile: str) -> dict:
     return run("order", "get", "--order-id", order_id, profile=profile) or {}
 
 
-def fill_result(order_id: str, profile: str, tries: int = 8, delay: float = 2.0) -> dict:
+def cancel_order(order_id: str, profile: str) -> bool:
+    """Ask the broker to cancel one order.
+
+    True if the cancel was accepted (204), False if it was refused -- a 422
+    means the order is no longer cancelable because it settled first, which is
+    information, not a failure. Either way the caller MUST re-poll: a cancel is
+    a request, not an outcome, and an order can fill in the gap.
+    """
+    try:
+        run("order", "cancel", "--order-id", order_id, profile=profile, parse=False)
+        return True
+    except CLIError as e:
+        if e.code == 2:                    # auth failure is never "already settled"
+            raise
+        return False
+
+
+def fill_result(order_id: str, profile: str, tries: int = 24,
+                delay: float = 5.0) -> dict:
     """Poll an order to a settled state and report what actually happened.
 
-    Returns {"qty": int, "credit": float | None, "status": str}.
+    Returns {"qty": int, "credit": float | None, "status": str,
+             "timed_out": bool}.
 
     Two things must be reconciled, not one. The limit price is what we asked
     for and filled_avg_price is what we got; the requested qty is what we asked
@@ -143,12 +162,21 @@ def fill_result(order_id: str, profile: str, tries: int = 8, delay: float = 2.0)
 
     Now that the limit actually binds (signed net price), resting and partial
     fills are live possibilities rather than theoretical ones.
+
+    `timed_out` is the field that keeps a working order from being mistaken for
+    a dead one. Without it the caller cannot distinguish "the market said no"
+    from "we stopped looking": both report filled_qty 0. On 2026-08-31 an order
+    filled 78.5s after submission, long after a 16s poll had given up, and the
+    resulting position was journaled nowhere and managed by nothing. The window
+    is now 120s, and the caller cancels rather than walking away.
     """
     settled = {"filled", "canceled", "expired", "rejected", "done_for_day"}
     o: dict = {}
+    timed_out = True
     for _ in range(tries):
         o = get_order(order_id, profile)
         if o.get("status") in settled:
+            timed_out = False
             break
         time.sleep(delay)
     px = o.get("filled_avg_price")
@@ -156,6 +184,7 @@ def fill_result(order_id: str, profile: str, tries: int = 8, delay: float = 2.0)
         "qty": int(float(o.get("filled_qty") or 0)),
         "credit": abs(float(px)) if px is not None else None,
         "status": o.get("status") or "unknown",
+        "timed_out": timed_out,
     }
 
 
