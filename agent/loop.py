@@ -132,10 +132,41 @@ def manage_open_spreads(
             continue
 
         oid = res.get("id") if isinstance(res, dict) else None
-        pnl = sp.realized_pnl(mark if mark is not None else 0.0)
-        journal.close_spread(sp.id, exit_debit=mark or 0.0, exit_rule=d.rule or "manual",
+
+        # Reconcile the close the same way entries are reconciled. `mark` is a
+        # conservative estimate -- pay the ask, sell the bid -- and journaling
+        # it as the exit price makes realized P&L fiction. On 2026-09-01 the
+        # SPY 767/762 put spread marked 3.29 and filled at 2.25, overstating
+        # the loss by $1,248 on the public dashboard.
+        fill = cli.fill_result(oid, profile) if oid else {
+            "qty": 0, "credit": None, "status": "no order id", "timed_out": False}
+        if fill["timed_out"]:
+            cli.cancel_order(oid, profile)
+            fill = cli.fill_result(oid, profile)
+
+        if fill["qty"] < qty:
+            # Anything short of a full close leaves contracts still held.
+            # Marking the spread closed would retire them from exit management
+            # entirely -- the same failure as journaling a fill that never
+            # happened. Stay open; the next sweep sizes from the broker and
+            # finishes the job.
+            what = (f"{fill['status']} with 0 filled" if fill["qty"] == 0
+                    else f"partially closed {fill['qty']} of {qty}")
+            print(f"        close INCOMPLETE ({what}); spread stays open",
+                  file=sys.stderr)
+            journal.record_cycle(
+                profile=profile, action="error",
+                error=(f"close of spread {sp.id} {what}; still held, "
+                       "next sweep will retry from the broker's size"))
+            continue
+
+        exit_px = fill["credit"] if fill["credit"] is not None else (mark or 0.0)
+        pnl = sp.realized_pnl(exit_px)
+        journal.close_spread(sp.id, exit_debit=exit_px, exit_rule=d.rule or "manual",
                              realized_pnl=pnl, close_order_id=oid)
-        print(f"        CLOSED @ {limit:.2f}  realized ${pnl:+,.0f}  order={oid}")
+        print(f"        CLOSED @ {exit_px:.2f} (limit {limit:.2f}, mark "
+              f"{mark if mark is not None else float('nan'):.2f})  "
+              f"realized ${pnl:+,.0f}  order={oid}")
 
 
 def run_cycle(settings: Settings, *, dry_run: bool = False,
