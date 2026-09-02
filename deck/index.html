@@ -1,0 +1,493 @@
+<title>Gatekeeper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;800&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+  /* Committed dark: this is a trading terminal, not a document. Every colour
+     is painted explicitly so the page holds on any host ground. */
+  :root{
+    --ground:#0a0a0b;
+    --panel:#121317;
+    --panel-2:#16181d;
+    --line:#24262c;
+    --line-soft:#1b1d22;
+    --ink:#f2f3f5;
+    --ink-dim:#b6bcc4;
+    --muted:#868d97;
+    --amber:#fab219;
+    --green:#2fbf5f;
+    --red:#ef4a5a;
+    --blue:#3987e5;
+    --sans:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,monospace;
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+
+  body{
+    background:var(--ground);
+    color:var(--ink);
+    font-family:var(--sans);
+    font-size:16px;
+    line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  .deck{height:100dvh;overflow-y:auto;scroll-snap-type:y mandatory}
+
+  .slide{
+    position:relative;
+    min-height:100dvh;
+    scroll-snap-align:start;
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+    padding:clamp(32px,5vw,84px) clamp(24px,6vw,96px);
+    background:var(--ground);
+    overflow:hidden;
+  }
+  /* faint chart grid, carried over from the cover art */
+  .slide::before{
+    content:"";position:absolute;inset:0;pointer-events:none;
+    background-image:
+      linear-gradient(rgba(255,255,255,.028) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(255,255,255,.028) 1px,transparent 1px);
+    background-size:48px 48px;
+  }
+  .slide > *{position:relative}
+
+  .num{
+    position:absolute;top:clamp(20px,3vw,38px);right:clamp(24px,6vw,96px);
+    font-family:var(--mono);font-size:12px;font-weight:500;
+    color:var(--muted);letter-spacing:.14em;z-index:2;
+  }
+
+  .eyebrow{
+    font-family:var(--mono);font-size:clamp(10px,1vw,12px);font-weight:500;
+    letter-spacing:.22em;text-transform:uppercase;color:var(--muted);
+    margin-bottom:18px;
+  }
+
+  h1{
+    font-size:clamp(56px,10vw,132px);font-weight:800;letter-spacing:-.045em;
+    line-height:.92;margin:0;text-wrap:balance;
+  }
+  h2{
+    font-size:clamp(30px,4.4vw,58px);font-weight:800;letter-spacing:-.032em;
+    line-height:1.02;margin:0 0 22px;text-wrap:balance;max-width:20ch;
+  }
+  .lede{
+    font-size:clamp(17px,1.7vw,23px);color:var(--ink-dim);line-height:1.5;
+    max-width:62ch;margin:0;
+  }
+  .lede strong{color:var(--ink);font-weight:600}
+  p.small{font-size:15px;color:var(--muted);max-width:66ch;margin:0}
+
+  .stack{display:flex;flex-direction:column;gap:26px}
+  .stack-tight{display:flex;flex-direction:column;gap:14px}
+
+  /* ---- pipeline ---- */
+  .pipe{display:flex;align-items:stretch;gap:14px;flex-wrap:wrap}
+  .node{
+    flex:1 1 150px;border:1px solid var(--line);border-radius:10px;
+    background:var(--panel);padding:20px 18px;
+  }
+  .node .k{font-family:var(--mono);font-size:11px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--muted);margin-bottom:9px}
+  .node .v{font-size:19px;font-weight:600;letter-spacing:-.01em}
+  .node .d{font-size:13px;color:var(--muted);margin-top:6px}
+  .node.model{border-color:rgba(57,135,229,.5);background:rgba(57,135,229,.07)}
+  .node.gates{border-color:rgba(250,178,25,.5);background:rgba(250,178,25,.06)}
+  .node.exec{border-color:rgba(47,191,95,.45);background:rgba(47,191,95,.06)}
+
+  /* ---- generic panel ---- */
+  .panel{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:24px 26px}
+
+  /* ---- data tables ---- */
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+  table{border-collapse:collapse;width:100%;font-family:var(--mono);
+    font-size:14px;font-variant-numeric:tabular-nums;min-width:520px}
+  th{
+    text-align:left;font-weight:500;font-size:10.5px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--muted);
+    padding:14px 18px;border-bottom:1px solid var(--line);white-space:nowrap;
+  }
+  td{padding:11px 18px;border-bottom:1px solid var(--line-soft);color:var(--ink-dim);white-space:nowrap}
+  tr:last-child td{border-bottom:none}
+  td.name{color:var(--ink)}
+  td.num-col{text-align:right}
+  .amber{color:var(--amber)}
+  .green{color:var(--green)}
+  .red{color:var(--red)}
+  .blue{color:var(--blue)}
+
+  /* ---- gate chips ---- */
+  .gates-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(178px,1fr));gap:9px}
+  .gate{
+    font-family:var(--mono);font-size:12.5px;padding:11px 13px;
+    border:1px solid var(--line);border-radius:8px;background:var(--panel);
+    display:flex;align-items:center;gap:9px;
+  }
+  .gate::before{content:"";width:5px;height:5px;border-radius:50%;background:var(--amber);flex:none}
+  .gate.zero{border-color:rgba(250,178,25,.55);background:rgba(250,178,25,.08)}
+  .gate.zero::before{background:var(--amber);box-shadow:0 0 0 3px rgba(250,178,25,.18)}
+  .gate.fresh{border-color:rgba(57,135,229,.45)}
+  .gate.fresh::before{background:var(--blue)}
+
+  /* ---- terminal block ---- */
+  .term{
+    border:1px solid var(--line);border-radius:12px;background:#0d0e11;
+    font-family:var(--mono);font-size:13.5px;line-height:1.85;
+    overflow-x:auto;
+  }
+  .term-bar{
+    display:flex;align-items:center;gap:7px;padding:11px 16px;
+    border-bottom:1px solid var(--line);color:var(--muted);
+    font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;
+  }
+  .term-bar i{width:8px;height:8px;border-radius:50%;background:var(--line);display:block}
+  .term pre{margin:0;padding:18px 20px;white-space:pre;color:var(--ink-dim)}
+  .term .cmd{color:var(--ink)}
+  .term .flag{color:var(--muted)}
+
+  /* ---- two-up ---- */
+  .two{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
+
+  .kv{display:flex;flex-direction:column;gap:5px}
+  .kv .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--muted)}
+  .kv .v{font-size:15px;color:var(--ink-dim)}
+
+  .rule{height:1px;background:var(--line);border:none;margin:0}
+
+  .callout{
+    border-left:2px solid var(--amber);padding:4px 0 4px 20px;
+    font-size:clamp(17px,1.8vw,22px);line-height:1.45;color:var(--ink);
+    max-width:56ch;text-wrap:balance;
+  }
+
+  a{color:var(--blue);text-decoration:none;border-bottom:1px solid rgba(57,135,229,.35)}
+  a:hover{border-bottom-color:var(--blue)}
+  a:focus-visible,.deck:focus-visible{outline:2px solid var(--amber);outline-offset:3px}
+
+  .foot{
+    position:absolute;left:clamp(24px,6vw,96px);bottom:clamp(20px,3vw,38px);
+    font-family:var(--mono);font-size:11.5px;color:var(--muted);letter-spacing:.04em;
+  }
+
+  /* progress */
+  .prog{position:fixed;top:0;left:0;height:2px;background:var(--amber);width:0;z-index:20}
+</style>
+
+<div class="prog" id="prog"></div>
+
+<div class="deck" id="deck" tabindex="0">
+
+  <!-- 1 ─ title -->
+  <section class="slide">
+    <div class="stack">
+      <div class="eyebrow">Alpaca × lablab.ai · AI Trading Agents Hackathon</div>
+      <h1>Gatekeeper</h1>
+      <p class="lede" style="font-size:clamp(19px,2.1vw,27px)">
+        The model proposes. <strong>Code disposes.</strong>
+      </p>
+      <hr class="rule">
+      <div class="two" style="max-width:900px">
+        <div class="kv"><span class="k">Strategy</span><span class="v">Defined-risk options spreads, SPY / QQQ / IWM</span></div>
+        <div class="kv"><span class="k">Alpaca surface</span><span class="v">CLI + Trading API, paper account</span></div>
+      </div>
+    </div>
+    <div class="foot">risk limits live in code, not the prompt</div>
+  </section>
+
+  <!-- 2 ─ thesis -->
+  <section class="slide">
+    <div class="num">01 · thesis</div>
+    <div class="stack">
+      <h2>Where the risk limits live</h2>
+      <p class="lede">
+        The common approach is to write the risk rules into the system prompt —
+        <em>never risk more than X</em> — and rely on the model to follow them.
+      </p>
+      <p class="lede">
+        A model asked to respect a position limit will respect it most of the time.
+        We wanted the limits to hold the rest of the time too.
+      </p>
+      <p class="lede">
+        So the system is split in two. Claude decides what to trade.
+        <strong>Deterministic Python decides whether that trade is allowed to exist.</strong>
+        They are separate processes, and the model has no access to the second one.
+      </p>
+    </div>
+  </section>
+
+  <!-- 3 ─ architecture -->
+  <section class="slide">
+    <div class="num">02 · architecture</div>
+    <div class="stack">
+      <h2>What one cycle does</h2>
+      <div class="pipe">
+        <div class="node"><div class="k">observe</div><div class="v">Market state</div><div class="d">chains, bars, quotes, news, calendar</div></div>
+        <div class="node model"><div class="k">reason</div><div class="v">Claude Opus 5</div><div class="d">proposes strikes and a quantity</div></div>
+        <div class="node gates"><div class="k">dispose</div><div class="v">15 gates</div><div class="d">pure Python, no model in the loop</div></div>
+        <div class="node exec"><div class="k">execute</div><div class="v">Alpaca CLI</div><div class="d">the execution boundary</div></div>
+        <div class="node"><div class="k">record</div><div class="v">Journal</div><div class="d">every verdict, order and fill</div></div>
+      </div>
+      <p class="lede">
+        The model never states a dollar figure. It proposes strikes and a quantity, and the
+        risk layer derives max loss from the contract specs, then resizes the position to fit the budget.
+      </p>
+      <p class="small">
+        Nothing the model outputs can raise a limit, skip a gate, or size a position up.
+        It runs unattended on Google Cloud: four entry cycles a day, exit sweeps every ten minutes.
+      </p>
+    </div>
+  </section>
+
+  <!-- 4 ─ options path -->
+  <section class="slide">
+    <div class="num">03 · the options path</div>
+    <div class="stack">
+      <h2>What it trades</h2>
+      <div class="two">
+        <div class="panel stack-tight">
+          <div class="kv"><span class="k">Structure</span><span class="v">Vertical credit spreads. Sell the strike nearer the money, buy the strike beyond it.</span></div>
+          <div class="kv"><span class="k">Why the long leg</span><span class="v">It caps the loss. Max loss is a known number before the order is submitted rather than an open-ended exposure.</span></div>
+          <div class="kv"><span class="k">Expiry</span><span class="v">2026-09-03 only — everything settles the day before the deadline.</span></div>
+        </div>
+        <div class="panel stack-tight">
+          <div class="kv"><span class="k">Strike selection</span><span class="v">The model only sees contracts between 0.05 and 0.35 delta. A gate then enforces 0.20–0.35 on the short leg.</span></div>
+          <div class="kv"><span class="k">Profit target</span><span class="v">Close at 50% of the credit captured.</span></div>
+          <div class="kv"><span class="k">Stop</span><span class="v">Close when the cost to close reaches 3× the credit taken.</span></div>
+          <div class="kv"><span class="k">Expiry day</span><span class="v">Flatten 30 minutes before the close — an assigned short strike would leave stock in the account on submission morning.</span></div>
+        </div>
+      </div>
+      <p class="small">
+        A convex “satellite” sleeve that buys defined-risk direction is implemented alongside the core.
+        Across this event the regime never permitted it, so every trade shown here is core premium selling.
+      </p>
+    </div>
+  </section>
+
+  <!-- 5 ─ regime -->
+  <section class="slide">
+    <div class="num">04 · regime</div>
+    <div class="stack">
+      <h2>Regime sets direction and size</h2>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Regime</th><th>Risk budget</th><th>Rights permitted</th><th>Rationale</th></tr></thead>
+          <tbody>
+            <tr><td class="name">sideways</td><td class="amber">12.00%</td><td>P and C</td><td>range-bound tape is the best case for short premium</td></tr>
+            <tr><td class="name">bull</td><td class="amber">10.20%</td><td>P only</td><td>never sell calls into a trend that is running</td></tr>
+            <tr><td class="name">bear</td><td class="amber">4.20%</td><td>C only</td><td>downtrend: no short puts, size cut hard</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="lede">
+        A bear read cuts the core budget from 12% of equity to 4.2%, a 35% multiplier applied by
+        code before any gate runs. The model is not given that number and cannot set it.
+      </p>
+    </div>
+  </section>
+
+  <!-- 6 ─ alpaca -->
+  <section class="slide">
+    <div class="num">05 · alpaca integration</div>
+    <div class="stack">
+      <h2>How it talks to Alpaca</h2>
+      <p class="lede">Every order leaves through the Alpaca CLI. It gives structured JSON in and out, exit codes, automatic retry on 429 and 5xx, and <span style="font-family:var(--mono);font-size:.92em">--client-order-id</span> for idempotency.</p>
+      <div class="term">
+        <div class="term-bar"><i></i><i></i><i></i><span>alpaca cli</span></div>
+<pre><span class="cmd">alpaca data option chain</span> <span class="flag">--underlying-symbol SPY --expiration-date 2026-09-03</span>
+<span class="cmd">alpaca data bars</span> · <span class="cmd">latest-quote</span> · <span class="cmd">news</span> · <span class="cmd">calendar</span> · <span class="cmd">clock</span>
+<span class="cmd">alpaca account get</span> · <span class="cmd">position list</span>
+<span class="cmd">alpaca order get</span> · <span class="cmd">order cancel</span>
+
+<span class="flag"># order submit does not expose the multi-leg flags,</span>
+<span class="flag"># so spreads go through the raw Trading API:</span>
+<span class="cmd">alpaca api POST /v2/orders</span>   <span class="flag">order_class: mleg</span></pre>
+      </div>
+      <p class="small">Chains, bars, quotes, news and the trading calendar all arrive through the CLI. Account state and positions too. Multi-leg orders are the one case that needs the raw endpoint.</p>
+    </div>
+  </section>
+
+  <!-- 7 ─ signed limit -->
+  <section class="slide">
+    <div class="num">06 · what the live API taught us</div>
+    <div class="stack">
+      <h2><span class="amber" style="font-family:var(--mono);font-size:.7em;letter-spacing:-.01em">limit_price</span> on a multi-leg order is a signed net price.</h2>
+      <p class="lede">
+        Negative means a credit you require. Positive means a debit you will pay.
+        Sending <strong>+0.80</strong> on a credit spread reads as “I’ll pay up to 0.80” — which any credit
+        trivially satisfies, so the limit never binds and the order fills at whatever the market gives.
+      </p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Test against the live API</th><th>Spread worth</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td class="name">demanded +2.50</td><td>1.23</td><td class="red">filled at 1.22 — limit never bound</td></tr>
+            <tr><td class="name">demanded −2.50</td><td>1.23</td><td class="green">correctly rested unfilled</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small">We found this by testing against the live API rather than reading the docs. Fixing it also made two previously dead code paths live, since orders can now rest unfilled or fill partially, and that surfaced three further bugs.</p>
+    </div>
+  </section>
+
+  <!-- 8 ─ the gates -->
+  <section class="slide">
+    <div class="num">07 · the gates</div>
+    <div class="stack">
+      <h2>The fifteen gates</h2>
+      <div class="gates-grid">
+        <div class="gate zero">account_guard</div>
+        <div class="gate">event_halt</div>
+        <div class="gate">daily_loss</div>
+        <div class="gate">event_drawdown</div>
+        <div class="gate">universe</div>
+        <div class="gate">expiry</div>
+        <div class="gate">defined_risk</div>
+        <div class="gate">price_sanity</div>
+        <div class="gate">regime_direction</div>
+        <div class="gate">tranche_risk</div>
+        <div class="gate">concentration</div>
+        <div class="gate">position_count</div>
+        <div class="gate">trading_window</div>
+        <div class="gate">liquidity</div>
+        <div class="gate fresh">delta_band</div>
+      </div>
+      <div class="two">
+        <p class="small"><span class="amber">●</span> <strong style="color:var(--ink)">account_guard</strong> refuses to trade the judged account outside the competition window. It raises an exception rather than a warning, because the eligibility of the whole submission depends on there being no fills outside that window.</p>
+        <p class="small"><span class="blue">●</span> <strong style="color:var(--ink)">delta_band</strong> was added mid-event. The prompt had asked for a 0.25–0.30 short delta since day one, but no gate checked it, so a 0.304-delta call passed. Each gate is a pure function of the proposal plus observed account and market state.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9 ─ a real cycle -->
+  <section class="slide">
+    <div class="num">08 · a real cycle</div>
+    <div class="stack">
+      <h2>A cycle that passed</h2>
+      <div class="term">
+        <div class="term-bar"><i></i><i></i><i></i><span>decision log · verbatim</span></div>
+<pre>regime: <span class="cmd">bear</span>
+proposal: QQQ 2026-09-03 <span class="cmd">C 713.0/715.0 x15 @ 0.42</span> (core)
+
+<span class="green">[PASS]</span> regime_direction  bear permits C — downtrend: no short puts, size cut
+<span class="green">[PASS]</span> tranche_risk      max loss 2,370 vs core budget 4,235
+                  <span class="amber">(4.20% of equity, 35% regime multiplier)</span>
+<span class="green">[PASS]</span> delta_band        short 713C delta 0.255 within [0.20, 0.35]
+<span class="green">[PASS]</span> … 12 more            <span class="flag">15 / 15 → order submitted</span></pre>
+      </div>
+      <p class="lede">
+        The model did not choose the 4,235 budget and was never shown it. Code read the bear
+        regime and reduced the position size before any gate ran.
+      </p>
+    </div>
+  </section>
+
+  <!-- 10 ─ a rejection -->
+  <section class="slide">
+    <div class="num">09 · a rejection</div>
+    <div class="stack">
+      <h2>A cycle that was blocked</h2>
+      <div class="term">
+        <div class="term-bar"><i></i><i></i><i></i><span>2026-09-01 · 12:32 ET</span></div>
+<pre>proposal: IWM 2026-09-03 <span class="cmd">C 293.0/296.0 x16 @ 0.45</span>
+
+<span class="red">[BLOCK]</span> liquidity   long leg IWM260903C00296000
+            spread <span class="red">11.8%</span> &gt; 10% of mid</pre>
+      </div>
+      <p class="lede">
+        The model proposed IWM four separate times and was rejected each time on bid-ask width.
+        On the fifth attempt it proposed a <strong>narrower</strong> spread, 293/295 instead of
+        293/296, and the tighter structure cleared the gate.
+      </p>
+      <p class="small">The liquidity gate also protects the credibility of the P&amp;L. Paper trading can fill wide, illiquid contracts at prices a real book would not get, so the gate keeps the results closer to what the strategy would actually have achieved.</p>
+    </div>
+  </section>
+
+  <!-- 11 ─ the monitor -->
+  <section class="slide">
+    <div class="num">10 · what runs while nobody watches</div>
+    <div class="stack">
+      <h2>A fill that arrived after the code stopped waiting</h2>
+      <p class="lede">
+        An order filled 78 seconds after submission. The code polling for that fill stopped at 16,
+        so the journal recorded it as unfilled while the broker held a 20-lot spread. Exit management
+        reads the journal rather than the broker, so no profit target, stop or expiry flatten applied to it.
+      </p>
+      <div class="two">
+        <div class="panel stack-tight">
+          <div class="kv"><span class="k">Cause</span><span class="v">Fixing the signed limit turned instant fills into resting orders. The 16-second poll had been set when fills were instant, and its result could not distinguish an order the market declined from one still working.</span></div>
+        </div>
+        <div class="panel stack-tight">
+          <div class="kv"><span class="k">The fix</span><span class="v">Cancel on timeout, re-poll, and journal the price that actually filled. A close that does not fully fill no longer marks the spread closed.</span></div>
+          <div class="kv"><span class="k">The net</span><span class="v">A monitor reconciles broker positions against the journal every 15 minutes and escalates when they disagree.</span></div>
+        </div>
+      </div>
+      <p class="small">The monitor caught the next failure within minutes: a stop whose limit was capped at the stop level, which could not fill once the position moved past it.</p>
+    </div>
+  </section>
+
+  <!-- 12 ─ close -->
+  <section class="slide">
+    <div class="num">11 · submission</div>
+    <div class="stack">
+      <h2>Submission details</h2>
+      <div class="two">
+        <div class="panel stack-tight">
+          <div class="kv"><span class="k">Live dashboard</span><span class="v"><a href="https://alpaca-ai-agent-2026.web.app">alpaca-ai-agent-2026.web.app</a></span></div>
+          <div class="kv"><span class="k">Source</span><span class="v"><a href="https://github.com/matthewchung74/alpaca-gatekeeper">github.com/matthewchung74/alpaca-gatekeeper</a></span></div>
+        </div>
+        <div class="panel stack-tight">
+          <div class="kv"><span class="k">Alpaca paper account</span><span class="v" style="font-family:var(--mono)">PA3X3X2CYW0J</span></div>
+          <div class="kv"><span class="k">Starting balance</span><span class="v" style="font-family:var(--mono)">$100,000.00</span></div>
+        </div>
+      </div>
+      <p class="small">
+        Every cycle is recorded and public: the market snapshot, the model’s full reasoning,
+        the proposal, all fifteen gate verdicts, the order, and the reconciled fill.
+      </p>
+    </div>
+    <div class="foot">autonomous · options · defined-risk</div>
+  </section>
+
+</div>
+
+<script>
+  var deck = document.getElementById('deck');
+  var prog = document.getElementById('prog');
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+
+  deck.addEventListener('scroll', function(){
+    var max = deck.scrollHeight - deck.clientHeight;
+    prog.style.width = max > 0 ? (deck.scrollTop / max * 100) + '%' : '0%';
+  }, {passive:true});
+
+  function current(){
+    var best = 0, bestD = Infinity;
+    for (var i = 0; i < slides.length; i++){
+      var d = Math.abs(slides[i].getBoundingClientRect().top);
+      if (d < bestD){ bestD = d; best = i; }
+    }
+    return best;
+  }
+  function go(i){
+    i = Math.max(0, Math.min(slides.length - 1, i));
+    slides[i].scrollIntoView({behavior:'smooth', block:'start'});
+  }
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' '){
+      e.preventDefault(); go(current() + 1);
+    } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft' || e.key === 'PageUp'){
+      e.preventDefault(); go(current() - 1);
+    } else if (e.key === 'Home'){ e.preventDefault(); go(0); }
+    else if (e.key === 'End'){ e.preventDefault(); go(slides.length - 1); }
+  });
+  deck.focus();
+</script>
