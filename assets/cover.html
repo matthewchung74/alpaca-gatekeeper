@@ -1,0 +1,75 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap');
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{width:1280px;height:720px;overflow:hidden;
+       font-family:Inter,system-ui,sans-serif;
+       background:#0a0a0b;color:#fff;position:relative}
+  /* faint grid, like a chart backdrop */
+  .grid{position:absolute;inset:0;
+        background-image:linear-gradient(#ffffff08 1px,transparent 1px),
+                         linear-gradient(90deg,#ffffff08 1px,transparent 1px);
+        background-size:48px 48px}
+  .glow{position:absolute;width:760px;height:760px;border-radius:50%;
+        background:radial-gradient(circle,#3987e520 0%,transparent 62%);
+        top:-260px;right:-190px}
+  .wrap{position:relative;padding:64px 70px;height:100%;display:flex;flex-direction:column}
+  .kicker{font:600 13px/1 'JetBrains Mono',monospace;letter-spacing:.22em;
+          text-transform:uppercase;color:#6f7480}
+  h1{font-size:100px;font-weight:800;letter-spacing:-.045em;line-height:.95;margin-top:16px}
+  .sub{font-size:23px;color:#a8adb8;margin-top:16px;font-weight:400}
+  .sub b{color:#fff;font-weight:600}
+  figure{flex:1;display:flex;align-items:center;justify-content:center;margin-top:6px}
+  .foot{display:flex;justify-content:space-between;align-items:flex-end;
+        font:500 15px/1 'JetBrains Mono',monospace;color:#6f7480}
+  .foot b{color:#3987e5}
+</style>
+<div class="grid"></div><div class="glow"></div>
+<div class="wrap">
+  <div class="kicker">Alpaca &times; lablab.ai &middot; AI Trading Agents</div>
+  <h1>GATEKEEPER</h1>
+  <p class="sub">The model proposes. <b>Code disposes.</b></p>
+
+  <figure>
+  <svg width="1060" height="270" viewBox="0 0 1060 270" fill="none">
+    <!-- CLAUDE block -->
+    <rect x="2" y="72" width="212" height="126" rx="16" fill="#12233d" stroke="#3987e5" stroke-width="2"/>
+    <text x="108" y="124" text-anchor="middle" fill="#fff" font-family="Inter" font-size="27" font-weight="700">CLAUDE</text>
+    <text x="108" y="152" text-anchor="middle" fill="#7f93ad" font-family="Inter" font-size="14">proposes a spread</text>
+
+    <!-- the gates -->
+    <text x="530" y="26" text-anchor="middle" fill="#fab219" font-family="JetBrains Mono" font-size="14" font-weight="500" letter-spacing="1.5">15 DETERMINISTIC GATES</text>
+    <g>
+      <rect x="404" y="44" width="11" height="182" rx="5" fill="#fab219"/>
+      <rect x="446" y="44" width="11" height="182" rx="5" fill="#fab219"/>
+      <rect x="488" y="44" width="11" height="182" rx="5" fill="#fab219"/>
+      <rect x="530" y="44" width="11" height="182" rx="5" fill="#fab219"/>
+      <rect x="572" y="44" width="11" height="182" rx="5" fill="#fab219"/>
+      <rect x="614" y="44" width="11" height="182" rx="5" fill="#fab219"/>
+      <rect x="656" y="44" width="11" height="182" rx="5" fill="#fab219"/>
+    </g>
+
+    <!-- PASS: green, all the way through -->
+    <path d="M222 108 H820" stroke="#0ca30c" stroke-width="5" stroke-linecap="round"/>
+    <path d="M812 99 l16 9 -16 9 z" fill="#0ca30c"/>
+    <text x="300" y="94" fill="#0ca30c" font-family="JetBrains Mono" font-size="15" font-weight="500">PASS</text>
+
+    <!-- BLOCKED: red, stops dead at the first bar -->
+    <path d="M222 176 H392" stroke="#e5484d" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="398" cy="176" r="13" fill="none" stroke="#e5484d" stroke-width="4"/>
+    <path d="M390 168 l16 16 M406 168 l-16 16" stroke="#e5484d" stroke-width="4" stroke-linecap="round"/>
+    <text x="242" y="206" fill="#e5484d" font-family="JetBrains Mono" font-size="15" font-weight="500">BLOCKED</text>
+
+    <!-- ALPACA block -->
+    <rect x="846" y="72" width="212" height="126" rx="16" fill="#0d2b26" stroke="#199e70" stroke-width="2"/>
+    <text x="952" y="124" text-anchor="middle" fill="#fff" font-family="Inter" font-size="27" font-weight="700">ALPACA</text>
+    <text x="952" y="152" text-anchor="middle" fill="#6fae99" font-family="Inter" font-size="14">order executed</text>
+  </svg>
+  </figure>
+
+  <div class="foot">
+    <span>risk limits live in <b>code</b>, not the prompt</span>
+    <span>autonomous &middot; options &middot; defined-risk</span>
+  </div>
+</div>
