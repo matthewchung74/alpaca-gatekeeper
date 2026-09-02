@@ -107,10 +107,16 @@ def manage_open_spreads(
         if d.action != "close":
             continue
 
-        # Pay up to the stop level to get out; a limit at the last mark can sit
-        # unfilled exactly when exiting matters most.
-        limit = min(mark + 0.05, sp.entry_credit * settings.limits.stop_loss_multiple) \
-            if mark is not None else sp.width
+        # Pay what it costs to get out. This used to be capped at the stop
+        # level -- min(mark + 0.05, entry_credit * stop_loss_multiple) -- which
+        # is fine until the position gaps THROUGH the stop. Then the cap pins
+        # the bid below the market and the close can never fill: on 2026-09-02
+        # IWM 293/295 marked 1.20 while the limit stayed frozen at 1.17, and the
+        # agent retried an unfillable order every 10 minutes while the loss ran.
+        # A stop is an instruction to be out, so the price follows the market.
+        # The width is the true ceiling: no spread can cost more than that to
+        # close, so this can never pay an absurd price.
+        limit = min(mark + 0.05, sp.width) if mark is not None else sp.width
         # Close only what the broker says we hold.
         qty = held_qty(sp, obs["positions"])
         if qty != sp.qty:
