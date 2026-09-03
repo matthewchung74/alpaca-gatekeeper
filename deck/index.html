@@ -434,9 +434,39 @@ proposal: QQQ 2026-09-03 <span class="cmd">C 713.0/715.0 x15 @ 0.42</span> (core
     </div>
   </section>
 
-  <!-- 12 ─ close -->
+
+  <!-- 12 ─ results -->
   <section class="slide">
-    <div class="num">11 · submission</div>
+    <div class="num">11 · results</div>
+    <div class="stack">
+      <h2>What the losses have in common</h2>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Regime at open</th><th>Trades</th><th>Net</th><th>What was permitted</th></tr></thead>
+          <tbody>
+            <tr><td class="name">sideways</td><td>4</td><td class="green">+1,455</td><td>puts and calls</td></tr>
+            <tr><td class="name">bear</td><td>5</td><td class="red">−3,298</td><td>calls only</td></tr>
+            <tr><td class="name">nine closed · 5 winners</td><td>56%</td><td class="red">−1,843</td><td>−1.87% on the event</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="lede">
+        Three of the four losses were short call spreads opened under a <span class="amber" style="font-family:var(--mono);font-size:.9em">bear</span>
+        label, which permits calls only. They lost together, on the same move, because they were
+        the same bet in three tickers.
+      </p>
+      <p class="small">
+        No gate prevents that. <span style="font-family:var(--mono)">concentration</span> caps exposure per underlying;
+        nothing aggregates direction across the book. The config declared a <span style="font-family:var(--mono)">max_portfolio_delta</span>
+        that was read nowhere and deleted mid-event as dead code — the concept it named is the one control that would have caught this.
+        Selling credit spreads risks about three dollars to make one, so break-even sat near 65% on the trades taken. The agent ran 56%.
+      </p>
+    </div>
+  </section>
+
+  <!-- 13 ─ close -->
+  <section class="slide">
+    <div class="num">12 · submission</div>
     <div class="stack">
       <h2>Submission details</h2>
       <div class="two">

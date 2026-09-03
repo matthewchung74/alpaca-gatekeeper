@@ -51,6 +51,43 @@ Four bugs surfaced only against the live API, each of which would have cost mone
 3. **The fill price is not the limit price.** Profit target, stop and realized P&L all key off the entry price, so the agent polls to a settled state and reconciles size and price.
 4. **Explicit `position_intent` is a safety feature.** Omitting it gets the order accepted with Alpaca inferring `buy_to_open` — opening an opposite position instead of closing. Explicit `*_to_close` fails loudly with a 422 instead.
 
+## Results, and what they say
+
+Nine positions closed, five winners, four losers. **−$1,843 realized, −1.87% on the event.**
+The strategy finished a loser, and the record says why.
+
+| Regime at open | Trades | Net |
+|---|---|---|
+| `sideways` | 4 | **+1,455** |
+| `bear` | 5 | **−3,298** |
+
+Selling defined-risk credit spreads risks roughly three dollars to make one, so it needs a
+high win rate to clear. On the trades actually taken — stops working, losses cut before
+maximum — break-even sat near **65%**. The agent ran **56%**. That gap is the whole result.
+
+Three of the four losses were short call spreads opened under a `bear` label, which permits
+calls only. They lost together, on the same move, because they were the same bet in three
+tickers. No gate prevents that: `concentration` caps exposure *per underlying*, and nothing
+aggregates direction across the book. `config.RiskLimits` did declare a `max_portfolio_delta`
+of 0.30 — with units in the comment — and it was read nowhere in the codebase. It was deleted
+mid-event as dead config, which was right; the concept it named is the one control that would
+have caught this, and building it is the first thing we would do next.
+
+The fourth loss is the counterexample worth keeping. The SPY 767/762 **put** spread lost
+−$1,800 from a `sideways` label, which a bear reading would have forbidden outright. The
+regime layer is not simply wrong — it was net positive on `sideways` and negative on `bear`,
+across nine trades, which is too small a sample to conclude much beyond *this is the thing to
+measure next*.
+
+Two losses exited on `assignment_risk` rather than `stop_loss`, at 3.77× and 1.94× the credit
+against a 3.0× stop. That is not the stop failing to bind. Sweeps pause inside the no-trade
+window before the close and resume after the open, so nothing ran between 15:50 on 09-02 and
+09:40 on 09-03; the positions gapped overnight and the first check that could act came after
+the damage. On expiry day `assignment_risk` also outranks `stop_loss`, and closes at the same
+market price either way. The limitation is real, was documented before it cost anything, and
+is the clearest argument for an out-of-hours risk check rather than a faster one.
+
+
 ## Evidence
 
 Every cycle journals the snapshot, the model's verbatim reasoning, the proposal, all fifteen gate verdicts, the order and the fill — public on the dashboard. From the second live trade, unedited:
