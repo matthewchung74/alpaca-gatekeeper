@@ -35,6 +35,7 @@ def evaluate(
     regime: str = "sideways",
     chains: dict | None = None,
     quotes: dict | None = None,
+    target_expiry: str | None = None,
 ) -> list[GateResult]:
     """Run every gate. Order matters only for readability; all of them run."""
     g: list[GateResult] = []
@@ -79,10 +80,11 @@ def evaluate(
     ))
 
     # --- Gate 5: expiry discipline ---------------------------------------
-    ok = proposal.expiry == TARGET_EXPIRY
+    required = target_expiry or TARGET_EXPIRY
+    ok = proposal.expiry == required
     g.append(GateResult(
         name="expiry", passed=ok,
-        detail=f"{proposal.expiry} vs required {TARGET_EXPIRY} (settles before the deadline)",
+        detail=f"{proposal.expiry} vs required {required}",
     ))
 
     # --- Gate 6: defined risk --------------------------------------------

@@ -188,6 +188,23 @@ def fill_result(order_id: str, profile: str, tries: int = 24,
     }
 
 
+def list_expiries(underlying: str, profile: str, on_or_after: str,
+                  limit: int = 400) -> list[str]:
+    """Expiries actually listed for an underlying, nearest first.
+
+    The contracts endpoint returns rows sorted by expiry, so a truncated page
+    still contains the nearest dates -- which is all the caller wants. Never
+    guess these from a calendar: SPY, QQQ and IWM do not share one weekly
+    pattern, and a guessed date produces an empty chain and a stood-down cycle.
+    """
+    data = run("api", "GET",
+               f"/v2/options/contracts?underlying_symbols={underlying}"
+               f"&expiration_date_gte={on_or_after}&limit={limit}",
+               profile=profile)
+    rows = (data or {}).get("option_contracts") or []
+    return sorted({r["expiration_date"] for r in rows if r.get("expiration_date")})
+
+
 def news(symbols: list[str], profile: str, limit: int = 12) -> list[dict]:
     """Recent headlines for the universe (Benzinga via Alpaca)."""
     data = run("data", "news", "--symbols", ",".join(symbols),

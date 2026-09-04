@@ -15,7 +15,12 @@ ET = ZoneInfo("America/New_York")
 # --- Event ---------------------------------------------------------------
 KICKOFF = datetime(2026, 8, 28, 11, 0, tzinfo=ET)   # first legal fill
 DEADLINE = datetime(2026, 9, 4, 11, 0, tzinfo=ET)   # submission closes
-TARGET_EXPIRY = "2026-09-03"                        # everything settles Thursday
+TARGET_EXPIRY = "2026-09-03"                        # hackathon expiry; fallback only
+# Past the event the expiry has to roll, or the agent simply stops: every
+# proposal is checked against one date, and once it passes nothing can trade.
+# resolve_expiry() in loop.py picks the nearest listed expiry at least this
+# many days out, per cycle, from the broker rather than from a calendar.
+MIN_DAYS_TO_EXPIRY = 3
 
 # --- Accounts ------------------------------------------------------------
 # `dev` is the practice account and the default. `comp` is judged; its
