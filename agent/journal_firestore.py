@@ -115,15 +115,33 @@ class FirestoreJournal:
     def all_spreads(self, profile: str) -> list[dict]:
         return list(reversed(self._spreads(profile)))
 
-    def recent_cycles(self, limit: int = 50) -> list[dict]:
+    def recent_cycles(self, limit: int = 50, profile: str | None = None) -> list[dict]:
+        """Recent cycles, narrowed to one profile.
+
+        Without the profile filter a second agent writing to the same database
+        appears in the dashboard's decision log. Over-fetch and narrow in
+        Python rather than adding a where() -- filtering on profile while
+        ordering by ts needs a composite index, which this backend avoids by
+        design.
+        """
         docs = self.db.collection(CYCLES).order_by(
             "ts", direction=firestore.Query.DESCENDING
-        ).limit(limit).stream()
-        return [{**d.to_dict(), "id": d.id} for d in docs]
+        ).limit(limit if profile is None else limit * 6).stream()
+        rows = [{**d.to_dict(), "id": d.id} for d in docs]
+        if profile is not None:
+            rows = [r for r in rows if r.get("profile") == profile]
+        return rows[:limit]
 
-    def equity_curve(self) -> list[dict]:
+    def equity_curve(self, profile: str | None = None) -> list[dict]:
+        """The equity series for one profile.
+
+        The dashboard derives its headline equity from the last point here, so
+        an unfiltered curve does not merely add stray points -- it reports
+        another account's balance as this one's.
+        """
         docs = self.db.collection(MARKS).order_by("ts").stream()
-        return [{"ts": d.get("ts"), "equity": d.get("equity")} for d in docs]
+        return [{"ts": d.get("ts"), "equity": d.get("equity")} for d in docs
+                if profile is None or d.get("profile") == profile]
 
     def day_start_equity(self, day: str) -> float | None:
         docs = self.db.collection(MARKS).where(

@@ -171,18 +171,30 @@ class SQLiteJournal:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def recent_cycles(self, limit: int = 50) -> list[dict]:
+    def recent_cycles(self, limit: int = 50, profile: str | None = None) -> list[dict]:
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT * FROM cycles ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
+            if profile is None:
+                rows = c.execute(
+                    "SELECT * FROM cycles ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM cycles WHERE profile = ? ORDER BY id DESC LIMIT ?",
+                    (profile, limit),
+                ).fetchall()
         return [dict(r) for r in rows]
 
-    def equity_curve(self) -> list[dict]:
+    def equity_curve(self, profile: str | None = None) -> list[dict]:
         with self._conn() as c:
-            rows = c.execute(
-                "SELECT ts, equity FROM marks ORDER BY id ASC"
-            ).fetchall()
+            if profile is None:
+                rows = c.execute(
+                    "SELECT ts, equity FROM marks ORDER BY id ASC"
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT ts, equity FROM marks WHERE profile = ? ORDER BY id ASC",
+                    (profile,),
+                ).fetchall()
         return [dict(r) for r in rows]
 
     def day_start_equity(self, day: str) -> float | None:

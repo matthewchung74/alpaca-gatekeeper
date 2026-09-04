@@ -51,7 +51,7 @@ def _state() -> dict:
     profile = SETTINGS.profile
     now = now_et()
 
-    curve = j.equity_curve()
+    curve = j.equity_curve(profile)
     spreads = j.all_spreads(profile)
     open_rows = [s for s in spreads if s["status"] == "open"]
 
@@ -71,7 +71,7 @@ def _state() -> dict:
     day = now.strftime("%Y-%m-%d")
     day_start = j.day_start_equity(day) or equity
 
-    cycles = j.recent_cycles(40)
+    cycles = j.recent_cycles(40, profile=profile)
     for c in cycles:
         for f in ("gates", "proposal"):
             if c.get(f):
