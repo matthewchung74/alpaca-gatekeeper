@@ -23,18 +23,17 @@ from datetime import datetime, timedelta, timezone
 
 GCLOUD = "/Users/mattc/google-cloud-sdk/bin/gcloud"
 ALPACA = "/opt/homebrew/bin/alpaca"
-PROFILE = "dev"
+PROFILE = "comp"
 PROJECT = "alpaca-ai-agent-2026"
 REGION = "us-east1"
-FIRESTORE = (f"https://firestore.googleapis.com/v1/projects/{PROJECT}"
-             "/databases/(default)/documents")
+STATE_URL = "https://alpaca-ai-agent-2026.web.app/api/state"
 
 # SPY260903P00767000 -> root, yymmdd, right, strike x1000
 OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
 ET = timezone(timedelta(hours=-4))          # EDT for the whole competition window
-# The hackathon is over; this now watches ongoing trading on the dev account.
-# Drawdown is measured from the account's own starting balance, not the event's.
+TARGET_EXPIRY = "2026-09-03"
+DEADLINE = datetime(2026, 9, 4, 11, 0, tzinfo=ET)
 STARTING_EQUITY = 100_000.0
 MAX_DAILY_LOSS_PCT = 0.04
 MAX_EVENT_DD_PCT = 0.15
@@ -82,90 +81,15 @@ def in_session(now_et: datetime) -> bool:
     return (now_et.hour, now_et.minute) >= (9, 30) and now_et.hour < 16
 
 
-# --- check 1: the journal, read straight from Firestore ---------------
+# --- check 1: the dashboard, which is also the journal's only public window ---
 
-def _val(v: dict):
-    """Decode one Firestore typed value."""
-    if "nullValue" in v: return None
-    if "stringValue" in v: return v["stringValue"]
-    if "doubleValue" in v: return float(v["doubleValue"])
-    if "integerValue" in v: return int(v["integerValue"])
-    if "booleanValue" in v: return v["booleanValue"]
-    return None
-
-
-def _query(collection: str, order_desc: str | None = None, limit: int = 200):
-    """Run one Firestore query and return decoded documents.
-
-    Deliberately single-field: filter or order, never both, so this needs no
-    composite index -- the same constraint journal_firestore.py works under.
-    Narrowing by profile happens in Python.
-    """
-    q: dict = {"from": [{"collectionId": collection}], "limit": limit}
-    if order_desc:
-        q["orderBy"] = [{"field": {"fieldPath": order_desc}, "direction": "DESCENDING"}]
-    body = json.dumps({"structuredQuery": q}).encode()
+def check_dashboard() -> dict | None:
     try:
-        tok = subprocess.run([GCLOUD, "auth", "print-access-token"],
-                             capture_output=True, text=True, timeout=60, check=True).stdout.strip()
-        req = urllib.request.Request(
-            f"{FIRESTORE}:runQuery", data=body, method="POST",
-            headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            rows = json.load(r)
-    except (urllib.error.URLError, TimeoutError, OSError,
-            subprocess.SubprocessError, json.JSONDecodeError) as e:
-        report("CRIT", "journal", f"Firestore {collection} unreadable: {e}")
+        with urllib.request.urlopen(STATE_URL, timeout=45) as r:
+            return json.loads(r.read())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
+        report("CRIT", "dashboard", f"{STATE_URL} unreachable or unparseable: {e}")
         return None
-    out = []
-    for row in rows:
-        doc = row.get("document")
-        if not doc:
-            continue
-        d = {k: _val(v) for k, v in (doc.get("fields") or {}).items()}
-        d["id"] = doc["name"].rsplit("/", 1)[-1]
-        out.append(d)
-    return out
-
-
-def load_state() -> dict | None:
-    """What the checks need, for THIS profile.
-
-    Equity comes from the broker rather than the journal: it is the number the
-    risk checks should react to, and it stays correct even if a cycle failed to
-    record a mark.
-    """
-    spreads = _query("spreads")
-    cycles = _query("cycles", order_desc="ts")
-    if spreads is None or cycles is None:
-        return None
-
-    try:
-        r = subprocess.run([ALPACA, "api", "GET", "/v2/account", "--profile", PROFILE],
-                           capture_output=True, text=True, timeout=90)
-        acct = json.loads(r.stdout) if r.returncode == 0 else {}
-    except (subprocess.SubprocessError, json.JSONDecodeError, OSError) as e:
-        report("CRIT", "broker", f"account unreadable: {e}")
-        return None
-    equity = float(acct.get("equity") or 0)
-    if equity <= 0:
-        report("CRIT", "broker", f"no equity for profile {PROFILE}: {str(acct)[:160]}")
-        return None
-
-    today = datetime.now(ET).strftime("%Y-%m-%d")
-    marks = [m for m in (_query("marks", order_desc="ts") or [])
-             if m.get("profile") == PROFILE and str(m.get("ts", ""))[:10] == today]
-    day_start = marks[-1]["equity"] if marks else equity
-
-    return {
-        "equity": equity,
-        "day_start_equity": day_start,
-        "cycles": [c for c in cycles if c.get("profile") == PROFILE][:40],
-        "open_spreads": [s for s in spreads
-                         if s.get("profile") == PROFILE and s.get("status") == "open"],
-        "closed_spreads": [s for s in spreads
-                           if s.get("profile") == PROFILE and s.get("status") == "closed"],
-    }
 
 
 # --- check 2: is the schedule still armed ---
@@ -326,12 +250,9 @@ def check_expiry(state: dict, now_et: datetime) -> None:
         report("CRIT", "expiry",
                f"{len(expiring)} spread(s) expiring today still open at "
                f"{now_et:%H:%M} ET; the flatten has not completed")
-    stale = [s for s in open_rows
-             if s.get("expiry") and s["expiry"] < today]
-    if stale:
+    if now_et.date() > datetime.fromisoformat(TARGET_EXPIRY).date() and open_rows:
         report("CRIT", "expiry",
-               f"{len(stale)} spread(s) open past their own expiry: "
-               + ", ".join(f"{s['underlying']} {s['expiry']}" for s in stale[:3]))
+               f"{len(open_rows)} spread(s) open past the {TARGET_EXPIRY} target expiry")
 
 
 # --- check 9: does the broker agree with the journal ---
@@ -429,7 +350,7 @@ def main() -> int:
     now_et = now_utc.astimezone(ET)
     print(f"--- gatekeeper health {now_et:%Y-%m-%d %H:%M:%S ET} ---")
 
-    state = load_state()
+    state = check_dashboard()
     check_schedulers()
     check_executions(now_utc, now_et)
     if state is not None:
@@ -451,6 +372,8 @@ def main() -> int:
             print(f"    last journaled cycle {last.astimezone(ET):%m-%d %H:%M ET} "
                   f"({(now_utc - last).total_seconds() / 60:.0f} min ago)")
 
+    days_left = (DEADLINE - now_et).total_seconds() / 86400
+    print(f"    {days_left:.1f} days to the submission deadline")
 
     crit = [f for f in findings if f[0] == "CRIT"]
     warn = [f for f in findings if f[0] == "WARN"]

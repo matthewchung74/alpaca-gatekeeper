@@ -15,12 +15,7 @@ ET = ZoneInfo("America/New_York")
 # --- Event ---------------------------------------------------------------
 KICKOFF = datetime(2026, 8, 28, 11, 0, tzinfo=ET)   # first legal fill
 DEADLINE = datetime(2026, 9, 4, 11, 0, tzinfo=ET)   # submission closes
-TARGET_EXPIRY = "2026-09-03"                        # hackathon expiry; fallback only
-# Past the event the expiry has to roll, or the agent simply stops: every
-# proposal is checked against one date, and once it passes nothing can trade.
-# resolve_expiry() in loop.py picks the nearest listed expiry at least this
-# many days out, per cycle, from the broker rather than from a calendar.
-MIN_DAYS_TO_EXPIRY = 3
+TARGET_EXPIRY = "2026-09-03"                        # everything settles Thursday
 
 # --- Accounts ------------------------------------------------------------
 # `dev` is the practice account and the default. `comp` is judged; its
@@ -53,28 +48,6 @@ class RiskLimits:
     # never shown.
     min_short_delta: float = 0.20
     max_short_delta: float = 0.35
-    # Directional risk across the WHOLE book, as a fraction of equity.
-    # Max loss signed by the move that hurts: call spreads lose on a rally,
-    # put spreads on a selloff, so holding both sides nets toward zero --
-    # an iron condor can only lose one wing.
-    #
-    # Be clear about what this does NOT do. It would not have prevented the
-    # 2026-09-02 loss. Those three same-way call spreads totalled 7,855, or
-    # 7.9% of equity, and pass any cap that also lets a single full-size
-    # tranche through -- tranche_risk permits 12% on one trade. They did not
-    # lose because the book was too large; they lost because three small bets
-    # were the same bet, on a strategy that needs roughly 65% winners and got
-    # 56%. Correlation is not the same problem as size, and this gate measures
-    # size.
-    #
-    # What it does do is stop the book becoming lopsidedly large -- several
-    # full tranches all leaning one way. That is worth having on its own terms.
-    #
-    # It replaces a notional-delta version that penalised WIDTH rather than
-    # risk: a 5-wide spread carries far more delta than a 2-wide one while
-    # losing no more than its width, and that gate blocked a $9,416 trade
-    # tranche_risk was happy with.
-    max_directional_risk_pct: float = 0.20
     no_trade_open_minutes: int = 5
     no_trade_close_minutes: int = 5
     max_tranche_risk_pct: float = 0.12      # worst case on any one CORE tranche

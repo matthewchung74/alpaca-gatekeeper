@@ -7,7 +7,6 @@ broker. Gate zero is the account guard, which cannot be reached by any prompt.
 """
 from __future__ import annotations
 
-import re
 from datetime import datetime
 
 from . import regime as regime_mod
@@ -16,9 +15,6 @@ from .config import (
     AccountGuardError, assert_may_trade, in_no_trade_window,
 )
 from .models import GateResult, TradeProposal, occ_symbol
-
-# SPY260903P00767000 -> root, yymmdd, right, strike x1000
-OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
 
 def evaluate(
@@ -33,10 +29,6 @@ def evaluate(
     limits: RiskLimits,
     halted: bool = False,
     regime: str = "sideways",
-    chains: dict | None = None,
-    quotes: dict | None = None,
-    target_expiry: str | None = None,
-    open_spreads: list[dict] | None = None,
 ) -> list[GateResult]:
     """Run every gate. Order matters only for readability; all of them run."""
     g: list[GateResult] = []
@@ -81,11 +73,10 @@ def evaluate(
     ))
 
     # --- Gate 5: expiry discipline ---------------------------------------
-    required = target_expiry or TARGET_EXPIRY
-    ok = proposal.expiry == required
+    ok = proposal.expiry == TARGET_EXPIRY
     g.append(GateResult(
         name="expiry", passed=ok,
-        detail=f"{proposal.expiry} vs required {required}",
+        detail=f"{proposal.expiry} vs required {TARGET_EXPIRY} (settles before the deadline)",
     ))
 
     # --- Gate 6: defined risk --------------------------------------------
@@ -164,9 +155,6 @@ def evaluate(
     # --- Gate 14: short-leg delta ----------------------------------------
     g.append(_delta_gate(proposal, chain, limits))
 
-    # --- Gate 15: directional risk ---------------------------------------
-    g.append(_directional_risk_gate(proposal, open_spreads or [], equity, limits))
-
     return g
 
 
@@ -241,80 +229,6 @@ def _delta_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits) -> Gat
                 f"{'within' if inside else 'OUTSIDE'} [{lo:.2f}, {hi:.2f}]"
                 + ("" if inside else
                    f"; {'too far OTM to earn its risk' if d < lo else 'too close to the money'}")),
-    )
-
-
-def _spread_max_loss(row: dict) -> float:
-    """Worst case on one journaled spread, in dollars."""
-    width = abs(float(row["short_strike"]) - float(row["long_strike"]))
-    credit = float(row.get("entry_credit") or 0)
-    qty = int(row.get("qty") or 0)
-    # core sells premium and can lose the width less the credit; satellite pays
-    # a debit and can only lose that debit.
-    per = (width - credit) if (row.get("sleeve") or "core") == "core" else credit
-    return max(per, 0.0) * 100.0 * qty
-
-
-def _hurt_by_a_rally(right: str, sleeve: str) -> bool:
-    """Which way does this structure lose?
-
-    A short call spread loses when the market rises; a short put spread when it
-    falls. The satellite sleeve buys direction, so it is the other way round.
-    """
-    if (sleeve or "core") == "core":
-        return right == "C"
-    return right == "P"
-
-
-def _directional_risk_gate(
-    proposal: TradeProposal, open_spreads: list[dict], equity: float,
-    limits: RiskLimits,
-) -> GateResult:
-    """How much of the account is at risk in one direction.
-
-    Every other limit here is per-trade or per-underlying. That is how three
-    short call spreads in SPY, QQQ and IWM -- each comfortably inside
-    tranche_risk, concentration and delta_band -- became one directional bet
-    that lost together on 2026-09-02 for -4,010.
-
-    Exposure is each position's MAX LOSS, signed by the move that would cause
-    it: call spreads positive, put spreads negative. Holding both sides nets
-    toward zero, which is right -- an iron condor can only lose one wing. The
-    proposal is added to what is already held, so the gate blocks the marginal
-    trade that tips the book over rather than judging it alone.
-
-    Max loss rather than notional delta, deliberately. Delta scales with the
-    width of the structure while the loss does not: a 5-wide spread carries far
-    more delta than a 2-wide one and can lose no more than its own width. An
-    earlier delta version of this gate blocked a $9,416 trade that tranche_risk
-    was happy with, purely for being wide.
-    """
-    if equity <= 0:
-        return GateResult(name="directional_risk", passed=True,
-                          detail="no equity reported; exposure unmeasurable")
-
-    held = 0.0
-    for row in open_spreads:
-        try:
-            loss = _spread_max_loss(row)
-            up = _hurt_by_a_rally(row["right"], row.get("sleeve"))
-        except (KeyError, TypeError, ValueError):
-            continue
-        held += loss if up else -loss
-
-    mine = proposal.total_max_loss
-    marginal = mine if _hurt_by_a_rally(proposal.right, proposal.sleeve) else -mine
-    total = held + marginal
-    ratio = abs(total) / equity
-    ok = ratio <= limits.max_directional_risk_pct
-    side = "a rally" if total > 0 else "a selloff"
-
-    return GateResult(
-        name="directional_risk", passed=ok,
-        detail=(f"{abs(total):,.0f} of {equity:,.0f} equity = {ratio:.1%} at risk on "
-                f"{side}, {'within' if ok else 'OVER'} "
-                f"{limits.max_directional_risk_pct:.0%} "
-                f"(held {held:+,.0f}, this trade {marginal:+,.0f})"),
     )
 
 

@@ -18,14 +18,14 @@ from . import risk
 from .manage import decide_exit, held_qty, is_actually_held, mark_to_close, spread_from_row
 from .brain import Brain, build_snapshot
 from .config import (
-    COMPETITION_PROFILE, MIN_DAYS_TO_EXPIRY, STARTING_EQUITY, TARGET_EXPIRY,
-    UNIVERSE, Settings, in_no_trade_window, now_et,
+    COMPETITION_PROFILE, STARTING_EQUITY, TARGET_EXPIRY, UNIVERSE,
+    Settings, in_no_trade_window, now_et,
 )
 from .journal import open_journal
 from .models import AgentDecision
 
 
-def observe(profile: str, expiry: str) -> dict:
+def observe(profile: str) -> dict:
     """Pull everything a decision needs, in as few calls as possible."""
     acct = cli.account(profile)
     equity = float(acct["equity"])
@@ -41,11 +41,11 @@ def observe(profile: str, expiry: str) -> dict:
             # bear tapes, so the model needs call strikes to pick from. ~6%
             # either side of spot covers the 0.05-0.35 delta band.
             puts = cli.option_chain(
-                sym, profile, expiry=expiry, option_type="put",
+                sym, profile, expiry=TARGET_EXPIRY, option_type="put",
                 strike_gte=round(mid * 0.94), strike_lte=round(mid * 1.00),
             )
             calls = cli.option_chain(
-                sym, profile, expiry=expiry, option_type="call",
+                sym, profile, expiry=TARGET_EXPIRY, option_type="call",
                 strike_gte=round(mid * 1.00), strike_lte=round(mid * 1.06),
             )
             chains[sym] = {**puts, **calls}
@@ -59,34 +59,6 @@ def observe(profile: str, expiry: str) -> dict:
         headlines = []
     return {"account": acct, "equity": equity, "positions": positions,
             "quotes": quotes, "chains": chains, "bars": bars, "news": headlines}
-
-
-def resolve_expiry(profile: str, now) -> str:
-    """The expiry every proposal this cycle must use.
-
-    Nearest date listed for EVERY name in the universe at least
-    MIN_DAYS_TO_EXPIRY out. Requiring it across the whole universe matters:
-    IWM lists dates SPY and QQQ do not, and picking one of those would let the
-    model propose a spread whose chain comes back empty for the other two.
-
-    Falls back to the configured constant if the broker cannot be reached, so
-    a data outage degrades to the old fixed behaviour rather than to no expiry
-    at all.
-    """
-    floor = (now + timedelta(days=MIN_DAYS_TO_EXPIRY)).strftime("%Y-%m-%d")
-    common: set[str] | None = None
-    for sym in UNIVERSE:
-        try:
-            found = set(cli.list_expiries(sym, profile, floor))
-        except cli.CLIError as e:
-            print(f"  warn: expiries for {sym} unavailable: {e}", file=sys.stderr)
-            return TARGET_EXPIRY
-        common = found if common is None else (common & found)
-    if not common:
-        print("  warn: no expiry common to the universe; using the configured one",
-              file=sys.stderr)
-        return TARGET_EXPIRY
-    return min(common)
 
 
 def manage_open_spreads(
@@ -217,11 +189,8 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         print("  outside the trading session; sweep is a no-op")
         return 0
 
-    expiry = resolve_expiry(profile, now)
-    print(f"  target expiry: {expiry}")
-
     try:
-        obs = observe(profile, expiry)
+        obs = observe(profile)
     except cli.CLIError as e:
         journal.record_cycle(profile=profile, action="error", error=str(e))
         print(f"  observe failed: {e}", file=sys.stderr)
@@ -247,7 +216,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         now=now, equity=equity, day_start_equity=day_start,
         positions=obs["positions"], quotes=obs["quotes"], chains=obs["chains"],
         bars=obs.get("bars", {}), news=obs.get("news", []),
-        limits=settings.limits, target_expiry=expiry,
+        limits=settings.limits,
     )
 
     try:
@@ -288,8 +257,6 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         p, profile=profile, now=now, equity=equity, day_start_equity=day_start,
         open_positions=obs["positions"], chain=obs["chains"].get(p.underlying, {}),
         limits=settings.limits, regime=decision.regime,
-        chains=obs["chains"], quotes=obs["quotes"], target_expiry=expiry,
-        open_spreads=journal.open_spreads(profile),
     )
     for g in gates:
         print(f"    {g}")
