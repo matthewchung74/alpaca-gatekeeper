@@ -17,7 +17,7 @@ The usual answer is to put the risk rules in the prompt. That fails quietly. A m
 Gatekeeper takes the opposite position. **Claude decides what to trade. Deterministic Python decides whether that trade is allowed to exist.** The two are separate processes with a hard boundary between them:
 
 ```
-observe ──▶ reason (Claude Opus 5) ──▶ 15 gates (pure Python) ──▶ Alpaca CLI ──▶ journal
+observe ──▶ reason (Claude Opus 5) ──▶ 16 gates (pure Python) ──▶ Alpaca CLI ──▶ journal
              proposes                    disposes                  executes
 ```
 
@@ -95,7 +95,7 @@ You can watch it comply. From a live decision:
 
 ---
 
-## The 15 gates
+## The 16 gates
 
 Every gate is a pure function of the proposal plus observed account and market state. A proposal must clear **all** of them.
 
@@ -116,6 +116,9 @@ Every gate is a pure function of the proposal plus observed account and market s
 | 12 | `trading_window` | Not in the first or last 5 minutes of a session |
 | 13 | `liquidity` | Both legs quoted, spread ≤ 10% of mid, OI ≥ 500 |
 | 14 | `delta_band` | Short-leg \|delta\| within 0.20–0.35 |
+| 15 | `portfolio_delta` | Net directional exposure across the whole book ≤ 2.0× equity |
+
+Gate 15 is the answer to how this event was lost: three short call spreads in three tickers, each inside every other limit, were one bet that fell together. `concentration` caps exposure per underlying and nothing aggregated direction across the book. Its 2.0× threshold is calibrated on a single week and is a starting point, not a validated constant.
 
 Gate 14 exists because the prompt had asked for a 0.25–0.30 short delta since day one and nothing enforced it — a 0.304-delta call cleared every gate on 28 Aug because none of them looked. The enforced band is deliberately wider than the instruction: strikes are a point apart and delta moves 0.03–0.05 per strike, so a literal 0.25–0.30 gate leaves one legal strike per wing and, on the live 3 Sep chain, none at all for QQQ puts. It is also the one gate that passes when its input is missing, because it governs strategy conformance rather than solvency — max loss is bounded by `defined_risk` and `tranche_risk` whatever the delta.
 
@@ -212,7 +215,7 @@ agent/
   config.py            limits, event timing, the account guard
   models.py            TradeProposal / OpenSpread; derived risk lives here
   regime.py            regime -> budget and permitted direction, per sleeve
-  risk.py              the 15 gates
+  risk.py              the 16 gates
   manage.py            exit rules, structure-aware
   brain.py             Claude Opus 5, structured output
   alpaca_cli.py        the execution boundary

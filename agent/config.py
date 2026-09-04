@@ -48,6 +48,23 @@ class RiskLimits:
     # never shown.
     min_short_delta: float = 0.20
     max_short_delta: float = 0.35
+    # Directional exposure across the WHOLE book, as a multiple of equity.
+    # Every other limit here is per-trade or per-underlying, which is how three
+    # short call spreads in three tickers -- each comfortably inside
+    # tranche_risk, concentration and delta_band -- became one bet that lost
+    # together on 2026-09-02 for -4,010.
+    #
+    # Measured as |sum of signed leg deltas x contracts x 100 x spot| / equity.
+    # A single 15-20 lot spread on a $700 underlying already carries roughly
+    # 0.6x equity in notional delta, so any cap below 1.0 blocks normal
+    # operation -- the 0.30 that previously sat in this file was never read by
+    # anything and its units were never checked against a real book.
+    #
+    # 2.0 permits two concurrent same-way spreads and blocks a third. That
+    # threshold is calibrated against one week and nine trades, which is not
+    # enough to call it validated. It is a starting point, chosen to make the
+    # limit exist and bind, not a number anyone should trust yet.
+    max_portfolio_delta: float = 2.0
     no_trade_open_minutes: int = 5
     no_trade_close_minutes: int = 5
     max_tranche_risk_pct: float = 0.12      # worst case on any one CORE tranche

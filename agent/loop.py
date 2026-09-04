@@ -257,6 +257,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         p, profile=profile, now=now, equity=equity, day_start_equity=day_start,
         open_positions=obs["positions"], chain=obs["chains"].get(p.underlying, {}),
         limits=settings.limits, regime=decision.regime,
+        chains=obs["chains"], quotes=obs["quotes"],
     )
     for g in gates:
         print(f"    {g}")
