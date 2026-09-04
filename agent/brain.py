@@ -22,8 +22,9 @@ right and let the gates do their job.
 
 MANDATE
 - Universe: {', '.join(UNIVERSE)}. Nothing else.
-- Expiry: {TARGET_EXPIRY} only. It settles before the submission deadline, so
-  the final P&L is locked rather than left to a 0DTE pin.
+- Expiry: exactly the TARGET EXPIRY given in the snapshot, and nothing else.
+  It is chosen to sit a few days out, so the position is never left to a 0DTE
+  pin. A proposal for any other date is rejected before it reaches the broker.
 - Instrument: defined-risk vertical credit spreads. For puts the short strike is
   ABOVE the long strike; for calls it is BELOW.
 - TWO SLEEVES. Pick one per cycle and set `sleeve` accordingly.
@@ -124,6 +125,7 @@ def build_snapshot(
     limits: RiskLimits,
     bars: dict[str, list] | None = None,
     news: list[dict] | None = None,
+    target_expiry: str = TARGET_EXPIRY,
 ) -> str:
     """Render the market state as text for the model.
 
@@ -135,7 +137,7 @@ def build_snapshot(
         f"TIME: {now:%Y-%m-%d %H:%M %Z}",
         f"EQUITY: ${equity:,.2f}   DAY START: ${day_start_equity:,.2f}   "
         f"DAY P&L: ${equity - day_start_equity:+,.2f}",
-        f"TARGET EXPIRY: {TARGET_EXPIRY}",
+        f"TARGET EXPIRY: {target_expiry}",
         "",
         "OPEN POSITIONS:",
     ]
@@ -170,7 +172,7 @@ def build_snapshot(
             f"{b['t'][5:10]} o{b['o']:.2f} h{b['h']:.2f} l{b['l']:.2f} c{b['c']:.2f}"
             for b in series[-8:]))
 
-    lines += ["", f"OPTION CHAINS ({TARGET_EXPIRY}), tradeable delta band:"]
+    lines += ["", f"OPTION CHAINS ({target_expiry}), tradeable delta band:"]
     for sym, chain in chains.items():
         lines.append(f"  --- {sym} ---")
         puts, calls = [], []
