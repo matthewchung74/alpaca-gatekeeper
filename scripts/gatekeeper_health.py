@@ -14,6 +14,7 @@ ever with GET -- it cannot place, modify, or cancel an order.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -28,6 +29,11 @@ PROJECT = "alpaca-ai-agent-2026"
 REGION = "us-east1"
 FIRESTORE = (f"https://firestore.googleapis.com/v1/projects/{PROJECT}"
              "/databases/(default)/documents")
+# Layer 2 (the Claude pass) reads THIS, not the public dashboard. The dashboard
+# is profile-filtered to `comp` and has been frozen since the hackathon closed,
+# so a monitor that curls it is reading a finished book and will report nothing
+# about the account actually trading.
+STATE_DUMP = os.path.expanduser(f"~/.cache/gatekeeper/state_{PROFILE}.json")
 
 # SPY260903P00767000 -> root, yymmdd, right, strike x1000
 OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
@@ -430,6 +436,12 @@ def main() -> int:
     print(f"--- gatekeeper health {now_et:%Y-%m-%d %H:%M:%S ET} ---")
 
     state = load_state()
+    if state is not None:
+        try:
+            with open(STATE_DUMP, "w") as fh:
+                json.dump(state, fh, default=str)
+        except OSError as e:                # never let the dump break the check
+            print(f"    [note] state dump failed: {e}")
     check_schedulers()
     check_executions(now_utc, now_et)
     if state is not None:
@@ -442,8 +454,9 @@ def main() -> int:
         check_expiry(state, now_et)
 
         eq = state.get("equity")
-        print(f"    equity {eq:,.2f}  day P&L {state.get('day_pnl', 0):+,.2f}  "
-              f"total {state.get('total_pnl', 0):+,.2f}  "
+        day_start = state.get("day_start_equity") or eq
+        print(f"    equity {eq:,.2f}  day P&L {eq - day_start:+,.2f}  "
+              f"total {eq - STARTING_EQUITY:+,.2f}  "
               f"open {len(state.get('open_spreads') or [])}  "
               f"closed {len(state.get('closed_spreads') or [])}")
         last = parse_ts((state.get('cycles') or [{}])[0].get('ts'))
