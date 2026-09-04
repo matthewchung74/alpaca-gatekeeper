@@ -289,6 +289,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         open_positions=obs["positions"], chain=obs["chains"].get(p.underlying, {}),
         limits=settings.limits, regime=decision.regime,
         chains=obs["chains"], quotes=obs["quotes"], target_expiry=expiry,
+        open_spreads=journal.open_spreads(profile),
     )
     for g in gates:
         print(f"    {g}")
