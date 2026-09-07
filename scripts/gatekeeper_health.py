@@ -176,27 +176,49 @@ def load_state() -> dict | None:
 
 # --- check 2: is the schedule still armed ---
 
-def check_schedulers() -> None:
+def check_schedulers() -> bool:
+    """Returns True if entry-cycles is deliberately paused.
+
+    Pausing entry-cycles is how this agent is stopped between runs, and the
+    whole entry half of the check has to know that. Otherwise the act of
+    stopping the agent makes the watchdog page every 15 minutes about the
+    agent being stopped -- which is how a real alert gets ignored.
+
+    Exit management is a separate matter and stays at full severity: a paused
+    exit-sweeps, with spreads open, IS an emergency.
+    """
+    entries_paused = False
     out = gcloud("scheduler", "jobs", "list", f"--location={REGION}",
                  "--format=json")
     if out is None:
-        return
+        return False
     jobs = {j["name"].rsplit("/", 1)[-1]: j for j in json.loads(out)}
     for name in ("entry-cycles", "exit-sweeps"):
         j = jobs.get(name)
         if j is None:
             report("CRIT", "scheduler", f"{name} does not exist")
             continue
-        if j.get("state") != "ENABLED":
-            report("CRIT", "scheduler", f"{name} is {j.get('state')}, not ENABLED")
+        sched_state = j.get("state")
+        if sched_state != "ENABLED":
+            deliberate = (name == "entry-cycles" and sched_state == "PAUSED")
+            entries_paused = entries_paused or deliberate
+            report("WARN" if deliberate else "CRIT", "scheduler",
+                   f"{name} is {sched_state}, not ENABLED"
+                   + (" -- entries deliberately paused; exit management "
+                      "unaffected" if deliberate else ""))
         # A populated status block means the last delivery attempt errored.
         if j.get("status"):
-            report("CRIT", "scheduler", f"{name} last delivery failed: {j['status']}")
+            stale = entries_paused and name == "entry-cycles"
+            report("WARN" if stale else "CRIT", "scheduler",
+                   f"{name} last delivery failed: {j['status']}"
+                   + (" [pre-pause; no further deliveries]" if stale else ""))
+    return entries_paused
 
 
 # --- check 3+4: did the jobs actually run, and did they succeed ---
 
-def check_executions(now_utc: datetime, now_et: datetime) -> None:
+def check_executions(now_utc: datetime, now_et: datetime, *,
+                     entries_paused: bool = False) -> None:
     out = gcloud("run", "jobs", "executions", "list", f"--region={REGION}",
                  "--limit=25", "--format=json")
     if out is None:
@@ -217,8 +239,12 @@ def check_executions(now_utc: datetime, now_et: datetime) -> None:
 
         if created and (now_utc - created) < timedelta(hours=24):
             if failed or cancelled:
-                report("CRIT", "executions",
-                       f"{name} failed={failed} cancelled={cancelled}")
+                # agent-sweep failures always page: exits are the half that
+                # can lose money unattended.
+                expected = entries_paused and job == "agent-cycle"
+                report("WARN" if expected else "CRIT", "executions",
+                       f"{name} failed={failed} cancelled={cancelled}"
+                       + (" [entry job, paused]" if expected else ""))
         if job and created:
             newest[job] = max(newest.get(job, created), created)
 
@@ -236,8 +262,9 @@ def check_executions(now_utc: datetime, now_et: datetime) -> None:
 
 # --- check 5: has the journal advanced for every entry slot that has passed ---
 
-def check_entry_coverage(state: dict, now_et: datetime) -> None:
-    if now_et.weekday() >= 5:
+def check_entry_coverage(state: dict, now_et: datetime, *,
+                         entries_paused: bool = False) -> None:
+    if entries_paused or now_et.weekday() >= 5:
         return
     today = now_et.strftime("%Y-%m-%d")
     due = [f"{h:02d}:{m:02d}" for h, m in ENTRY_SLOTS
@@ -263,7 +290,7 @@ def check_entry_coverage(state: dict, now_et: datetime) -> None:
 # --- check 6: errors the agent recorded about itself ---
 
 def check_journal_errors(state: dict, now_utc: datetime, *,
-                         reconciled: bool) -> None:
+                         reconciled: bool, entries_paused: bool = False) -> None:
     """Errors from the last 24h, escalated by whether the damage still stands.
 
     A past error stays CRIT while its consequence is live. Once a later cycle
@@ -289,11 +316,19 @@ def check_journal_errors(state: dict, now_utc: datetime, *,
         if not ts or (now_utc - ts) >= timedelta(hours=24):
             continue
         recovered = reconciled and later_ok is not None and ts < later_ok
-        report("WARN" if recovered else "CRIT", "journal",
+        # While entries are paused no later cycle can ever run, so `recovered`
+        # can never become true and these would page forever. Still worth
+        # seeing; not worth waking anyone.
+        if recovered:
+            note = (" [recovered: a later cycle completed and the broker "
+                    "agrees with the journal]")
+        elif entries_paused:
+            note = " [entries paused; cannot clear until the agent resumes]"
+        else:
+            note = ""
+        report("WARN" if (recovered or entries_paused) else "CRIT", "journal",
                f"cycle {ts.astimezone(ET):%m-%d %H:%M ET} recorded error: "
-               f"{str(c['error'])[:220]}"
-               + (" [recovered: a later cycle completed and the broker agrees "
-                  "with the journal]" if recovered else ""))
+               f"{str(c['error'])[:220]}" + note)
 
 
 # --- check 7: risk limits, from the equity the agent itself reported ---
@@ -442,14 +477,15 @@ def main() -> int:
                 json.dump(state, fh, default=str)
         except OSError as e:                # never let the dump break the check
             print(f"    [note] state dump failed: {e}")
-    check_schedulers()
-    check_executions(now_utc, now_et)
+    entries_paused = check_schedulers()
+    check_executions(now_utc, now_et, entries_paused=entries_paused)
     if state is not None:
         # Reconciliation first: it is the evidence that decides whether a past
         # journal error still matters or is already repaired.
         reconciled = check_reconciliation(state)
-        check_journal_errors(state, now_utc, reconciled=reconciled)
-        check_entry_coverage(state, now_et)
+        check_journal_errors(state, now_utc, reconciled=reconciled,
+                             entries_paused=entries_paused)
+        check_entry_coverage(state, now_et, entries_paused=entries_paused)
         check_risk(state)
         check_expiry(state, now_et)
 
