@@ -92,9 +92,12 @@ class RiskLimits:
     # (spot x IV x sqrt(DTE/365)). Eight of nine hackathon strikes sat inside
     # the prior five sessions' range; this would have rejected all eight.
     expected_move_multiple: float = 1.0
-    # Credit as a fraction of width. A 0.15-0.20 delta strike at 7-14 DTE pays
-    # 20-25% in normal vol; below this the trade is not worth its width.
-    min_credit_pct_of_width: float = 0.20
+    # Credit as a fraction of width. For a narrow spread this is roughly the
+    # short leg's delta, and range_buffer puts the short leg near 0.15, so a
+    # floor above that can never be met. 10% rejects the wide, thin structure
+    # (the first live dry run proposed a 10-wide paying 6%) without rejecting
+    # the strategy. It is a payoff sanity check, not a volatility filter.
+    min_credit_pct_of_width: float = 0.10
     # --- Book shape ---
     # Per-tranche limits let four bear-sized tranches add up to more than one
     # sideways tranche, and three call spreads in three tickers that move

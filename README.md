@@ -17,7 +17,7 @@ The usual answer is to put the risk rules in the prompt. That fails quietly. A m
 Gatekeeper takes the opposite position. **Claude decides what to trade. Deterministic Python decides whether that trade is allowed to exist.** The two are separate processes with a hard boundary between them:
 
 ```
-observe ──▶ reason (Claude Opus 5) ──▶ 16 gates (pure Python) ──▶ Alpaca CLI ──▶ journal
+observe ──▶ reason (Claude Opus 5) ──▶ 22 gates (pure Python) ──▶ Alpaca CLI ──▶ journal
              proposes                    disposes                  executes
 ```
 
@@ -73,29 +73,25 @@ This is a risk control and a credibility control at once. Alpaca's paper environ
 
 ---
 
-## Regime is a control, not a label
+## Regime is computed, not asked
 
-The agent classifies the tape as bull, bear or sideways. That classification is **not advisory** — it mechanically sets the risk budget and forbids trade directions:
+The hackathon version let the model label the tape and bound the risk budget and the permitted direction to that label. On 2026-09-01 it labelled a 1.2% dip to the bottom of a 15-session band "bear", the bear rule permitted calls only, and the book sold four call spreads at the range low. They lost together on the rally two days later.
 
-| Regime | Core budget | Core may sell | Satellite budget | Satellite may buy |
-|---|---|---|---|---|
-| sideways | 12.00% | puts or calls | — | **nothing** |
-| bull | 10.20% | **puts** only | 3.40% | **calls** |
-| bear | 4.20% | **calls** only | 1.40% | **puts** |
+Now `regime.classify` reads the last ten completed sessions: a trend if spot has moved more than twice the mean daily range since the session ten back, otherwise sideways, plus where spot sits inside the ten-session high-low.
 
-Two properties matter here:
+| Read | Core budget | Core may sell |
+|---|---|---|
+| sideways, middle of range | 12.00% | puts or calls |
+| sideways, bottom quarter | 12.00% | **puts** only |
+| sideways, top quarter | 12.00% | **calls** only |
+| bull | 10.20% | **puts** only |
+| bear | 4.20% | **calls** only |
 
-**A regime can only ever reduce risk.** The configured budget is a ceiling no market read can raise. An unrecognised regime string falls back to the most defensive policy.
-
-**The bear rule forbids selling puts into a downtrend** — precisely how short-premium accounts die. The agent's own analysis is what triggers that lockout, and the prompt tells it so: inflating the regime to unlock size is the one thing that would actually lose the money.
-
-You can watch it comply. From a live decision:
-
-> *"Neither the up-tape needed for a 'bull' call nor the sequence of lower lows needed for 'bear' is present, so I report sideways honestly and take the direction the chop favours."*
+The model sees the read in its snapshot and cannot change it.
 
 ---
 
-## The 16 gates
+## The 22 gates
 
 Every gate is a pure function of the proposal plus observed account and market state. A proposal must clear **all** of them.
 
@@ -115,10 +111,16 @@ Every gate is a pure function of the proposal plus observed account and market s
 | 11 | `position_count` | 8 concurrent positions |
 | 12 | `trading_window` | Not in the first or last 5 minutes of a session |
 | 13 | `liquidity` | Both legs quoted, spread ≤ 10% of mid, OI ≥ 500 |
-| 14 | `delta_band` | Short-leg \|delta\| within 0.20–0.35 |
-| 15 | `portfolio_delta` | Net directional exposure across the whole book ≤ 2.0× equity |
+| 14 | `delta_band` | Short-leg \|delta\| within 0.10–0.35 |
+| 15 | `directional_risk` | Max loss signed by direction across the book ≤ 20% of equity |
+| 16 | `range_buffer` | Short strike outside the 10-session high-low and ≥ 1 expected move from spot |
+| 17 | `credit_floor` | Credit ≥ 10% of width |
+| 18 | `book_risk` | Open max loss + proposal ≤ 24% of equity × regime multiplier |
+| 19 | `same_direction` | ≤ 2 open core spreads on one right across SPY/QQQ/IWM |
+| 20 | `losing_side` | No new spread on a right where an open spread marks ≥ 1.5× its credit |
+| 21 | `cadence` | 1 entry per day; 24h cooldown per underlying and right after a close |
 
-Gate 15 is the answer to how this event was lost: three short call spreads in three tickers, each inside every other limit, were one bet that fell together. `concentration` caps exposure per underlying and nothing aggregated direction across the book. Its 2.0× threshold is calibrated on a single week and is a starting point, not a validated constant.
+Gates 16 to 21 come from the post-mortem. Six of nine hackathon short strikes finished in the money; held to expiry the book would have lost about $11,400 against the $1,843 it did lose. The strikes sat inside the prior week's range at one to four days to expiry, the book stacked three same-direction spreads in three tickers that move together, and the model proposed a trade in every cycle it had budget for. Each of those is now a gate.
 
 Gate 14 exists because the prompt had asked for a 0.25–0.30 short delta since day one and nothing enforced it — a 0.304-delta call cleared every gate on 28 Aug because none of them looked. The enforced band is deliberately wider than the instruction: strikes are a point apart and delta moves 0.03–0.05 per strike, so a literal 0.25–0.30 gate leaves one legal strike per wing and, on the live 3 Sep chain, none at all for QQQ puts. It is also the one gate that passes when its input is missing, because it governs strategy conformance rather than solvency — max loss is bounded by `defined_risk` and `tranche_risk` whatever the delta.
 
@@ -214,8 +216,8 @@ Four bugs that only a real fill could surface, each of which would have cost mon
 agent/
   config.py            limits, event timing, the account guard
   models.py            TradeProposal / OpenSpread; derived risk lives here
-  regime.py            regime -> budget and permitted direction, per sleeve
-  risk.py              the 16 gates
+  regime.py            tape read from the bars; regime -> budget and permitted sides
+  risk.py              the 22 gates
   manage.py            exit rules, structure-aware
   brain.py             Claude Opus 5, structured output
   alpaca_cli.py        the execution boundary

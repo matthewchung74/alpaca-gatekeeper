@@ -16,7 +16,7 @@
 2. **Expiry:** nearest expiry listed for the whole universe at least 7 days out (`MIN_DAYS_TO_EXPIRY = 7`). SPY, QQQ and IWM list Mon/Wed/Fri expiries, so this lands at 7 to 9 days; no ceiling is needed.
 3. **New gates**, all journaled:
    - `range_buffer`: short strike outside the 10-session high-low and at least 1.0x the expected move from spot (`spot * IV * sqrt(DTE/365)`, IV from the short leg's chain snapshot). Missing bars, spot or IV block.
-   - `credit_floor`: core credit at least 20% of width. Satellite passes.
+   - `credit_floor`: core credit at least 10% of width (revised from 20% after the first live dry run: credit/width is bounded by the short delta, which range_buffer puts near 0.15). Satellite passes.
    - `book_risk`: open max loss plus the proposal within 24% of equity times the regime multiplier.
    - `same_direction`: at most 2 open core spreads on the same right across the universe.
    - `losing_side`: no new core spread on a right where an open core spread marks at or above 1.5x its credit.

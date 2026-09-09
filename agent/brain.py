@@ -34,7 +34,9 @@ MANDATE
     recent range and at least one expected move from spot -- the snapshot
     prints both numbers per underlying, and the range_buffer gate enforces
     them. That usually lands the short leg near 0.10-0.20 delta. The
-    delta_band gate rejects a short leg outside 0.10-0.35.
+    delta_band gate rejects a short leg outside 0.10-0.35. Keep the width
+    tight (2-5 points): credit as a fraction of width falls as the width
+    grows, and the credit_floor gate rejects anything under 10% of width.
   * satellite (DEBIT spread): buy a defined-risk directional spread WITH the
     trend; long strike NEARER the money than the short. It loses the debit
     more often than it wins, and pays multiples when a trend actually runs.
