@@ -174,10 +174,12 @@ class ExitDecision(BaseModel):
 
 
 class AgentDecision(BaseModel):
-    """What the brain returns each cycle. `proposal` is None when it stands down."""
-    regime: Literal["bull", "bear", "sideways"] = Field(
-        description="Your read of the current regime for the traded universe"
-    )
+    """What the brain returns each cycle. `proposal` is None when it stands down.
+
+    No regime field. The regime is computed from the bars in regime.classify
+    and shown to the model; a label the model could set was a control the
+    model could move, and on 2026-09-01 it moved it to the wrong side.
+    """
     reasoning: str = Field(description="Your analysis, for the journal and the demo")
     proposal: TradeProposal | None = Field(
         default=None, description="The trade to open, or null to stand down this cycle"

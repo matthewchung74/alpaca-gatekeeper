@@ -303,3 +303,26 @@ def test_small_chain_is_untouched():
     out = _rendered(_fake_chain("SPY", 5, 5))
     assert "omitted" not in out
     assert len([l for l in out.splitlines() if "SPY260903" in l]) == 10
+
+
+# --- the model sees the computed tape; it does not set it -------------------
+
+def test_snapshot_shows_the_computed_tape_and_permitted_sides():
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    from agent.regime import TapeRead
+    read = TapeRead(regime="sideways", range_position=0.03, lookback_high=775.3,
+                    lookback_low=762.04, trend_pct=-0.007, avg_range_pct=0.008, detail="d")
+    out = build_snapshot(
+        now=datetime(2026, 9, 1, 9, 46, tzinfo=ET), equity=100_000.0,
+        day_start_equity=100_000.0, positions=[], quotes={}, chains={}, bars={},
+        news=[], limits=LIMITS, tape={"SPY": read}, sides={"SPY": ("P",)},
+    )
+    assert "TAPE READ" in out and "SPY: sideways" in out
+    assert "range 762.04-775.30" in out and "position 3%" in out
+    assert "core may sell: P" in out
+
+
+def test_decision_has_no_regime_field():
+    from agent.models import AgentDecision
+    assert "regime" not in AgentDecision.model_fields

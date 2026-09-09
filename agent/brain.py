@@ -10,6 +10,7 @@ import anthropic
 
 from .config import TARGET_EXPIRY, UNIVERSE, RiskLimits
 from .models import AgentDecision, parse_strike
+from .regime import TapeRead
 
 PER_WING_CAP = 30   # per underlying, per side
 
@@ -23,17 +24,17 @@ right and let the gates do their job.
 MANDATE
 - Universe: {', '.join(UNIVERSE)}. Nothing else.
 - Expiry: exactly the TARGET EXPIRY given in the snapshot, and nothing else.
-  It is chosen to sit a few days out, so the position is never left to a 0DTE
-  pin. A proposal for any other date is rejected before it reaches the broker.
+  It is chosen to sit at least a week out, so a strike one expected move away
+  clears the recent range. A proposal for any other date is rejected before
+  it reaches the broker.
 - Instrument: defined-risk vertical credit spreads. For puts the short strike is
   ABOVE the long strike; for calls it is BELOW.
 - TWO SLEEVES. Pick one per cycle and set `sleeve` accordingly.
-  * core (CREDIT spread): sell premium at roughly 0.25-0.30 delta on the short
-    strike; short strike NEARER the money than the long. Deliberately
-    aggressive: more credit, and a short strike that will be tested. Do not
-    drift back to 0.15. This is the workhorse and wins slowly and often.
-    Aim at 0.25-0.30, but note this is now ENFORCED in code: the delta_band
-    gate rejects any short leg outside 0.20-0.35, whichever way it drifts.
+  * core (CREDIT spread): sell premium with the short strike OUTSIDE the
+    recent range and at least one expected move from spot -- the snapshot
+    prints both numbers per underlying, and the range_buffer gate enforces
+    them. That usually lands the short leg near 0.10-0.20 delta. The
+    delta_band gate rejects a short leg outside 0.10-0.35.
   * satellite (DEBIT spread): buy a defined-risk directional spread WITH the
     trend; long strike NEARER the money than the short. It loses the debit
     more often than it wins, and pays multiples when a trend actually runs.
@@ -43,28 +44,23 @@ MANDATE
   the debit you will pay for satellite.
   Satellite sleeve: directional, smaller, only on a clear catalyst.
 
-YOUR REGIME CALL IS A BINDING CONTROL, NOT A COMMENT
-Whatever regime you report is applied deterministically before your trade is
-placed. It decides how much risk the tranche may carry and which direction of
-spread is allowed at all:
-  sideways -> core 12.00% (P or C credit). NO satellite: there is no trend to
-              buy, so paying a debit for convexity is burning premium.
-  bull     -> core 10.20% (P credit only; short calls fight the tape).
-              satellite 3.40% (C debit -- buy the uptrend).
-  bear     -> core 4.20% (C credit only; short puts into a downtrend is how
-              premium sellers blow up). satellite 1.40% (P debit).
-The sleeves lean opposite ways ON PURPOSE: core sells premium against the move,
-satellite buys exposure with it. Proposing a satellite trade in a sideways tape
-is rejected outright.
-So call the regime honestly. Saying "sideways" to unlock size you have not
-earned is the one thing that will actually lose this account money. If you
-propose a direction the regime forbids, the trade is rejected outright; if you
-propose a size above the regime budget, it is silently cut to fit.
+THE TAPE READ IS COMPUTED FOR YOU
+The snapshot carries, per underlying, a regime (bull / bear / sideways) read
+from the daily bars, the position of spot inside the recent range, the
+expected move to expiry, and the sides the core sleeve may sell. You do not
+set any of it. The budget and the permitted sides follow from it:
+  sideways -> core 12.00%. Bottom quarter of the range: puts only. Top
+              quarter: calls only. Middle: either. NO satellite.
+  bull     -> core 10.20% (P credit only). satellite 3.40% (C debit).
+  bear     -> core 4.20% (C credit only). satellite 1.40% (P debit).
+A side the read forbids is rejected outright; a size above the budget is
+silently cut to fit. If no side is permitted in the name you like, stand down
+or pick another name.
 
 HOW TO THINK
-- Read the regime first. In a sideways or mildly bullish tape, put credit
-  spreads are the bread and butter. In a sharp downtrend, either stand down or
-  move to call spreads above resistance.
+- Read the tape section first. Sell the side it permits, at a strike beyond
+  the range and the expected move. A range that has just moved to one edge
+  is a mean-reversion risk, not a trend to lean on.
 - Prefer strikes with tight bid-ask and real open interest. A theoretical edge
   on an illiquid contract is not an edge.
 - Standing down is a valid and often correct decision. Propose null rather than
@@ -94,6 +90,19 @@ class Brain:
         self.model = model
         self.client = client or anthropic.Anthropic()
 
+    def preflight(self) -> None:
+        """One cheap call so a dead key or an empty balance fails loudly and early.
+
+        On 2026-09-07 the entry cycle fetched every quote, chain and headline,
+        then died on 'credit balance is too low'. Check the API before paying
+        for any of that. Raises the SDK's own exception on failure.
+        """
+        self.client.messages.create(
+            model=self.model, max_tokens=1,
+            thinking={"type": "disabled"}, output_config={"effort": "low"},
+            messages=[{"role": "user", "content": "ping"}],
+        )
+
     def decide(self, snapshot: str, limits: RiskLimits) -> AgentDecision:
         """Return a structured decision, or a stand-down if the model declines."""
         response = self.client.messages.parse(
@@ -107,7 +116,6 @@ class Brain:
         )
         if getattr(response, "stop_reason", None) == "refusal":
             return AgentDecision(
-                regime="sideways",
                 reasoning="Model declined to answer this cycle; standing down.",
                 proposal=None,
             )
@@ -126,6 +134,8 @@ def build_snapshot(
     bars: dict[str, list] | None = None,
     news: list[dict] | None = None,
     target_expiry: str = TARGET_EXPIRY,
+    tape: dict[str, TapeRead] | None = None,
+    sides: dict[str, tuple] | None = None,
 ) -> str:
     """Render the market state as text for the model.
 
@@ -171,6 +181,20 @@ def build_snapshot(
         lines.append("    " + "  ".join(
             f"{b['t'][5:10]} o{b['o']:.2f} h{b['h']:.2f} l{b['l']:.2f} c{b['c']:.2f}"
             for b in series[-8:]))
+
+    lines += ["", "TAPE READ (computed from the bars; binding):"]
+    if tape:
+        for sym, read in tape.items():
+            allowed = "/".join((sides or {}).get(sym, ())) or "none"
+            if read.range_position is None:
+                lines.append(f"  {sym}: {read.regime} -- {read.detail}; core may sell: {allowed}")
+                continue
+            lines.append(
+                f"  {sym}: {read.regime}, range {read.lookback_low:.2f}-{read.lookback_high:.2f}, "
+                f"position {read.range_position:.0%}, {read.trend_pct:+.2%} vs "
+                f"{limits.range_lookback} sessions ago; core may sell: {allowed}")
+    else:
+        lines.append("  (unavailable)")
 
     lines += ["", f"OPTION CHAINS ({target_expiry}), tradeable delta band:"]
     for sym, chain in chains.items():
