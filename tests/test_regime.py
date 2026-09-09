@@ -326,3 +326,27 @@ def test_snapshot_shows_the_computed_tape_and_permitted_sides():
 def test_decision_has_no_regime_field():
     from agent.models import AgentDecision
     assert "regime" not in AgentDecision.model_fields
+
+
+def test_snapshot_prints_the_range_buffer_boundary_from_the_chain():
+    """The gate judges each strike with its own IV; the model must see the
+    same boundary, or it sizes the move from ATM vol and comes up short."""
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    from agent.regime import TapeRead
+    read = TapeRead(regime="sideways", range_position=0.5, lookback_high=770.0,
+                    lookback_low=750.0, trend_pct=0.0, avg_range_pct=0.008, detail="d")
+    chain = {}
+    for k in range(735, 790):
+        right = "P" if k < 760 else "C"
+        chain[occ_symbol("SPY", "2026-09-04", right, float(k))] = {
+            "impliedVolatility": 0.15, "greeks": {"delta": 0.2},
+            "latestQuote": {"bp": 1.0, "ap": 1.05}}
+    out = build_snapshot(
+        now=datetime(2026, 8, 28, 13, 0, tzinfo=ET), equity=100_000.0,
+        day_start_equity=100_000.0, positions=[], quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+        chains={"SPY": chain}, bars={}, news=[], limits=LIMITS, target_expiry="2026-09-04",
+        tape={"SPY": read}, sides={"SPY": ("P", "C")},
+    )
+    # 7 DTE at 15% IV: expected move 15.79 -> puts <= 744.2 and < 750; calls >= 775.8 and > 770
+    assert "puts clear at <= 744" in out and "calls clear at >= 776" in out

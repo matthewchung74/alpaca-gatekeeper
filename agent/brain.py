@@ -31,9 +31,12 @@ MANDATE
   ABOVE the long strike; for calls it is BELOW.
 - TWO SLEEVES. Pick one per cycle and set `sleeve` accordingly.
   * core (CREDIT spread): sell premium with the short strike OUTSIDE the
-    recent range and at least one expected move from spot -- the snapshot
-    prints both numbers per underlying, and the range_buffer gate enforces
-    them. That usually lands the short leg near 0.10-0.20 delta. The
+    recent range and at least one expected move from spot. The TAPE READ
+    section prints, per underlying, the range and the first strike on each
+    side that clears the range_buffer gate, judged with that strike's own
+    IV. Use that boundary; do not recompute the move from ATM vol, because
+    put skew makes the gate's number larger than yours. The short leg
+    usually lands near 0.10-0.20 delta. The
     delta_band gate rejects a short leg outside 0.10-0.35. Keep the width
     tight (2-5 points): credit as a fraction of width falls as the width
     grows, and the credit_floor gate rejects anything under 10% of width.
@@ -85,6 +88,44 @@ WHAT YOU MUST NOT DO
   prior week unless the bars above actually show it. Your regime call sets the
   risk budget, so an ungrounded read puts real money at risk.
 """
+
+
+def _boundary_line(sym: str, read: TapeRead, quote: dict, chain: dict, now,
+                   target_expiry: str, limits: RiskLimits) -> str:
+    """Where the range_buffer gate starts passing, per side, from the chain itself.
+
+    Each strike is judged with its own IV, exactly as the gate will judge it,
+    so put skew is already in the number the model reads.
+    """
+    from datetime import date
+    from .risk import range_clearance
+    bid, ask = quote.get("bp"), quote.get("ap")
+    if not (bid and ask):
+        return "range_buffer boundary: no quote"
+    spot = (float(bid) + float(ask)) / 2
+    dte = max((date.fromisoformat(target_expiry) - now.date()).days, 1)
+    best: dict[str, tuple[float, float | None]] = {}
+    for osym, snap in chain.items():
+        iv = snap.get("impliedVolatility")
+        if iv is None:
+            continue
+        right = osym[len(sym) + 6]
+        strike = parse_strike(osym)
+        if not range_clearance(right, strike, spot, float(iv), dte, read, limits).ok:
+            continue
+        cur = best.get(right)
+        # puts: the highest clearing strike; calls: the lowest
+        if cur is None or (strike > cur[0] if right == "P" else strike < cur[0]):
+            best[right] = (strike, (snap.get("greeks") or {}).get("delta"))
+    parts = []
+    for right, word, op in (("P", "puts", "<="), ("C", "calls", ">=")):
+        if right in best:
+            k, d = best[right]
+            dd = f", delta {abs(float(d)):.2f}" if d is not None else ""
+            parts.append(f"{word} clear at {op} {k:g}{dd}")
+        else:
+            parts.append(f"no {word[:-1]} strike in the chain clears")
+    return f"range_buffer boundary ({dte} DTE, each strike at its own IV): " + "; ".join(parts)
 
 
 class Brain:
@@ -195,6 +236,8 @@ def build_snapshot(
                 f"  {sym}: {read.regime}, range {read.lookback_low:.2f}-{read.lookback_high:.2f}, "
                 f"position {read.range_position:.0%}, {read.trend_pct:+.2%} vs "
                 f"{limits.range_lookback} sessions ago; core may sell: {allowed}")
+            lines.append("    " + _boundary_line(sym, read, quotes.get(sym) or {},
+                                                 chains.get(sym) or {}, now, target_expiry, limits))
     else:
         lines.append("  (unavailable)")
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import date, datetime, timedelta
+from typing import NamedTuple
 
 from . import regime as regime_mod
 from .config import (
@@ -353,6 +354,30 @@ def _mid(q: dict) -> float | None:
     return (bid + ask) / 2 if bid > 0 and ask > 0 else None
 
 
+class Clearance(NamedTuple):
+    ok: bool
+    dist: float        # short strike's distance from spot, signed so OTM is positive
+    need: float        # expected_move_multiple x expected move
+    em: float          # one expected move to expiry, in points
+    inside: bool       # strike inside the lookback high-low
+
+
+def range_clearance(right: str, strike: float, spot: float, iv: float, dte: int,
+                    tape, limits: RiskLimits) -> Clearance:
+    """Does a short strike clear the range AND one expected move?
+
+    One function, used by the gate and by the snapshot, so the number the
+    model is shown is the number the gate checks. On 2026-09-09 the model
+    sized the move from ATM vol and the gate from the put's own skewed vol;
+    the strike was two points short and the cycle was wasted.
+    """
+    em = spot * float(iv) * math.sqrt(max(dte, 1) / 365.0)
+    need = limits.expected_move_multiple * em
+    dist = (strike - spot) if right == "C" else (spot - strike)
+    inside = (strike <= tape.lookback_high) if right == "C" else (strike >= tape.lookback_low)
+    return Clearance(dist >= need and not inside, dist, need, em, inside)
+
+
 def _range_buffer_gate(proposal: TradeProposal, tape, chain: dict,
                        spot: float | None, now: datetime, limits: RiskLimits) -> GateResult:
     """The short strike must sit outside the recent range AND one expected move out.
@@ -376,16 +401,14 @@ def _range_buffer_gate(proposal: TradeProposal, tape, chain: dict,
         return GateResult(name="range_buffer", passed=False,
                           detail=f"no IV published for short leg {sym}; cannot size the expected move")
     dte = max((date.fromisoformat(proposal.expiry) - now.date()).days, 1)
-    em = spot * float(iv) * math.sqrt(dte / 365.0)
-    need = limits.expected_move_multiple * em
     k = proposal.short_strike
-    dist = (k - spot) if proposal.right == "C" else (spot - k)
+    c = range_clearance(proposal.right, k, spot, float(iv), dte, tape, limits)
+    dist, need = c.dist, c.need
     problems: list[str] = []
     if dist < need:
         problems.append(f"{dist:.2f} from spot < {limits.expected_move_multiple:g}x "
-                        f"expected move {em:.2f} ({dte} DTE, IV {float(iv):.1%})")
-    inside = (k <= tape.lookback_high) if proposal.right == "C" else (k >= tape.lookback_low)
-    if inside:
+                        f"expected move {c.em:.2f} ({dte} DTE, IV {float(iv):.1%})")
+    if c.inside:
         problems.append(f"short {k:g} inside the {limits.range_lookback}-session range "
                         f"{tape.lookback_low:.2f}-{tape.lookback_high:.2f}")
     if problems:
