@@ -230,3 +230,18 @@ def test_legs_are_sell_short_buy_long():
     assert legs[0]["position_intent"] == "sell_to_open"
     assert legs[1]["symbol"] == "SPY260903P00747000"
     assert legs[1]["side"] == "buy"
+
+
+# --- post-mortem: strikes lived inside the range at 1-4 DTE ---------------
+
+def test_expiry_floor_is_a_week_out():
+    """Every hackathon trade was 1-4 DTE, where a 0.25-delta strike sits
+    inside one ordinary day's range. Seven days puts it outside."""
+    from agent.config import MIN_DAYS_TO_EXPIRY
+    assert MIN_DAYS_TO_EXPIRY >= 7
+
+
+def test_delta_band_floor_admits_one_expected_move():
+    """One expected move at 7-14 DTE is roughly 0.16 delta; the old 0.20
+    floor would reject every strike the range gate permits."""
+    assert LIMITS.min_short_delta <= 0.10
