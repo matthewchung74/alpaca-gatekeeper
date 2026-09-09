@@ -15,6 +15,7 @@ from datetime import timedelta
 from . import alpaca_cli as cli
 from . import regime
 from . import risk
+from .regime import TapeRead, classify, core_sides
 from .manage import decide_exit, held_qty, is_actually_held, mark_to_close, spread_from_row
 from .brain import Brain, build_snapshot
 from .config import (
@@ -89,19 +90,47 @@ def resolve_expiry(profile: str, now) -> str:
     return min(common)
 
 
+def read_tape(obs: dict, now, limits) -> tuple[dict[str, TapeRead], dict[str, tuple]]:
+    """Classify every name in the universe from its own bars and quote.
+
+    A name with no usable quote or history gets a defensive sideways read
+    with no range, which the range_buffer gate turns into no entry.
+    """
+    today = now.strftime("%Y-%m-%d")
+    tape: dict[str, TapeRead] = {}
+    sides: dict[str, tuple] = {}
+    for sym in UNIVERSE:
+        q = obs["quotes"].get(sym) or {}
+        bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
+        spot = (bid + ask) / 2 if bid and ask else None
+        bars = obs.get("bars", {}).get(sym) or []
+        if spot is None:
+            tape[sym] = TapeRead("sideways", None, None, None, None, None, "no quote")
+        else:
+            tape[sym] = classify(bars, spot, today, lookback=limits.range_lookback,
+                                 trend_multiple=limits.trend_range_multiple)
+        sides[sym] = core_sides(tape[sym], limits)
+        print(f"  tape {sym}: {tape[sym].detail}; core may sell {'/'.join(sides[sym]) or 'none'}")
+    return tape, sides
+
+
 def manage_open_spreads(
     settings: Settings, journal, obs: dict, now, *, dry_run: bool
-) -> None:
+) -> dict:
     """Close anything the exit rules call for, before considering new risk.
 
     Exits are never gated on the account guard the way entries are: if the
     judged account somehow holds a position, we must always be able to get out
     of it.
+
+    Returns the conservative mark of every spread the broker holds, keyed by
+    journal id, so the entry gates can see which side is already losing.
     """
     profile = settings.profile
     rows = journal.open_spreads(profile)
+    marks: dict = {}
     if not rows:
-        return
+        return marks
 
     spreads = [spread_from_row(r) for r in rows]
     symbols = sorted({s for sp in spreads for s in (sp.short_symbol(), sp.long_symbol())})
@@ -121,6 +150,8 @@ def manage_open_spreads(
                   "-> not yet filled; skipping")
             continue
         mark = mark_to_close(sp, quotes)
+        if mark is not None:
+            marks[sp.id] = mark
         q = obs["quotes"].get(sp.underlying) or {}
         bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
         spot = (bid + ask) / 2 if bid and ask else None
@@ -201,6 +232,8 @@ def manage_open_spreads(
         print(f"        CLOSED @ {exit_px:.2f} (limit {limit:.2f}, mark "
               f"{mark if mark is not None else float('nan'):.2f})  "
               f"realized ${pnl:+,.0f}  order={oid}")
+        marks.pop(sp.id, None)
+    return marks
 
 
 def run_cycle(settings: Settings, *, dry_run: bool = False,
@@ -220,6 +253,19 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
     expiry = resolve_expiry(profile, now)
     print(f"  target expiry: {expiry}")
 
+    brain = None
+    if not manage_only:
+        # The model is the one dependency that fails silently at billing
+        # time. Check it before paying for a snapshot it cannot read.
+        try:
+            brain = Brain(model=settings.model)
+            brain.preflight()
+        except Exception as e:  # noqa: BLE001 - any failure here means no cycle
+            journal.record_cycle(profile=profile, action="error",
+                                 error=f"anthropic preflight: {e}")
+            print(f"  anthropic preflight failed: {e}", file=sys.stderr)
+            return 1
+
     try:
         obs = observe(profile, expiry)
     except cli.CLIError as e:
@@ -234,7 +280,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
                         positions=obs["positions"])
 
     # Exits before entries, always.
-    manage_open_spreads(settings, journal, obs, now, dry_run=dry_run)
+    open_marks = manage_open_spreads(settings, journal, obs, now, dry_run=dry_run)
 
     if manage_only:
         # Exit sweeps run far more often than entry cycles: stops and profit
@@ -243,33 +289,36 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         print("  manage-only pass complete")
         return 0
 
+    tape, sides = read_tape(obs, now, settings.limits)
+    cycle_regime = tape["SPY"].regime      # the universe read, for the journal badge
+
     snapshot = build_snapshot(
         now=now, equity=equity, day_start_equity=day_start,
         positions=obs["positions"], quotes=obs["quotes"], chains=obs["chains"],
         bars=obs.get("bars", {}), news=obs.get("news", []),
-        limits=settings.limits, target_expiry=expiry,
+        limits=settings.limits, target_expiry=expiry, tape=tape, sides=sides,
     )
 
     try:
-        decision: AgentDecision = Brain(model=settings.model).decide(snapshot, settings.limits)
+        decision: AgentDecision = brain.decide(snapshot, settings.limits)
     except Exception as e:  # noqa: BLE001 - a brain failure must not trade
         journal.record_cycle(profile=profile, action="error", snapshot=snapshot,
                              equity=equity, error=f"brain: {e}")
         print(f"  brain failed: {e}", file=sys.stderr)
         return 1
 
-    print(f"  regime: {decision.regime}")
     print(f"  reasoning: {decision.reasoning[:300]}")
 
     if decision.proposal is None:
         journal.record_cycle(
             profile=profile, action="stood_down", snapshot=snapshot,
-            reasoning=decision.reasoning, regime=decision.regime, equity=equity,
+            reasoning=decision.reasoning, regime=cycle_regime, equity=equity,
         )
         print("  stood down (no proposal)")
         return 0
 
     p = decision.proposal
+    cycle_regime = tape[p.underlying].regime if p.underlying in tape else cycle_regime
     kind = "cr" if p.is_credit else "db"
     print(f"  proposal: {p.underlying} {p.expiry} {p.right} "
           f"{p.short_strike}/{p.long_strike} x{p.qty} @ {p.net_price:.2f} {kind} "
@@ -278,18 +327,21 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
 
     # Regime binds the size before the gates see it. Downsizing beats blocking:
     # a good trade at smaller size beats a wasted cycle.
-    eff_pct = regime.budget_pct_for(decision.regime, p.sleeve, settings.limits)
+    eff_pct = regime.budget_pct_for(cycle_regime, p.sleeve, settings.limits)
     new_qty, note = regime.resize_to_budget(p, equity=equity, effective_pct=eff_pct)
-    print(f"  regime policy [{decision.regime}/{p.sleeve}]: {note}")
+    print(f"  regime policy [{cycle_regime}/{p.sleeve}]: {note}")
     if new_qty != p.qty:
         p = p.model_copy(update={"qty": new_qty})
 
     gates = risk.evaluate(
         p, profile=profile, now=now, equity=equity, day_start_equity=day_start,
         open_positions=obs["positions"], chain=obs["chains"].get(p.underlying, {}),
-        limits=settings.limits, regime=decision.regime,
+        limits=settings.limits, regime=cycle_regime,
         chains=obs["chains"], quotes=obs["quotes"], target_expiry=expiry,
         open_spreads=journal.open_spreads(profile),
+        tape=tape.get(p.underlying), open_marks=open_marks,
+        recent_spreads=[r for r in journal.all_spreads(profile)
+                        if (r.get("ts_open") or "") >= (now - timedelta(days=7)).strftime("%Y-%m-%d")],
     )
     for g in gates:
         print(f"    {g}")
@@ -300,7 +352,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         journal.record_cycle(
             profile=profile, action="blocked", snapshot=snapshot,
             reasoning=decision.reasoning, proposal=p.model_dump(),
-            gates=gate_payload, regime=decision.regime, equity=equity,
+            gates=gate_payload, regime=cycle_regime, equity=equity,
         )
         print(f"  BLOCKED by {len(risk.blockers(gates))} gate(s)")
         return 0
@@ -323,7 +375,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         journal.record_cycle(
             profile=profile, action="error", snapshot=snapshot,
             reasoning=decision.reasoning, proposal=p.model_dump(),
-            gates=gate_payload, regime=decision.regime, equity=equity, error=str(e),
+            gates=gate_payload, regime=cycle_regime, equity=equity, error=str(e),
         )
         print(f"  submit failed: {e}", file=sys.stderr)
         return 1
@@ -352,7 +404,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
             journal.record_cycle(
                 profile=profile, action="error", snapshot=snapshot,
                 reasoning=decision.reasoning, proposal=requested.model_dump(),
-                gates=gate_payload, regime=decision.regime, equity=equity,
+                gates=gate_payload, regime=cycle_regime, equity=equity,
                 order_id=order_id,
                 error=(f"order {order_id} still {fill['status']} after cancel; "
                        "broker may hold an unjournaled position -- RECONCILE MANUALLY"),
@@ -367,7 +419,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
             journal.record_cycle(
                 profile=profile, action="unfilled", snapshot=snapshot,
                 reasoning=decision.reasoning, proposal=p.model_dump(),
-                gates=gate_payload, regime=decision.regime, equity=equity,
+                gates=gate_payload, regime=cycle_regime, equity=equity,
                 order_id=order_id,
                 error=f"order {fill['status']} with 0 filled; no spread recorded",
             )
@@ -388,7 +440,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         profile=profile, action="dry_run" if dry_run else "submitted",
         snapshot=snapshot, reasoning=decision.reasoning,
         proposal=requested.model_dump(),
-        gates=gate_payload, regime=decision.regime, equity=equity, order_id=order_id,
+        gates=gate_payload, regime=cycle_regime, equity=equity, order_id=order_id,
     )
     print(f"  {'DRY RUN' if dry_run else 'SUBMITTED'}  order_id={order_id}  coid={coid}")
     return 0
