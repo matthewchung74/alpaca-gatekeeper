@@ -317,3 +317,29 @@ def test_credit_floor_passes_a_fair_credit():
 def test_credit_floor_ignores_the_satellite():
     p = make_proposal(sleeve="satellite", short_strike=747.0, long_strike=752.0, net_price=0.47)
     assert gate(evaluate(p), "credit_floor").passed
+
+
+# --- direction at the edges of a range ---------------------------------------
+
+def test_direction_gate_forbids_short_calls_at_the_bottom_of_a_range():
+    """The 2026-09-01 trade: sideways tape, spot at the range low, sell calls."""
+    p = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    g = gate(evaluate(p, tape=tape(range_position=0.02)), "regime_direction")
+    assert not g.passed and "range" in g.detail
+
+
+def test_direction_gate_forbids_short_puts_at_the_top_of_a_range():
+    p = make_proposal(right="P")
+    g = gate(evaluate(p, tape=tape(range_position=0.95)), "regime_direction")
+    assert not g.passed
+
+
+def test_direction_gate_permits_puts_at_the_bottom_of_a_range():
+    p = make_proposal(right="P")
+    assert gate(evaluate(p, tape=tape(range_position=0.02)), "regime_direction").passed
+
+
+def test_direction_gate_keeps_the_bear_rule_when_the_tape_is_a_trend():
+    p = make_proposal(right="P")
+    g = gate(evaluate(p, tape=tape(regime="bear", range_position=0.02)), "regime_direction")
+    assert not g.passed

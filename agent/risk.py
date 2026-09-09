@@ -116,16 +116,24 @@ def evaluate(
     ))
 
     # --- Gate 8: regime direction ----------------------------------------
-    # Selling puts into a downtrend is how short-premium accounts die. The
-    # agent's own regime call is what forbids it.
-    ok = regime_mod.direction_allowed(regime, proposal.right, proposal.sleeve)
+    # Selling puts into a downtrend is how short-premium accounts die. In a
+    # range, selling the side the tape just moved away from is how the
+    # 2026-09-01 book died: bottom of the range forbids short calls, top
+    # forbids short puts. Computed from the bars, never from the model.
     pol = regime_mod.policy_for(regime)
-    permitted = (pol.satellite_rights if proposal.sleeve == "satellite"
-                 else pol.allowed_rights)
+    if tape is not None and proposal.sleeve == "core":
+        permitted = regime_mod.core_sides(tape, limits)
+        why = (pol.rationale if tape.regime != "sideways" or tape.range_position is None
+               else f"range position {tape.range_position:.0%}")
+    else:
+        permitted = (pol.satellite_rights if proposal.sleeve == "satellite"
+                     else pol.allowed_rights)
+        why = pol.rationale
+    ok = proposal.right in permitted
     g.append(GateResult(
         name="regime_direction", passed=ok,
         detail=(f"{regime} permits {'/'.join(permitted) or 'nothing'} for the "
-                f"{proposal.sleeve} sleeve; proposal is {proposal.right} -- {pol.rationale}"),
+                f"{proposal.sleeve} sleeve; proposal is {proposal.right} -- {why}"),
     ))
 
     # --- Gate 9: sleeve risk budget (regime-adjusted) --------------------
