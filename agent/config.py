@@ -75,6 +75,15 @@ class RiskLimits:
     # losing no more than its width, and that gate blocked a $9,416 trade
     # tranche_risk was happy with.
     max_directional_risk_pct: float = 0.20
+    # --- Tape read (computed regime) ---
+    # The 2026-09-01 loss: the model called "bear" after a 1.2% dip to the
+    # bottom of a 15-session band, and bear -> calls-only sold four call
+    # spreads at the range low. Regime is now computed from the bars, and in
+    # a range the position inside it decides which side may be sold.
+    range_lookback: int = 10            # completed sessions
+    trend_range_multiple: float = 2.0   # trend if |move| > this x mean daily range
+    range_edge_quantile: float = 0.25   # sideways: no short calls below this range
+                                        # position, no short puts above 1 - this
     no_trade_open_minutes: int = 5
     no_trade_close_minutes: int = 5
     max_tranche_risk_pct: float = 0.12      # worst case on any one CORE tranche

@@ -120,3 +120,79 @@ def describe(regime: str, limits) -> str:
             f"({'/'.join(p.allowed_rights)} credit), "
             f"satellite {budget_pct_for(regime, 'satellite', limits):.2%} "
             f"({sat} debit) -- {p.rationale}")
+
+
+# --- the tape read: computed, never asked ---------------------------------
+
+@dataclass(frozen=True)
+class TapeRead:
+    """What the daily bars say about one underlying.
+
+    Built from completed sessions only. The regime feeds the budget and the
+    bull/bear direction rules; the range position decides which side may be
+    sold in a sideways tape. `None` fields mean there was not enough history,
+    and the gates that need them fail closed.
+    """
+    regime: str
+    range_position: float | None
+    lookback_high: float | None
+    lookback_low: float | None
+    trend_pct: float | None
+    avg_range_pct: float | None
+    detail: str
+
+
+def classify(bars: list[dict], spot: float, today: str, *,
+             lookback: int = 10, trend_multiple: float = 2.0) -> TapeRead:
+    """Regime and range position from the last `lookback` completed sessions.
+
+    Trend is spot against the close `lookback` sessions ago, measured in units
+    of the mean daily high-low range. A move smaller than `trend_multiple`
+    ranges is noise inside a band, not a trend -- on 2026-09-01 SPY was 0.7%
+    off its 10-session-ago close with 0.8% daily ranges, and calling that
+    "bear" is what sold calls at the low.
+    """
+    done = [b for b in bars if str(b.get("t", ""))[:10] < today]
+    if len(done) < lookback:
+        return TapeRead("sideways", None, None, None, None, None,
+                        f"only {len(done)} completed sessions; need {lookback}")
+    win = done[-lookback:]
+    hi = max(float(b["h"]) for b in win)
+    lo = min(float(b["l"]) for b in win)
+    ref = float(win[0]["c"])
+    trend = (spot - ref) / ref
+    avg_range = sum((float(b["h"]) - float(b["l"])) / float(b["c"]) for b in win) / len(win)
+    threshold = trend_multiple * avg_range
+    if trend > threshold:
+        reg = "bull"
+    elif trend < -threshold:
+        reg = "bear"
+    else:
+        reg = "sideways"
+    pos = (spot - lo) / (hi - lo) if hi > lo else None
+    if pos is not None:
+        detail = (f"{reg}: spot {spot:.2f} is {trend:+.2%} vs {lookback} sessions ago "
+                  f"(trend threshold {threshold:.2%}); range {lo:.2f}-{hi:.2f}, "
+                  f"position {pos:.0%}")
+    else:
+        detail = f"{reg}: spot {spot:.2f}, flat range {lo:.2f}-{hi:.2f}"
+    return TapeRead(regime=reg, range_position=pos, lookback_high=hi, lookback_low=lo,
+                    trend_pct=trend, avg_range_pct=avg_range, detail=detail)
+
+
+def core_sides(tape: TapeRead, limits) -> tuple[Right, ...]:
+    """Which rights the core sleeve may sell, given the tape.
+
+    Trends keep the policy rule (bull: puts only; bear: calls only). A range
+    forbids selling into the mean reversion: no short calls in the bottom
+    quarter, no short puts in the top quarter.
+    """
+    allowed = policy_for(tape.regime).allowed_rights
+    if tape.regime != "sideways" or tape.range_position is None:
+        return allowed
+    q = limits.range_edge_quantile
+    if tape.range_position < q:
+        return tuple(r for r in allowed if r != "C")
+    if tape.range_position > 1 - q:
+        return tuple(r for r in allowed if r != "P")
+    return allowed
