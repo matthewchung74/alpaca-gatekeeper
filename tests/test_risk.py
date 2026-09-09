@@ -343,3 +343,67 @@ def test_direction_gate_keeps_the_bear_rule_when_the_tape_is_a_trend():
     p = make_proposal(right="P")
     g = gate(evaluate(p, tape=tape(regime="bear", range_position=0.02)), "regime_direction")
     assert not g.passed
+
+
+# --- the shape of the whole book ---------------------------------------------
+
+def row(**kw) -> dict:
+    base = dict(id="r1", underlying="QQQ", right="C", sleeve="core", short_strike=740.0,
+                long_strike=743.0, qty=10, entry_credit=0.60, status="open",
+                ts_open="2026-08-27T15:46:00+00:00", ts_close=None)
+    base.update(kw)
+    return base
+
+
+def test_book_risk_caps_the_whole_book_not_the_tranche():
+    # 24% of 100k = 24,000. Held 20,250; a 4,983 proposal tips it over.
+    held = [row(id="a", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=45)]
+    p = make_proposal(qty=11)
+    g = gate(evaluate(p, open_spreads=held), "book_risk")
+    assert not g.passed and "24%" in g.detail
+
+
+def test_book_risk_scales_with_the_regime_multiplier():
+    held = [row(id="a", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=15)]  # 6,750
+    p = make_proposal(qty=5)                        # 2,265 -> 9,015 total
+    assert gate(evaluate(p, open_spreads=held), "book_risk").passed                     # 24,000
+    assert not gate(evaluate(p, open_spreads=held, regime="bear"), "book_risk").passed  # 8,400
+
+
+def test_same_direction_caps_open_spreads_on_one_right_across_the_universe():
+    held = [row(id="a", underlying="QQQ", right="C"), row(id="b", underlying="IWM", right="C")]
+    p = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    g = gate(evaluate(p, open_spreads=held), "same_direction")
+    assert not g.passed and "2 open" in g.detail
+    assert gate(evaluate(make_proposal(right="P"), open_spreads=held), "same_direction").passed
+
+
+def test_losing_side_blocks_adding_to_a_side_already_underwater():
+    """09-02 11:46: QQQ calls added while IWM and SPY calls marked ~2x credit."""
+    held = [row(id="a", underlying="IWM", right="C", entry_credit=0.39)]
+    p = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    losing = gate(evaluate(p, open_spreads=held, open_marks={"a": 0.80}), "losing_side")
+    fine = gate(evaluate(p, open_spreads=held, open_marks={"a": 0.40}), "losing_side")
+    no_mark = gate(evaluate(p, open_spreads=held, open_marks={}), "losing_side")
+    assert not losing.passed and "2.05x" in losing.detail
+    assert fine.passed and no_mark.passed
+
+
+def test_cadence_allows_one_entry_per_day():
+    today = [row(id="a", ts_open="2026-08-28T15:46:00+00:00")]      # 11:46 ET on MIDDAY's date
+    g = gate(evaluate(make_proposal(), recent_spreads=today), "cadence")
+    assert not g.passed and "1 entr" in g.detail
+    yesterday = [row(id="a", ts_open="2026-08-27T15:46:00+00:00")]
+    assert gate(evaluate(make_proposal(), recent_spreads=yesterday), "cadence").passed
+
+
+def test_cadence_cools_down_after_a_close_in_the_same_name_and_side():
+    closed = [row(id="a", underlying="SPY", right="P", status="closed",
+                  ts_open="2026-08-27T15:46:00+00:00", ts_close="2026-08-28T14:00:00+00:00")]
+    g = gate(evaluate(make_proposal(right="P"), recent_spreads=closed), "cadence")
+    assert not g.passed and "closed" in g.detail
+    other_side = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    assert gate(evaluate(other_side, recent_spreads=closed), "cadence").passed
+    old = [row(id="a", underlying="SPY", right="P", status="closed",
+               ts_open="2026-08-25T15:46:00+00:00", ts_close="2026-08-26T14:00:00+00:00")]
+    assert gate(evaluate(make_proposal(right="P"), recent_spreads=old), "cadence").passed

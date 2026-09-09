@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 
 from . import regime as regime_mod
 from .config import (
-    COMPETITION_PROFILE, TARGET_EXPIRY, UNIVERSE, RiskLimits,
+    COMPETITION_PROFILE, ET, TARGET_EXPIRY, UNIVERSE, RiskLimits,
     AccountGuardError, assert_may_trade, in_no_trade_window,
 )
 from .models import GateResult, TradeProposal, occ_symbol
@@ -187,6 +187,12 @@ def evaluate(
 
     # --- Gate 17: premium floor -----------------------------------------
     g.append(_credit_floor_gate(proposal, limits))
+
+    # --- Gates 18-21: the shape of the whole book ------------------------
+    g.append(_book_risk_gate(proposal, open_spreads or [], equity, regime, limits))
+    g.append(_same_direction_gate(proposal, open_spreads or [], limits))
+    g.append(_losing_side_gate(proposal, open_spreads or [], open_marks or {}, limits))
+    g.append(_cadence_gate(proposal, recent_spreads or [], now, limits))
 
     return g
 
@@ -400,6 +406,116 @@ def _credit_floor_gate(proposal: TradeProposal, limits: RiskLimits) -> GateResul
         name="credit_floor", passed=ok,
         detail=(f"credit {proposal.net_price:.2f} is {frac:.0%} of width {proposal.width:g} "
                 f"({'>=' if ok else '<'} {limits.min_credit_pct_of_width:.0%})"))
+
+
+def _book_risk_gate(proposal: TradeProposal, open_spreads: list[dict], equity: float,
+                    regime: str, limits: RiskLimits) -> GateResult:
+    """Open max loss plus this trade, against a book budget the regime scales.
+
+    tranche_risk caps one trade; nothing capped the sum. Under "bear" the
+    tranche budget fell to 35% and the book simply opened four tranches.
+    """
+    held = 0.0
+    for row in open_spreads:
+        try:
+            held += _spread_max_loss(row)
+        except (KeyError, TypeError, ValueError):
+            continue
+    mult = regime_mod.policy_for(regime).size_multiplier
+    cap = equity * limits.max_book_risk_pct * mult
+    total = held + proposal.total_max_loss
+    ok = total <= cap
+    return GateResult(
+        name="book_risk", passed=ok,
+        detail=(f"open max loss {held:,.0f} + this trade {proposal.total_max_loss:,.0f} = "
+                f"{total:,.0f} vs book budget {cap:,.0f} "
+                f"({limits.max_book_risk_pct:.0%} of equity x {mult:.0%} {regime})"))
+
+
+def _same_direction_gate(proposal: TradeProposal, open_spreads: list[dict],
+                         limits: RiskLimits) -> GateResult:
+    """SPY, QQQ and IWM are one bucket. Count open core spreads on this right."""
+    same = [r for r in open_spreads
+            if r.get("right") == proposal.right and (r.get("sleeve") or "core") == "core"]
+    ok = proposal.sleeve != "core" or len(same) < limits.max_same_direction
+    names = ", ".join(f"{r.get('underlying')} {float(r.get('short_strike')):g}/"
+                      f"{float(r.get('long_strike')):g}" for r in same) or "none"
+    return GateResult(
+        name="same_direction", passed=ok,
+        detail=(f"{len(same)} open core {proposal.right} spread(s) across the universe "
+                f"({names}) vs max {limits.max_same_direction}"))
+
+
+def _losing_side_gate(proposal: TradeProposal, open_spreads: list[dict],
+                      open_marks: dict, limits: RiskLimits) -> GateResult:
+    """No adding to a side that is already being run over.
+
+    On 2026-09-02 at 11:46 ET a third short call spread was opened while the
+    first two marked about twice their credit. The snapshot showed the model
+    those positions; it added anyway. This is the gate that says no.
+    """
+    if proposal.sleeve != "core":
+        return GateResult(name="losing_side", passed=True, detail="satellite; not applied")
+    for r in open_spreads:
+        if r.get("right") != proposal.right or (r.get("sleeve") or "core") != "core":
+            continue
+        mark = open_marks.get(r.get("id"))
+        credit = float(r.get("entry_credit") or 0)
+        if mark is None or credit <= 0:
+            continue
+        ratio = float(mark) / credit
+        if ratio >= limits.losing_side_multiple:
+            return GateResult(
+                name="losing_side", passed=False,
+                detail=(f"{r.get('underlying')} {float(r.get('short_strike')):g}/"
+                        f"{float(r.get('long_strike')):g} {proposal.right} marks {float(mark):.2f} = "
+                        f"{ratio:.2f}x its {credit:.2f} credit (>= {limits.losing_side_multiple:g}x); "
+                        "not adding to a losing side"))
+    return GateResult(name="losing_side", passed=True,
+                      detail=f"no open {proposal.right} spread at or beyond "
+                             f"{limits.losing_side_multiple:g}x its credit")
+
+
+def _ts(s) -> datetime | None:
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(str(s))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=ET)
+
+
+def _cadence_gate(proposal: TradeProposal, recent: list[dict], now: datetime,
+                  limits: RiskLimits) -> GateResult:
+    """One entry a day, and no re-entry where a spread just closed.
+
+    Four cycles a day produced a proposal in every cycle with budget, and each
+    50% target exit was recycled the same day into a closer, shorter-dated
+    spread. Frequency was the strategy's variance, not its edge.
+    """
+    today = now.astimezone(ET).date()
+    opened_today = [r for r in recent
+                    if (t := _ts(r.get("ts_open"))) and t.astimezone(ET).date() == today]
+    if len(opened_today) >= limits.max_entries_per_day:
+        return GateResult(
+            name="cadence", passed=False,
+            detail=(f"{len(opened_today)} entr{'y' if len(opened_today) == 1 else 'ies'} "
+                    f"already today vs max {limits.max_entries_per_day}"))
+    window = timedelta(hours=limits.reentry_cooldown_hours)
+    for r in recent:
+        if r.get("underlying") != proposal.underlying or r.get("right") != proposal.right:
+            continue
+        closed = _ts(r.get("ts_close"))
+        if closed and now - closed < window:
+            return GateResult(
+                name="cadence", passed=False,
+                detail=(f"{proposal.underlying} {proposal.right} spread closed "
+                        f"{closed.astimezone(ET):%m-%d %H:%M ET}, inside the "
+                        f"{limits.reentry_cooldown_hours}h cooldown"))
+    return GateResult(name="cadence", passed=True,
+                      detail=(f"{len(opened_today)} entries today; no {proposal.underlying} "
+                              f"{proposal.right} close in the last {limits.reentry_cooldown_hours}h"))
 
 
 def all_passed(gates: list[GateResult]) -> bool:

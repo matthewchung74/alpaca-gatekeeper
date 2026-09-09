@@ -95,6 +95,17 @@ class RiskLimits:
     # Credit as a fraction of width. A 0.15-0.20 delta strike at 7-14 DTE pays
     # 20-25% in normal vol; below this the trade is not worth its width.
     min_credit_pct_of_width: float = 0.20
+    # --- Book shape ---
+    # Per-tranche limits let four bear-sized tranches add up to more than one
+    # sideways tranche, and three call spreads in three tickers that move
+    # together were one bet. These look at the whole book.
+    max_book_risk_pct: float = 0.24         # open max loss + proposal, x regime multiplier
+    max_same_direction: int = 2             # open core spreads on one right, whole universe
+    losing_side_multiple: float = 1.5       # no add-on where a spread marks >= this x credit
+    # --- Cadence ---
+    # Four cycles a day produced a proposal in 13 of 13 cycles with budget.
+    max_entries_per_day: int = 1
+    reentry_cooldown_hours: int = 24        # same underlying and right, after any close
     no_trade_open_minutes: int = 5
     no_trade_close_minutes: int = 5
     max_tranche_risk_pct: float = 0.12      # worst case on any one CORE tranche
