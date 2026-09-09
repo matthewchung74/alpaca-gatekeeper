@@ -7,8 +7,9 @@ broker. Gate zero is the account guard, which cannot be reached by any prompt.
 """
 from __future__ import annotations
 
+import math
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from . import regime as regime_mod
 from .config import (
@@ -37,9 +38,15 @@ def evaluate(
     quotes: dict | None = None,
     target_expiry: str | None = None,
     open_spreads: list[dict] | None = None,
+    tape: regime_mod.TapeRead | None = None,
+    open_marks: dict | None = None,
+    recent_spreads: list[dict] | None = None,
 ) -> list[GateResult]:
     """Run every gate. Order matters only for readability; all of them run."""
     g: list[GateResult] = []
+    if tape is not None:
+        regime = tape.regime
+    spot = _mid((quotes or {}).get(proposal.underlying) or {})
 
     # --- Gate 0: account guard -------------------------------------------
     try:
@@ -166,6 +173,12 @@ def evaluate(
 
     # --- Gate 15: directional risk ---------------------------------------
     g.append(_directional_risk_gate(proposal, open_spreads or [], equity, limits))
+
+    # --- Gate 16: strike placement --------------------------------------
+    g.append(_range_buffer_gate(proposal, tape, chain, spot, now, limits))
+
+    # --- Gate 17: premium floor -----------------------------------------
+    g.append(_credit_floor_gate(proposal, limits))
 
     return g
 
@@ -316,6 +329,69 @@ def _directional_risk_gate(
                 f"{limits.max_directional_risk_pct:.0%} "
                 f"(held {held:+,.0f}, this trade {marginal:+,.0f})"),
     )
+
+
+def _mid(q: dict) -> float | None:
+    try:
+        bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (bid + ask) / 2 if bid > 0 and ask > 0 else None
+
+
+def _range_buffer_gate(proposal: TradeProposal, tape, chain: dict,
+                       spot: float | None, now: datetime, limits: RiskLimits) -> GateResult:
+    """The short strike must sit outside the recent range AND one expected move out.
+
+    Eight of nine hackathon short strikes were inside the prior five sessions'
+    high-low, 0.5-1.0% from spot at 1-4 DTE. Six finished in the money. Delta
+    alone cannot place a strike outside the noise at short DTE; this can.
+
+    Fails closed. A strike we cannot place relative to the tape is a strike
+    we do not sell.
+    """
+    if tape is None or tape.lookback_high is None or tape.lookback_low is None:
+        return GateResult(name="range_buffer", passed=False,
+                          detail="no completed-session range available; cannot place the strike")
+    if spot is None:
+        return GateResult(name="range_buffer", passed=False,
+                          detail=f"no quote for {proposal.underlying}; cannot measure distance")
+    sym = occ_symbol(proposal.underlying, proposal.expiry, proposal.right, proposal.short_strike)
+    iv = (chain.get(sym) or {}).get("impliedVolatility")
+    if iv is None:
+        return GateResult(name="range_buffer", passed=False,
+                          detail=f"no IV published for short leg {sym}; cannot size the expected move")
+    dte = max((date.fromisoformat(proposal.expiry) - now.date()).days, 1)
+    em = spot * float(iv) * math.sqrt(dte / 365.0)
+    need = limits.expected_move_multiple * em
+    k = proposal.short_strike
+    dist = (k - spot) if proposal.right == "C" else (spot - k)
+    problems: list[str] = []
+    if dist < need:
+        problems.append(f"{dist:.2f} from spot < {limits.expected_move_multiple:g}x "
+                        f"expected move {em:.2f} ({dte} DTE, IV {float(iv):.1%})")
+    inside = (k <= tape.lookback_high) if proposal.right == "C" else (k >= tape.lookback_low)
+    if inside:
+        problems.append(f"short {k:g} inside the {limits.range_lookback}-session range "
+                        f"{tape.lookback_low:.2f}-{tape.lookback_high:.2f}")
+    if problems:
+        return GateResult(name="range_buffer", passed=False, detail="; ".join(problems))
+    return GateResult(name="range_buffer", passed=True,
+                      detail=(f"short {k:g} is {dist:.2f} from spot {spot:.2f} "
+                              f"(>= {need:.2f}) and outside {tape.lookback_low:.2f}-"
+                              f"{tape.lookback_high:.2f}"))
+
+
+def _credit_floor_gate(proposal: TradeProposal, limits: RiskLimits) -> GateResult:
+    """Premium must be worth the width. Satellite pays a debit; not its concern."""
+    if not proposal.is_credit:
+        return GateResult(name="credit_floor", passed=True, detail="debit spread; no floor")
+    frac = proposal.net_price / proposal.width if proposal.width > 0 else 0.0
+    ok = frac >= limits.min_credit_pct_of_width
+    return GateResult(
+        name="credit_floor", passed=ok,
+        detail=(f"credit {proposal.net_price:.2f} is {frac:.0%} of width {proposal.width:g} "
+                f"({'>=' if ok else '<'} {limits.min_credit_pct_of_width:.0%})"))
 
 
 def all_passed(gates: list[GateResult]) -> bool:

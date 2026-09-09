@@ -87,6 +87,14 @@ class RiskLimits:
     trend_range_multiple: float = 2.0   # trend if |move| > this x mean daily range
     range_edge_quantile: float = 0.25   # sideways: no short calls below this range
                                         # position, no short puts above 1 - this
+    # --- Strike placement and premium ---
+    # The short strike must clear BOTH the recent range and one expected move
+    # (spot x IV x sqrt(DTE/365)). Eight of nine hackathon strikes sat inside
+    # the prior five sessions' range; this would have rejected all eight.
+    expected_move_multiple: float = 1.0
+    # Credit as a fraction of width. A 0.15-0.20 delta strike at 7-14 DTE pays
+    # 20-25% in normal vol; below this the trade is not worth its width.
+    min_credit_pct_of_width: float = 0.20
     no_trade_open_minutes: int = 5
     no_trade_close_minutes: int = 5
     max_tranche_risk_pct: float = 0.12      # worst case on any one CORE tranche

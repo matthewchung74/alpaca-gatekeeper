@@ -6,10 +6,23 @@ from agent.config import (
     ET, KICKOFF, RiskLimits, TARGET_EXPIRY, AccountGuardError, assert_may_trade,
 )
 from agent.models import TradeProposal, occ_symbol
+from agent.regime import TapeRead
 from agent import risk
 
 LIMITS = RiskLimits()
 MIDDAY = datetime(2026, 8, 28, 13, 0, tzinfo=ET)   # after kickoff, mid-session
+WEEK_OUT = "2026-09-04"       # 7 days after MIDDAY
+
+
+def tape(**kw) -> TapeRead:
+    base = dict(regime="sideways", range_position=0.5, lookback_high=770.0,
+                lookback_low=750.0, trend_pct=0.0, avg_range_pct=0.008, detail="t")
+    base.update(kw)
+    return TapeRead(**base)
+
+
+def gate(gates, name):
+    return next(g for g in gates if g.name == name)
 
 
 def make_proposal(**kw) -> TradeProposal:
@@ -28,6 +41,13 @@ def make_chain(p: TradeProposal, *, bid=1.48, ask=1.54, oi=5000) -> dict:
         sym = occ_symbol(p.underlying, p.expiry, p.right, strike)
         chain[sym] = {"latestQuote": {"bp": bid, "ap": ask}, "openInterest": oi}
     return chain
+
+
+def chain_with_iv(p: TradeProposal, iv=0.15, **kw) -> dict:
+    ch = make_chain(p, **kw)
+    for snap in ch.values():
+        snap["impliedVolatility"] = iv
+    return ch
 
 
 def evaluate(p, **over):
@@ -58,8 +78,9 @@ def test_max_loss_derived_from_width_not_model():
 # --- happy path ----------------------------------------------------------
 
 def test_clean_proposal_passes_every_gate():
-    p = make_proposal()
-    gates = evaluate(p)
+    p = make_proposal(expiry=WEEK_OUT, short_strike=740.0, long_strike=735.0, net_price=1.10)
+    gates = evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                     tape=tape(), target_expiry=WEEK_OUT)
     assert risk.all_passed(gates), [str(g) for g in risk.blockers(gates)]
 
 
@@ -245,3 +266,54 @@ def test_delta_band_floor_admits_one_expected_move():
     """One expected move at 7-14 DTE is roughly 0.16 delta; the old 0.20
     floor would reject every strike the range gate permits."""
     assert LIMITS.min_short_delta <= 0.10
+
+
+# --- strike placement and premium ------------------------------------------
+
+def test_range_buffer_blocks_a_strike_inside_the_recent_range():
+    # spot 760, 10-session range 750-770: a 752 put is inside it
+    p = make_proposal(expiry=WEEK_OUT, short_strike=752.0, long_strike=747.0)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert not g.passed and "inside" in g.detail
+
+
+def test_range_buffer_blocks_a_strike_inside_one_expected_move():
+    # 7 DTE at 15% IV: expected move = 760 * 0.15 * sqrt(7/365) ~ 15.8
+    # 748 is outside the 750-770 range but only 12 from spot
+    p = make_proposal(expiry=WEEK_OUT, short_strike=748.0, long_strike=743.0)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert not g.passed and "expected move" in g.detail
+
+
+def test_range_buffer_passes_a_strike_beyond_both():
+    p = make_proposal(expiry=WEEK_OUT, short_strike=740.0, long_strike=735.0)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert g.passed, g.detail
+
+
+def test_range_buffer_fails_closed_without_history_or_iv():
+    p = make_proposal(expiry=WEEK_OUT, short_strike=740.0, long_strike=735.0)
+    q = {"SPY": {"bp": 759.9, "ap": 760.1}}
+    no_hist = gate(evaluate(p, chain=chain_with_iv(p), quotes=q,
+                            tape=tape(lookback_high=None, lookback_low=None)), "range_buffer")
+    no_iv = gate(evaluate(p, chain=make_chain(p), quotes=q, tape=tape()), "range_buffer")
+    no_tape = gate(evaluate(p, chain=chain_with_iv(p), quotes=q), "range_buffer")
+    assert not no_hist.passed and not no_iv.passed and not no_tape.passed
+
+
+def test_credit_floor_rejects_thin_premium():
+    p = make_proposal(net_price=0.47)          # 5-wide: 9.4% of width
+    assert not gate(evaluate(p), "credit_floor").passed
+
+
+def test_credit_floor_passes_a_fair_credit():
+    p = make_proposal(net_price=1.10)          # 22% of width
+    assert gate(evaluate(p), "credit_floor").passed
+
+
+def test_credit_floor_ignores_the_satellite():
+    p = make_proposal(sleeve="satellite", short_strike=747.0, long_strike=752.0, net_price=0.47)
+    assert gate(evaluate(p), "credit_floor").passed
