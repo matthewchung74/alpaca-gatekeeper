@@ -291,12 +291,15 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
 
     tape, sides = read_tape(obs, now, settings.limits)
     cycle_regime = tape["SPY"].regime      # the universe read, for the journal badge
+    recent_spreads = [r for r in journal.all_spreads(profile)
+                      if (r.get("ts_open") or "") >= (now - timedelta(days=7)).strftime("%Y-%m-%d")]
 
     snapshot = build_snapshot(
         now=now, equity=equity, day_start_equity=day_start,
         positions=obs["positions"], quotes=obs["quotes"], chains=obs["chains"],
         bars=obs.get("bars", {}), news=obs.get("news", []),
         limits=settings.limits, target_expiry=expiry, tape=tape, sides=sides,
+        recent_spreads=recent_spreads,
     )
 
     try:
@@ -340,8 +343,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         chains=obs["chains"], quotes=obs["quotes"], target_expiry=expiry,
         open_spreads=journal.open_spreads(profile),
         tape=tape.get(p.underlying), open_marks=open_marks,
-        recent_spreads=[r for r in journal.all_spreads(profile)
-                        if (r.get("ts_open") or "") >= (now - timedelta(days=7)).strftime("%Y-%m-%d")],
+        recent_spreads=recent_spreads,
     )
     for g in gates:
         print(f"    {g}")

@@ -389,6 +389,11 @@ def _range_buffer_gate(proposal: TradeProposal, tape, chain: dict,
     Fails closed. A strike we cannot place relative to the tape is a strike
     we do not sell.
     """
+    if not proposal.is_credit:
+        # The satellite buys direction and can only lose its debit, which
+        # tranche_risk already bounds. Judging its far leg against an expected
+        # move is a credit-spread rule applied to the wrong structure.
+        return GateResult(name="range_buffer", passed=True, detail="debit spread; not applied")
     if tape is None or tape.lookback_high is None or tape.lookback_low is None:
         return GateResult(name="range_buffer", passed=False,
                           detail="no completed-session range available; cannot place the strike")
@@ -507,6 +512,25 @@ def _ts(s) -> datetime | None:
     except ValueError:
         return None
     return d if d.tzinfo else d.replace(tzinfo=ET)
+
+
+def cadence_state(recent: list[dict], now: datetime, limits: RiskLimits) -> tuple[int, list[tuple[str, str, datetime]]]:
+    """Entries made today, and (underlying, right, cooldown-ends) for recent closes.
+
+    Shared with the snapshot so the model can route around a cooldown instead
+    of walking into it: on 2026-09-10 two of five cycles re-proposed the name
+    that had just closed.
+    """
+    today = now.astimezone(ET).date()
+    opened_today = sum(1 for r in recent
+                       if (t := _ts(r.get("ts_open"))) and t.astimezone(ET).date() == today)
+    window = timedelta(hours=limits.reentry_cooldown_hours)
+    cooling: list[tuple[str, str, datetime]] = []
+    for r in recent:
+        closed = _ts(r.get("ts_close"))
+        if closed and now - closed < window:
+            cooling.append((str(r.get("underlying")), str(r.get("right")), closed + window))
+    return opened_today, cooling
 
 
 def _cadence_gate(proposal: TradeProposal, recent: list[dict], now: datetime,

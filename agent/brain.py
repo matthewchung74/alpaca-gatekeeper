@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import anthropic
 
-from .config import TARGET_EXPIRY, UNIVERSE, RiskLimits
+from .config import ET, TARGET_EXPIRY, UNIVERSE, RiskLimits
 from .models import AgentDecision, parse_strike
 from .regime import TapeRead
 
@@ -179,6 +179,7 @@ def build_snapshot(
     target_expiry: str = TARGET_EXPIRY,
     tape: dict[str, TapeRead] | None = None,
     sides: dict[str, tuple] | None = None,
+    recent_spreads: list[dict] | None = None,
 ) -> str:
     """Render the market state as text for the model.
 
@@ -241,6 +242,18 @@ def build_snapshot(
     else:
         lines.append("  (unavailable)")
 
+    from .risk import cadence_state
+    opened_today, cooling = cadence_state(recent_spreads or [], now, limits)
+    lines += ["", "CADENCE (binding):",
+              f"  entries today: {opened_today} of max {limits.max_entries_per_day}"
+              + (" -- NO further entries today; stand down" if opened_today >= limits.max_entries_per_day else "")]
+    if cooling:
+        lines.append("  cooling down (do not propose these; the cadence gate rejects them):")
+        for u, r, until in sorted(cooling, key=lambda x: x[2]):
+            lines.append(f"    {u} {r} until {until.astimezone(ET):%m-%d %H:%M ET}")
+    else:
+        lines.append("  no cooldowns in force")
+
     lines += ["", f"OPTION CHAINS ({target_expiry}), tradeable delta band:"]
     for sym, chain in chains.items():
         lines.append(f"  --- {sym} ---")
@@ -279,8 +292,15 @@ def build_snapshot(
             lines.append(f"    ({dropped} far-OTM contracts omitted; both wings shown)")
 
     from .macro import macro_headlines, upcoming
-    events = upcoming(within_days=3, today=now.date())
-    lines += ["", "SCHEDULED RELEASES (next 3 days) -- short premium is short gamma:"]
+    from datetime import date as _date
+    # Look through the whole holding period, not a fixed three days: with a
+    # week-out expiry a three-day window hid the 2026-09-16 FOMC decision.
+    try:
+        horizon = max(3, (_date.fromisoformat(target_expiry) - now.date()).days)
+    except ValueError:
+        horizon = 3
+    events = upcoming(within_days=horizon, today=now.date())
+    lines += ["", f"SCHEDULED RELEASES (next {horizon} days, through expiry) -- short premium is short gamma:"]
     if events:
         for e in events:
             when = "TODAY" if e["days_away"] == 0 else f"in {e['days_away']}d"
@@ -289,8 +309,8 @@ def build_snapshot(
     else:
         lines.append("  (none in the next 3 days)")
     lines.append("  NOTE: only structurally-dated releases are listed (weekly claims,"
-                 " first-Friday payrolls). Other prints -- PCE, CPI, ISM, FOMC -- are not"
-                 " scheduled here; infer them from the headlines below.")
+                 " first-Friday payrolls, FOMC decision days). Other prints -- PCE, CPI,"
+                 " ISM -- are not scheduled here; infer them from the headlines below.")
 
     macro = macro_headlines(news or [])
     lines += ["", "MACRO HEADLINES (what has actually printed, and Fed tone):"]

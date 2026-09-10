@@ -407,3 +407,21 @@ def test_cadence_cools_down_after_a_close_in_the_same_name_and_side():
     old = [row(id="a", underlying="SPY", right="P", status="closed",
                ts_open="2026-08-25T15:46:00+00:00", ts_close="2026-08-26T14:00:00+00:00")]
     assert gate(evaluate(make_proposal(right="P"), recent_spreads=old), "cadence").passed
+
+
+def test_range_buffer_does_not_judge_the_satellite():
+    p = make_proposal(sleeve="satellite", right="P", short_strike=755.0, long_strike=758.0,
+                      net_price=1.0, expiry=WEEK_OUT)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert g.passed and "debit" in g.detail
+
+
+def test_cadence_state_reports_entries_today_and_cooldowns():
+    rows = [row(id="a", ts_open="2026-08-28T15:46:00+00:00"),
+            row(id="b", underlying="SPY", right="P", status="closed",
+                ts_open="2026-08-27T15:46:00+00:00", ts_close="2026-08-28T14:00:00+00:00")]
+    opened, cooling = risk.cadence_state(rows, MIDDAY, LIMITS)
+    assert opened == 1
+    assert [(u, r) for u, r, _ in cooling] == [("SPY", "P")]
+    assert cooling[0][2].astimezone(ET).strftime("%m-%d %H:%M") == "08-29 10:00"

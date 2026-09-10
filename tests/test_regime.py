@@ -350,3 +350,29 @@ def test_snapshot_prints_the_range_buffer_boundary_from_the_chain():
     )
     # 7 DTE at 15% IV: expected move 15.79 -> puts <= 744.2 and < 750; calls >= 775.8 and > 770
     assert "puts clear at <= 744" in out and "calls clear at >= 776" in out
+
+
+def test_snapshot_lists_entries_today_and_cooldowns():
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    rows = [dict(id="b", underlying="QQQ", right="C", sleeve="core", short_strike=735.0,
+                 long_strike=740.0, qty=6, entry_credit=0.54, status="closed",
+                 ts_open="2026-09-09T17:46:00+00:00", ts_close="2026-09-10T13:40:50+00:00")]
+    out = build_snapshot(
+        now=datetime(2026, 9, 10, 11, 46, tzinfo=ET), equity=100_000.0,
+        day_start_equity=100_000.0, positions=[], quotes={}, chains={}, bars={},
+        news=[], limits=LIMITS, recent_spreads=rows,
+    )
+    assert "CADENCE" in out and "entries today: 0 of max 1" in out
+    assert "QQQ C until 09-11 09:40 ET" in out
+
+
+def test_fomc_decision_day_is_a_scheduled_event():
+    """2026-09-16 was the target expiry the week of 09-10 and the agent could
+    not see the FOMC decision that afternoon. The Fed publishes the dates."""
+    from datetime import date
+    from agent.macro import upcoming
+    ev = upcoming(within_days=7, today=date(2026, 9, 10))
+    fomc = [e for e in ev if "FOMC" in e["event"]]
+    assert len(fomc) == 1 and fomc[0]["date"] == "2026-09-16"
+    assert not [e for e in upcoming(within_days=3, today=date(2026, 9, 21)) if "FOMC" in e["event"]]
