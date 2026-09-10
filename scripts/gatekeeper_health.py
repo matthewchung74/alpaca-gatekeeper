@@ -317,6 +317,11 @@ def check_journal_errors(state: dict, now_utc: datetime, *,
         if not ts or (now_utc - ts) >= timedelta(hours=24):
             continue
         recovered = reconciled and later_ok is not None and ts < later_ok
+        # An unfilled entry carries an error string because the loop wants
+        # the reason on record, but it is a chosen outcome: the order rested,
+        # did not fill, and was cancelled with nothing held. Worth seeing,
+        # not worth paging every 15 minutes (2026-09-10, IWM 284/280).
+        benign = c.get("action") == "unfilled"
         # While entries are paused no later cycle can ever run, so `recovered`
         # can never become true and these would page forever. Still worth
         # seeing; not worth waking anyone.
@@ -325,9 +330,11 @@ def check_journal_errors(state: dict, now_utc: datetime, *,
                     "agrees with the journal]")
         elif entries_paused:
             note = " [entries paused; cannot clear until the agent resumes]"
+        elif benign:
+            note = " [unfilled entry; nothing held]"
         else:
             note = ""
-        report("WARN" if (recovered or entries_paused) else "CRIT", "journal",
+        report("WARN" if (recovered or entries_paused or benign) else "CRIT", "journal",
                f"cycle {ts.astimezone(ET):%m-%d %H:%M ET} recorded error: "
                f"{str(c['error'])[:220]}" + note)
 
