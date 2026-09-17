@@ -28,6 +28,11 @@ class RegimePolicy:
     rationale: str
 
 
+# The satellite sleeve is switched off in every regime. Its first four live
+# trades (2026-09-10 to 09-16) were all put debit spreads bought at the bottom
+# of a range because the core had no legal strike, and all four stopped out
+# at the next open for -1,500 together. The machinery stays so it can be
+# re-enabled with a record behind it; the policy simply grants it no side.
 POLICY: dict[str, RegimePolicy] = {
     # Range-bound tape is the ideal environment for selling premium: both wings
     # decay and neither is trending into the short strike.
@@ -42,14 +47,14 @@ POLICY: dict[str, RegimePolicy] = {
     "bull": RegimePolicy(
         size_multiplier=0.85,
         allowed_rights=("P",),
-        satellite_rights=("C",),  # buy the trend
+        satellite_rights=(),      # satellite disabled 2026-09-17; see below
         rationale="uptrend: sell put premium below the move, buy call spreads with it",
     ),
     # The way short-premium accounts die is selling puts into a downtrend.
     "bear": RegimePolicy(
         size_multiplier=0.35,
         allowed_rights=("C",),
-        satellite_rights=("P",),  # buy the trend
+        satellite_rights=(),      # satellite disabled 2026-09-17; see below
         rationale="downtrend: no short puts, size cut hard, and any conviction expressed "
                   "as a defined-risk put debit spread rather than more premium",
     ),

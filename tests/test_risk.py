@@ -425,3 +425,14 @@ def test_cadence_state_reports_entries_today_and_cooldowns():
     assert opened == 1
     assert [(u, r) for u, r, _ in cooling] == [("SPY", "P")]
     assert cooling[0][2].astimezone(ET).strftime("%m-%d %H:%M") == "08-29 10:00"
+
+
+def test_range_buffer_ignores_the_stale_range_in_a_trend():
+    """Bear tape: the 10-session high is stale. One expected move is the test."""
+    p = make_proposal(expiry=WEEK_OUT, right="C", short_strike=777.0, long_strike=782.0)
+    q = {"SPY": {"bp": 759.9, "ap": 760.1}}
+    # 777 is 17 from spot (> 15.8 expected move) but inside a range topping at 790
+    inside_range = tape(regime="bear", range_position=0.1, lookback_high=790.0, lookback_low=755.0)
+    sideways = tape(regime="sideways", range_position=0.1, lookback_high=790.0, lookback_low=755.0)
+    assert gate(evaluate(p, chain=chain_with_iv(p), quotes=q, tape=inside_range), "range_buffer").passed
+    assert not gate(evaluate(p, chain=chain_with_iv(p), quotes=q, tape=sideways), "range_buffer").passed

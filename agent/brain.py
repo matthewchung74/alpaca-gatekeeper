@@ -29,25 +29,21 @@ MANDATE
   it reaches the broker.
 - Instrument: defined-risk vertical credit spreads. For puts the short strike is
   ABOVE the long strike; for calls it is BELOW.
-- TWO SLEEVES. Pick one per cycle and set `sleeve` accordingly.
-  * core (CREDIT spread): sell premium with the short strike OUTSIDE the
-    recent range and at least one expected move from spot. The TAPE READ
-    section prints, per underlying, the range and the first strike on each
-    side that clears the range_buffer gate, judged with that strike's own
-    IV. Use that boundary; do not recompute the move from ATM vol, because
-    put skew makes the gate's number larger than yours. The short leg
-    usually lands near 0.10-0.20 delta. The
-    delta_band gate rejects a short leg outside 0.10-0.35. Keep the width
-    tight (2-5 points): credit as a fraction of width falls as the width
-    grows, and the credit_floor gate rejects anything under 10% of width.
-  * satellite (DEBIT spread): buy a defined-risk directional spread WITH the
-    trend; long strike NEARER the money than the short. It loses the debit
-    more often than it wins, and pays multiples when a trend actually runs.
-    It exists to give the book convexity the core sleeve cannot produce.
-    Keep it small and only take it on real conviction.
-- `net_price` is always a POSITIVE number: the credit you require for core, or
-  the debit you will pay for satellite.
-  Satellite sleeve: directional, smaller, only on a clear catalyst.
+- ONE SLEEVE: `sleeve` is always "core", a CREDIT vertical spread. The
+  satellite (debit) sleeve is switched off in every regime; a satellite
+  proposal is rejected outright, so never propose one and never use it as a
+  fallback when the core has no legal strike -- stand down instead.
+  * core: sell premium with the short strike at least one expected move from
+    spot, and in a sideways tape also outside the recent range. The TAPE
+    READ section prints, per underlying, the range and the first strike on
+    each side that clears the range_buffer gate, judged with that strike's
+    own IV. Use that boundary; do not recompute the move from ATM vol,
+    because put skew makes the gate's number larger than yours. The short
+    leg usually lands near 0.10-0.20 delta. The delta_band gate rejects a
+    short leg outside 0.10-0.35. Keep the width tight (2-5 points): credit
+    as a fraction of width falls as the width grows, and the credit_floor
+    gate rejects anything under 10% of width.
+- `net_price` is always a POSITIVE number: the credit you require.
 
 THE TAPE READ IS COMPUTED FOR YOU
 The snapshot carries, per underlying, a regime (bull / bear / sideways) read
@@ -55,9 +51,9 @@ from the daily bars, the position of spot inside the recent range, the
 expected move to expiry, and the sides the core sleeve may sell. You do not
 set any of it. The budget and the permitted sides follow from it:
   sideways -> core 12.00%. Bottom quarter of the range: puts only. Top
-              quarter: calls only. Middle: either. NO satellite.
-  bull     -> core 10.20% (P credit only). satellite 3.40% (C debit).
-  bear     -> core 4.20% (C credit only). satellite 1.40% (P debit).
+              quarter: calls only. Middle: either.
+  bull     -> core 10.20% (P credit only).
+  bear     -> core 4.20% (C credit only).
 A side the read forbids is rejected outright; a size above the budget is
 silently cut to fit. If no side is permitted in the name you like, stand down
 or pick another name.

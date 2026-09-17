@@ -50,6 +50,8 @@ Every cycle is journaled this way — the market snapshot, the model's full reas
 
 The core sleeve sells premium **against** the direction of the move. The satellite buys defined-risk exposure **with** it. That is what makes this a barbell rather than the same bet twice, and it is why a range-bound tape permits no satellite at all: with no trend to buy, paying a debit for convexity is burning premium.
 
+**The satellite is switched off as of 2026-09-17.** Its first four live trades were all put debit spreads bought at the bottom of a range because the core had no legal strike that day, and all four stopped out at the next open, −$1,500 together. The code stays; the regime policy grants it no side in any regime.
+
 The economics genuinely invert. On a 5-wide spread at 1.50 net price:
 
 ```
@@ -113,7 +115,7 @@ Every gate is a pure function of the proposal plus observed account and market s
 | 13 | `liquidity` | Both legs quoted, spread ≤ 10% of mid, OI ≥ 500 |
 | 14 | `delta_band` | Short-leg \|delta\| within 0.10–0.35 |
 | 15 | `directional_risk` | Max loss signed by direction across the book ≤ 20% of equity |
-| 16 | `range_buffer` | Short strike outside the 10-session high-low and ≥ 1 expected move from spot |
+| 16 | `range_buffer` | Short strike ≥ 1 expected move from spot; in a sideways tape also outside the 10-session high-low |
 | 17 | `credit_floor` | Credit ≥ 10% of width |
 | 18 | `book_risk` | Open max loss + proposal ≤ 24% of equity × regime multiplier |
 | 19 | `same_direction` | ≤ 2 open core spreads on one right across SPY/QQQ/IWM |

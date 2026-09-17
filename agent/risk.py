@@ -374,7 +374,15 @@ def range_clearance(right: str, strike: float, spot: float, iv: float, dte: int,
     em = spot * float(iv) * math.sqrt(max(dte, 1) / 365.0)
     need = limits.expected_move_multiple * em
     dist = (strike - spot) if right == "C" else (spot - strike)
-    inside = (strike <= tape.lookback_high) if right == "C" else (strike >= tape.lookback_low)
+    # The range veto only makes sense in a range. In a trend the old extreme
+    # is stale: after a 3-4% decline the 10-session high sits so far above
+    # spot that no call strike under it clears the delta floor, and the core
+    # had no legal trade for a week (2026-09-10 to 09-17). One expected move
+    # is the whole test there.
+    if tape.regime == "sideways":
+        inside = (strike <= tape.lookback_high) if right == "C" else (strike >= tape.lookback_low)
+    else:
+        inside = False
     return Clearance(dist >= need and not inside, dist, need, em, inside)
 
 
