@@ -240,45 +240,47 @@ material here — they are specific, verifiable, and useful to anyone else build
 
 ---
 
-## Post — the cross-model audit · DRAFT 2026-09-18 (in the LinkedIn composer, not published)
+## Post — I blamed the wrong half · DRAFT (in the LinkedIn composer, not published)
+
+Covers the hackathon, the 09-08 post-mortem and the first week on the new rules (through 09-17).
+Deliberately excludes everything from 09-18. The earlier cross-model-audit draft is in git history (581b6ad).
 
 Link for the comments: https://github.com/matthewchung74/alpaca-gatekeeper/tree/post-mortem-gates
 (the fixes live on the `post-mortem-gates` branch; `main` is still the submitted version)
 
 ### LinkedIn
 
-> My trading bot had a safety check that passed every single trade for three weeks. It had never checked anything.
+> My trading bot lost money, and I blamed the wrong half of it.
 >
-> I built an autonomous options agent for the Alpaca × lablab.ai hackathon. One design rule: the LLM proposes a trade, and deterministic Python gates decide whether it is allowed to exist. Risk limits live in code, not in the prompt.
+> For the Alpaca × lablab.ai hackathon I built an autonomous options agent. An LLM proposes a credit spread, and deterministic Python gates decide whether it is allowed to exist. It traded a paper account for a week and finished down 1.9%. Nine trades, five winners.
 >
-> One of those gates: both option legs need open interest of at least 500.
+> My first write-up said what most post-mortems say: selling premium needs about 65% winners, I got 56%, call it variance. The stops felt like the culprit. Two losers had blown straight through them on overnight gaps.
 >
-> [PASS] liquidity: both legs quoted with acceptable spreads
+> Then I did the one thing I had skipped. I replayed every trade as if the bot had never exited and had simply held to expiry.
 >
-> Every trade. Three weeks. Green.
+> Actual result: −$1,843
+> Held to expiry: −$11,358
 >
-> This week I had a second AI model, from a different lab, audit the first one's work. Claude wrote the agent. OpenAI's Codex reviewed it.
+> The exits I was blaming had saved about $9,500. Six of my nine short strikes finished in the money. For strikes chosen at 0.25 to 0.30 delta, that should be two or three.
 >
-> It found that the market-data feed I was using never includes open interest. The field was always missing, and my gate treated "missing" as "fine."
+> The entries were broken, and the replay showed how:
 >
-> A control that passes on missing data is not a control. It is a log line.
+> • Every trade was 1 to 4 days from expiry. That close in, a 0.25-delta strike sits 0.5 to 1% from spot, inside one ordinary day's move. Eight of nine short strikes were inside the range the market had already traded that week.
+> • The model labeled a 1.2% dip "bear," at the very bottom of a 15-session range. My own rule said bear means sell calls only. So it sold five call spreads in 26 hours, at the low, across three index ETFs that move together. The last three lost together on the bounce.
+> • It proposed a trade in 13 of 13 cycles where it had budget. Nothing in the system ever made doing nothing the attractive choice.
 >
-> It found three more like it:
+> The part that stung: that regime rule was my proudest safety feature. "The model's market read can only ever reduce risk." It did reduce the size. Then it pointed the whole book at the wrong side.
 >
-> • A worthless protective leg (bid = 0) was read as "no quote," so the stop-loss silently could not fire.
-> • The daily loss limit was documented as "flatten and halt." It only blocked new entries.
-> • Partial fills booked the wrong P&L. A real −$1,300 was journaled as −$1,500.
+> What changed: the regime is now computed from price bars instead of asked of the model. Strikes must sit outside the recent range and at least one expected move away. Expiries are a week or more out. The book has caps on how many bets can lean the same way.
 >
-> 138 tests were passing the whole time. Every one of these bugs lived in a path the tests never thought to question, because the same model wrote the code and the tests.
+> First week on the new rules, still paper: the premium-selling side went 2 for 2. A directional sleeve I had never actually tested went 0 for 4, every one a fallback taken because the main strategy had nothing legal to do. I turned it off. Net: roughly flat, and no claim of an edge yet.
 >
 > What I took from it:
 >
-> 1. Fail closed. If a gate cannot see its input, the answer is no.
-> 2. Same-model review shares the same blind spots. A different model, asked only to find holes, found seven in an afternoon.
-> 3. "It passed" tells you nothing until you have watched it fail.
->
-> All fixed now, each bug reproduced as a failing test first. For the record: this is paper trading and the account is roughly flat. The point is not returns. The point is that the safety layer I was proudest of had a hole I could not see from inside.
+> 1. Run the counterfactual before you assign blame. "The win rate was too low" is a symptom, not a cause.
+> 2. A rule that forces a direction is a bet, even when it is labeled a safety control.
+> 3. If standing down never wins inside your system, your system will always trade.
 >
 > Repo in the comments.
 >
-> #AITrading #AlpacaMarkets #lablab #Claude #Codex #BuildInPublic
+> #AITrading #AlpacaMarkets #lablab #Claude #BuildInPublic
