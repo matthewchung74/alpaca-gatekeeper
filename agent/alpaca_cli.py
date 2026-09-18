@@ -205,6 +205,34 @@ def list_expiries(underlying: str, profile: str, on_or_after: str,
     return sorted({r["expiration_date"] for r in rows if r.get("expiration_date")})
 
 
+def open_orders(profile: str) -> list[dict]:
+    """Open parent orders. --nested rolls legs under their multi-leg parent."""
+    return run("order", "list", "--status", "open", "--nested", "--limit", "100",
+               profile=profile) or []
+
+
+def ex_dividend(symbol: str, profile: str, since: str, until: str) -> tuple[str, float] | None:
+    """The next cash ex-dividend date for a symbol in [since, until], with the amount.
+
+    Alpaca only announces these a couple of days ahead (SPY's 2026-09-18
+    ex-date was declared 09-16), so this is asked every cycle, not tabulated.
+    """
+    rows = run("corporate-action", "list", "--symbol", symbol, "--ca-types", "Dividend",
+               "--since", since, "--until", until, "--date-type", "ex_date",
+               profile=profile) or []
+    best = None
+    for r in rows:
+        if r.get("ca_sub_type") != "cash" or not r.get("ex_date"):
+            continue
+        try:
+            item = (r["ex_date"], float(r.get("cash") or 0))
+        except (TypeError, ValueError):
+            continue
+        if best is None or item[0] < best[0]:
+            best = item
+    return best
+
+
 def open_interest(symbol: str, profile: str) -> int | None:
     """Open interest for one contract.
 

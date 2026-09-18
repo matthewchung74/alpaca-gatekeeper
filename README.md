@@ -137,6 +137,8 @@ Exits are as deterministic as entries — the model has no say in when a positio
 | Rule | Core (credit) | Satellite (debit) |
 |---|---|---|
 | `assignment_risk` | Expiry day, spot within $0.50 of the short strike | same |
+| `dividend_assignment_risk` | Last session before an ex-dividend date, short **call** within $0.50 of spot | n/a |
+| `daily_loss_flatten` | Day's loss from the prior close reaches 4%: close everything, halt until tomorrow | same |
 | `expiry_flatten` | Expiry day, 30 min before the close | same |
 | `stop_loss` | Cost to close ≥ 3× the credit (capped below the width) | Value ≤ 50% of the debit paid |
 | `profit_target` | Cost to close ≤ 50% of the credit | Value ≥ 60% of max profit |
@@ -169,7 +171,7 @@ RISK LIMITS IN FORCE
 
 The bars are load-bearing. Without them the agent produced confident claims — *"near the upper end of its range"*, *"grinding higher"* — that nothing in its input supported, and that ungrounded read was setting the risk budget. With them it cites specific closes and is explicitly forbidden from asserting a trend the bars don't show.
 
-The scheduled-release list contains **only events whose timing is derivable from the calendar** (weekly jobless claims on Thursdays, non-farm payrolls on the first Friday). Everything else — CPI, PCE, ISM, FOMC — arrives through the news feed as it actually prints. An invented date is worse than no date, because the agent treats it as fact and sizes on it.
+The scheduled-release list contains **only dates that are structural or published in advance by the agency itself**: weekly jobless claims on Thursdays, and the BLS, BEA and Fed schedules for payrolls, CPI, PCE and FOMC decisions. Payrolls used to be "the first Friday", which was wrong for five of 2026's twelve reports. Everything else arrives through the news feed as it actually prints. An invented date is worse than no date, because the agent treats it as fact and sizes on it, so a year with no table tells the model the calendar is out of date rather than guessing.
 
 ---
 

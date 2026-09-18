@@ -304,9 +304,9 @@ def build_snapshot(
             lines.append(f"       {e['impact']}")
     else:
         lines.append("  (none in the next 3 days)")
-    lines.append("  NOTE: only structurally-dated releases are listed (weekly claims,"
-                 " first-Friday payrolls, FOMC decision days). Other prints -- PCE, CPI,"
-                 " ISM -- are not scheduled here; infer them from the headlines below.")
+    lines.append("  NOTE: listed from published schedules: weekly claims, payrolls, CPI,"
+                 " PCE, FOMC decision days. Other prints -- ISM, retail sales, GDP -- are"
+                 " not scheduled here; infer them from the headlines below.")
 
     macro = macro_headlines(news or [])
     lines += ["", "MACRO HEADLINES (what has actually printed, and Fed tone):"]

@@ -138,11 +138,33 @@ def test_tranche_gate_detail_shows_the_regime_math():
 
 # --- macro: only derivable dates, never invented ones ----------------------
 
-def test_nfp_is_the_first_friday():
+def test_payrolls_come_from_the_published_schedule_not_the_first_friday():
+    """Five of 2026's twelve jobs reports were not on a first Friday
+    (Jan 9, Feb 11, May 8, Jul 2, Aug 7). The schedule is published; use it."""
     from datetime import date
-    from agent.macro import _first_friday
-    assert _first_friday(2026, 9) == date(2026, 9, 4)
-    assert _first_friday(2026, 10) == date(2026, 10, 2)
+    from agent.macro import upcoming
+    def jobs(d):
+        return [e for e in upcoming(0, d) if "Employment" in e["event"]]
+    assert jobs(date(2026, 10, 2)) and jobs(date(2026, 7, 2)) and jobs(date(2026, 2, 11))
+    assert not jobs(date(2026, 7, 3)) and not jobs(date(2026, 2, 6))     # the "first Fridays"
+
+
+def test_cpi_and_pce_are_scheduled_events():
+    from datetime import date
+    from agent.macro import upcoming
+    ev = upcoming(within_days=20, today=date(2026, 9, 25))
+    names = {(e["date"], e["event"].split(" (")[0]) for e in ev}
+    assert ("2026-09-30", "PCE / Personal Income and Outlays") in names
+    assert ("2026-10-14", "Consumer Price Index") in names
+    assert ("2026-10-02", "Employment Situation / non-farm payrolls") in names
+
+
+def test_a_year_without_a_published_table_says_so_instead_of_guessing():
+    from datetime import date
+    from agent.macro import upcoming
+    ev = upcoming(within_days=3, today=date(2027, 3, 1))
+    assert any("OUT OF DATE" in e["event"] for e in ev)
+    assert not any("Employment" in e["event"] or "Consumer Price" in e["event"] for e in ev)
 
 
 def test_jobless_claims_land_on_thursdays_only():
@@ -165,8 +187,8 @@ def test_expiry_day_carries_a_claims_print():
 def test_nfp_falls_after_our_expiry():
     """NFP is the window's biggest gap risk and must land after Sep 3."""
     from datetime import date
-    from agent.macro import _first_friday
-    assert _first_friday(2026, 9) > date(2026, 9, 3)
+    from agent.macro import EMPLOYMENT_SITUATION
+    assert date(2026, 9, 4) in EMPLOYMENT_SITUATION and date(2026, 9, 3) not in EMPLOYMENT_SITUATION
 
 
 def test_macro_headlines_filter_picks_out_macro():

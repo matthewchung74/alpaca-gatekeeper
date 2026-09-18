@@ -19,6 +19,7 @@ from typing import Any
 
 from google.cloud import firestore
 
+LOCKS = "locks"
 CYCLES = "cycles"
 MARKS = "marks"
 SPREADS = "spreads"
@@ -100,6 +101,36 @@ class FirestoreJournal:
     def set_entry_credit(self, spread_id, credit: float) -> None:
         self.db.collection(SPREADS).document(str(spread_id)).update(
             {"entry_credit": credit})
+
+    # --- one job at a time ------------------------------------------------
+
+    def acquire_lock(self, name: str, holder: str, ttl_s: int) -> bool:
+        """Take the account's lock unless someone else holds a live one.
+
+        A transaction, so the cycle and the sweep cannot both read "free" and
+        both write. The TTL is the backstop for a container that dies holding it.
+        """
+        import time
+        ref = self.db.collection(LOCKS).document(name)
+        txn = self.db.transaction()
+
+        @firestore.transactional
+        def _take(t) -> bool:
+            snap = ref.get(transaction=t)
+            cur = snap.to_dict() if snap.exists else None
+            now = time.time()
+            if cur and cur.get("expires", 0) > now and cur.get("holder") != holder:
+                return False
+            t.set(ref, {"holder": holder, "expires": now + ttl_s, "ts": _now()})
+            return True
+
+        return _take(txn)
+
+    def release_lock(self, name: str, holder: str) -> None:
+        ref = self.db.collection(LOCKS).document(name)
+        snap = ref.get()
+        if snap.exists and (snap.to_dict() or {}).get("holder") == holder:
+            ref.delete()
 
     def reduce_spread(self, spread_id, *, qty: int, realized_pnl: float) -> None:
         """A partial close: fewer contracts remain, and some P&L is banked."""

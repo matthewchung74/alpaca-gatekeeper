@@ -175,3 +175,67 @@ def test_session_bounds_come_from_the_calendar():
     assert loop.session_bounds(datetime(2026, 11, 26, 10, 0, tzinfo=ET), cal) is None   # holiday
     assert loop.in_session(datetime(2026, 11, 27, 9, 31, tzinfo=ET), (o, c))            # first minutes count for exits
     assert not loop.in_session(datetime(2026, 11, 27, 13, 1, tzinfo=ET), (o, c))
+
+
+# --- one job at a time, and no order left behind ------------------------------
+
+def test_journal_lock_is_exclusive_and_expires(tmp_path):
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    assert j.acquire_lock("dev", "cycle-1", ttl_s=600)
+    assert not j.acquire_lock("dev", "sweep-2", ttl_s=600)
+    assert j.acquire_lock("comp", "sweep-2", ttl_s=600)          # a different account is a different lock
+    j.release_lock("dev", "sweep-2")                             # not the holder: no effect
+    assert not j.acquire_lock("dev", "sweep-3", ttl_s=600)
+    j.release_lock("dev", "cycle-1")
+    assert j.acquire_lock("dev", "sweep-3", ttl_s=0)             # held, but already expired
+    assert j.acquire_lock("dev", "cycle-4", ttl_s=600)
+
+
+def test_a_sweep_stands_aside_while_a_cycle_holds_the_lock(tmp_path, monkeypatch):
+    """Without this a sweep can adopt an entry the cycle has filled but not yet
+    journaled, and the position ends up in the journal twice."""
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    monkeypatch.setattr(loop, "open_journal", lambda path=None: j)
+    ran = []
+    monkeypatch.setattr(loop, "_cycle_body", lambda settings, journal, **kw: ran.append(kw) or 0)
+    assert j.acquire_lock("dev", "cycle-x", ttl_s=600)
+    assert loop.run_cycle(Settings(profile="dev"), manage_only=True) == 0
+    assert ran == []                                              # skipped, not run
+    j.release_lock("dev", "cycle-x")
+    assert loop.run_cycle(Settings(profile="dev"), manage_only=True) == 0
+    assert len(ran) == 1
+    assert j.acquire_lock("dev", "anyone", ttl_s=600)             # and it let go afterwards
+
+
+def test_the_lock_is_released_even_when_the_cycle_blows_up(tmp_path, monkeypatch):
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    monkeypatch.setattr(loop, "open_journal", lambda path=None: j)
+    def boom(settings, journal, **kw):
+        raise RuntimeError("broker on fire")
+    monkeypatch.setattr(loop, "_cycle_body", boom)
+    with pytest.raises(RuntimeError):
+        loop.run_cycle(Settings(profile="dev"), manage_only=True)
+    assert j.acquire_lock("dev", "next", ttl_s=600)
+
+
+def test_orders_left_open_by_a_dead_run_are_cancelled(tmp_path, monkeypatch):
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    now = datetime(2026, 9, 18, 14, 0, tzinfo=ET)
+    orders = [
+        {"id": "o1", "client_order_id": "hack-abc", "submitted_at": "2026-09-18T17:45:30Z"},   # 14.5 min old
+        {"id": "o2", "client_order_id": "exit-7-def", "submitted_at": "2026-09-18T17:40:00Z"},
+        {"id": "o3", "client_order_id": "hack-new", "submitted_at": "2026-09-18T17:59:30Z"},   # 30s old: in flight
+        {"id": "o4", "client_order_id": "placed-by-hand", "submitted_at": "2026-09-18T15:00:00Z"},
+    ]
+    monkeypatch.setattr(cli, "open_orders", lambda profile: orders)
+    cancelled = []
+    monkeypatch.setattr(cli, "cancel_order", lambda oid, profile: cancelled.append(oid) or True)
+    assert loop.cancel_stale_orders(j, "dev", now, dry_run=False) == ["o1", "o2"]
+    assert cancelled == ["o1", "o2"]
+
+
+def test_next_session_skips_the_weekend():
+    cal = [{"date": "2026-09-18", "open": "09:30", "close": "16:00"},
+           {"date": "2026-09-21", "open": "09:30", "close": "16:00"}]
+    assert loop.next_session_date(datetime(2026, 9, 18, 12, 0, tzinfo=ET), cal) == "2026-09-21"
+    assert loop.next_session_date(datetime(2026, 9, 21, 12, 0, tzinfo=ET), cal) is None

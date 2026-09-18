@@ -85,6 +85,8 @@ def decide_exit(
     spot: float | None,
     limits: RiskLimits,
     close_t: datetime | None = None,
+    ex_dividend: tuple[str, float] | None = None,
+    next_session: str | None = None,
 ) -> ExitDecision:
     """Pure function. Given a spread and a mark, should it be closed?
 
@@ -109,6 +111,24 @@ def decide_exit(
                 reason=(f"expiry day and spot {spot:.2f} is within "
                         f"{limits.itm_flatten_buffer} of the short {spread.short_strike} "
                         f"{spread.right}; closing to avoid assignment"),
+            )
+
+    # 1b. Early assignment for the dividend. A short call that is in or near
+    # the money the night before ex-date can be exercised so the holder
+    # collects the dividend; we wake up short the stock and owing it. The
+    # long leg does not protect against that. Only the LAST session before
+    # ex-date matters, and only calls we are short (Alpaca: options dividend
+    # risk). Far-OTM calls are never exercised and ride through.
+    if (ex_dividend and spread.right == "C" and spread.is_credit and spot is not None):
+        ex_date, cash = ex_dividend
+        today = now.strftime("%Y-%m-%d")
+        last_session_before = today < ex_date and (next_session is None or ex_date <= next_session)
+        if last_session_before and spot >= spread.short_strike - limits.itm_flatten_buffer:
+            return ExitDecision(
+                action="close", rule="dividend_assignment_risk",
+                reason=(f"{spread.underlying} goes ex-dividend {ex_date} ({cash:.2f}/share) and "
+                        f"spot {spot:.2f} is within {limits.itm_flatten_buffer} of the short "
+                        f"{spread.short_strike:g} call; closing to avoid early assignment"),
             )
 
     # 2. Flatten anything still open into the expiry close.

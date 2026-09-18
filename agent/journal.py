@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS spreads (
     close_order_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_spreads_status ON spreads(profile, status);
+
+CREATE TABLE IF NOT EXISTS locks (
+    name     TEXT PRIMARY KEY,
+    holder   TEXT NOT NULL,
+    expires  REAL NOT NULL           -- unix seconds
+);
 """
 
 
@@ -163,6 +169,25 @@ class SQLiteJournal:
                 (datetime.now().astimezone().isoformat(), exit_debit, exit_rule,
                  realized_pnl, close_order_id, spread_id),
             )
+
+    # --- one job at a time ------------------------------------------------
+
+    def acquire_lock(self, name: str, holder: str, ttl_s: int) -> bool:
+        """Take the account's lock unless someone else holds a live one."""
+        import time
+        now = time.time()
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT holder, expires FROM locks WHERE name = ?", (name,)).fetchone()
+            if row and row["expires"] > now and row["holder"] != holder:
+                return False
+            c.execute("INSERT OR REPLACE INTO locks (name, holder, expires) VALUES (?,?,?)",
+                      (name, holder, now + ttl_s))
+            return True
+
+    def release_lock(self, name: str, holder: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM locks WHERE name = ? AND holder = ?", (name, holder))
 
     def reduce_spread(self, spread_id, *, qty: int, realized_pnl: float) -> None:
         """A partial close: fewer contracts remain, and some P&L is banked."""

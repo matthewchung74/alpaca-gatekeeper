@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -136,6 +137,55 @@ def session_bounds(now, calendar: list[dict]) -> tuple | None:
         return (now.replace(hour=oh, minute=om, second=0, microsecond=0),
                 now.replace(hour=ch, minute=cm, second=0, microsecond=0))
     return None
+
+
+def next_session_date(now, calendar: list[dict]) -> str | None:
+    """The first trading day after today, from the broker's calendar."""
+    today = now.strftime("%Y-%m-%d")
+    later = sorted(str(r.get("date")) for r in calendar or [] if str(r.get("date")) > today)
+    return later[0] if later else None
+
+
+OUR_ORDERS = ("hack-", "exit-")          # client_order_id prefixes this agent uses
+
+
+def cancel_stale_orders(journal, profile: str, now, *, dry_run: bool,
+                        older_than_s: int = 180) -> list[str]:
+    """Cancel any order of ours that an earlier run left working.
+
+    Every order this agent sends is polled to a settled state and cancelled
+    if it does not fill, inside one invocation, under the account lock. So an
+    open order of ours at the START of a run belongs to a run that died, and
+    it can still fill into a position nobody asked for. Orders placed by hand
+    are left alone.
+    """
+    try:
+        orders = cli.open_orders(profile)
+    except cli.CLIError as e:
+        print(f"  warn: open orders unavailable: {e}", file=sys.stderr)
+        return []
+    cancelled: list[str] = []
+    for o in orders:
+        coid = str(o.get("client_order_id") or "")
+        if not coid.startswith(OUR_ORDERS):
+            continue
+        try:
+            sent = datetime.fromisoformat(str(o.get("submitted_at")).replace("Z", "+00:00")[:32])
+        except ValueError:
+            continue
+        if (now - sent).total_seconds() < older_than_s:
+            continue
+        print(f"  cancelling orphaned order {o.get('id')} ({coid}) from an earlier run",
+              file=sys.stderr)
+        if dry_run:
+            continue
+        cli.cancel_order(str(o.get("id")), profile)
+        cancelled.append(str(o.get("id")))
+    if cancelled:
+        journal.record_cycle(profile=profile, action="error",
+                             error="cancelled orphaned order(s) from an earlier run: "
+                                   + ", ".join(cancelled))
+    return cancelled
 
 
 def in_session(now, session: tuple) -> bool:
@@ -330,6 +380,7 @@ def record_halt(journal, profile: str, reason: str, equity: float | None = None)
 def manage_open_spreads(
     settings: Settings, journal, obs: dict, now, *, dry_run: bool,
     flatten: str | None = None, close_t=None,
+    ex_divs: dict | None = None, next_session: str | None = None,
 ) -> dict:
     """Close anything the exit rules call for, before considering new risk.
 
@@ -374,7 +425,8 @@ def manage_open_spreads(
             d = ExitDecision(action="close", rule="daily_loss_flatten", reason=flatten)
         else:
             d = decide_exit(sp, mark, now=now, spot=spot, limits=settings.limits,
-                            close_t=close_t)
+                            close_t=close_t, next_session=next_session,
+                            ex_dividend=(ex_divs or {}).get(sp.underlying))
         mark_s = f"{mark:.2f}" if mark is not None else "n/a"
         print(f"    #{sp.id} {sp.underlying} {sp.short_strike}/{sp.long_strike} "
               f"cr {sp.entry_credit:.2f} mark {mark_s} -> {d.action}"
@@ -462,10 +514,48 @@ def manage_open_spreads(
     return marks
 
 
+LOCK_TTL_S = 600      # the backstop for a container that dies holding the lock
+
+
 def run_cycle(settings: Settings, *, dry_run: bool = False,
               manage_only: bool = False) -> int:
-    profile = settings.profile
+    """One invocation, under the account's lock.
+
+    The entry cycle and the exit sweep are separate Cloud Run jobs on
+    overlapping schedules. Without a lock a sweep can reconcile while a cycle
+    has filled an entry but not yet journaled it, adopt the position, and
+    leave it in the journal twice. A sweep that finds the lock taken simply
+    stands aside (the cycle manages exits first anyway, and the next sweep is
+    ten minutes off); a cycle waits up to 90 seconds for a sweep to finish.
+    """
     journal = open_journal(settings.journal_path)
+    if dry_run:
+        return _cycle_body(settings, journal, dry_run=True, manage_only=manage_only)
+    profile = settings.profile
+    holder = f"{'sweep' if manage_only else 'cycle'}-{uuid.uuid4().hex[:10]}"
+    tries = 1 if manage_only else 10
+    for i in range(tries):
+        if journal.acquire_lock(profile, holder, LOCK_TTL_S):
+            break
+        if i < tries - 1:
+            time.sleep(10)
+    else:
+        if manage_only:
+            print("  another job holds the account lock; this sweep stands aside")
+            return 0
+        journal.record_cycle(profile=profile, action="error",
+                             error="account lock still held after 90s; cycle skipped")
+        print("  account lock still held after 90s; cycle skipped", file=sys.stderr)
+        return 1
+    try:
+        return _cycle_body(settings, journal, dry_run=False, manage_only=manage_only)
+    finally:
+        journal.release_lock(profile, holder)
+
+
+def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
+                manage_only: bool = False) -> int:
+    profile = settings.profile
     now = now_et()
 
     print(f"[{now:%H:%M:%S}] cycle start  profile={profile}  dry_run={dry_run}")
@@ -474,7 +564,10 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
     # the regular session rather than to no trading at all.
     try:
         day = now.strftime("%Y-%m-%d")
-        session = session_bounds(now, cli.trading_calendar(day, day, profile))
+        calendar = cli.trading_calendar(
+            day, (now + timedelta(days=7)).strftime("%Y-%m-%d"), profile)
+        session = session_bounds(now, calendar)
+        next_session = next_session_date(now, calendar)
         if session is None:
             print("  the market is closed today; nothing to do")
             return 0
@@ -482,6 +575,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         print(f"  warn: calendar unavailable, assuming regular hours: {e}", file=sys.stderr)
         session = (now.replace(hour=9, minute=30, second=0, microsecond=0),
                    now.replace(hour=16, minute=0, second=0, microsecond=0))
+        next_session = None
 
     if manage_only and not in_session(now, session):
         # Sweeps run every 10 minutes across the whole day. Outside the session
@@ -490,6 +584,9 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         # ENTRY lockout, and a stop must not wait for them.
         print("  outside the trading session; sweep is a no-op")
         return 0
+
+    # We hold the lock, so any order of ours still working is an orphan.
+    cancel_stale_orders(journal, profile, now, dry_run=dry_run)
 
     expiry = resolve_expiry(profile, now)
     print(f"  target expiry: {expiry}")
@@ -542,8 +639,23 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         journal.record_cycle(profile=profile, action="error", equity=equity,
                              error="reconcile: " + " | ".join(unexplained))
 
+    # Ex-dividend dates, only for names where we are short calls. Alpaca
+    # announces these a couple of days ahead, so ask every time.
+    ex_divs: dict = {}
+    for u in {r["underlying"] for r in journal.open_spreads(profile)
+              if r.get("right") == "C" and (r.get("sleeve") or "core") == "core"}:
+        try:
+            found = cli.ex_dividend(u, profile, now.strftime("%Y-%m-%d"),
+                                    (now + timedelta(days=7)).strftime("%Y-%m-%d"))
+            if found:
+                ex_divs[u] = found
+                print(f"  {u} goes ex-dividend {found[0]} ({found[1]:.2f}/share)")
+        except cli.CLIError as e:
+            print(f"  warn: ex-dividend lookup failed for {u}: {e}", file=sys.stderr)
+
     open_marks = manage_open_spreads(settings, journal, obs, now, dry_run=dry_run,
-                                     flatten=flatten, close_t=session[1])
+                                     flatten=flatten, close_t=session[1],
+                                     ex_divs=ex_divs, next_session=next_session)
 
     if manage_only:
         # Exit sweeps run far more often than entry cycles: stops and profit
@@ -649,6 +761,13 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
     requested = p
 
     coid = f"hack-{uuid.uuid4().hex[:24]}"
+    if not dry_run:
+        # Intent on record BEFORE the order leaves. If this process dies
+        # between submit and journal, reconciliation adopts the position and
+        # the orphan-order sweep cancels anything still working; this row is
+        # what explains, afterwards, where either came from.
+        journal.record_cycle(profile=profile, action="intent", regime=cycle_regime,
+                             equity=equity, proposal=requested.model_dump(), order_id=coid)
     try:
         result = cli.submit_mleg(
             # Signed net price: negative for a credit we require, positive for

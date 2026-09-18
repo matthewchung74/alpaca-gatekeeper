@@ -374,3 +374,39 @@ def test_expiry_flatten_follows_an_early_close():
     d = decide_exit(sp, 0.30, now=at_1235, spot=790.0, limits=LIMITS, close_t=close_t)
     assert d.action == "close" and d.rule == "expiry_flatten"
     assert decide_exit(sp, 0.30, now=at_1235, spot=790.0, limits=LIMITS).action == "hold"
+
+
+# --- early assignment around an ex-dividend date -----------------------------
+
+def _call(**kw):
+    return spread(right="C", short_strike=770.0, long_strike=775.0, entry_credit=0.50,
+                  expiry="2026-09-25", **kw)
+
+EVE = datetime(2026, 9, 17, 12, 0, tzinfo=ET)        # SPY went ex-dividend 2026-09-18, 1.89
+
+
+def test_short_call_near_the_money_is_closed_the_session_before_ex_dividend():
+    """A short call that is in or near the money the night before ex-date can be
+    exercised for the dividend, leaving short stock and the dividend owed."""
+    d = decide_exit(_call(), 0.90, now=EVE, spot=769.8, limits=LIMITS,
+                    ex_dividend=("2026-09-18", 1.89), next_session="2026-09-18")
+    assert d.action == "close" and d.rule == "dividend_assignment_risk"
+    assert "1.89" in d.reason
+
+
+def test_a_far_otm_short_call_rides_through_ex_dividend():
+    d = decide_exit(_call(), 0.30, now=EVE, spot=755.0, limits=LIMITS,
+                    ex_dividend=("2026-09-18", 1.89), next_session="2026-09-18")
+    assert d.action == "hold"
+
+
+def test_dividend_rule_waits_for_the_last_session_and_ignores_puts():
+    early = decide_exit(_call(), 0.90, now=EVE, spot=769.8, limits=LIMITS,
+                        ex_dividend=("2026-09-22", 1.89), next_session="2026-09-18")
+    assert early.rule != "dividend_assignment_risk"
+    over_a_weekend = decide_exit(_call(), 0.90, now=EVE, spot=769.8, limits=LIMITS,
+                                 ex_dividend=("2026-09-19", 1.89), next_session="2026-09-21")
+    assert over_a_weekend.rule == "dividend_assignment_risk"      # ex-date lands before the next session
+    put = spread(right="P", short_strike=770.0, long_strike=765.0, entry_credit=0.50, expiry="2026-09-25")
+    assert decide_exit(put, 0.90, now=EVE, spot=770.2, limits=LIMITS,
+                       ex_dividend=("2026-09-18", 1.89), next_session="2026-09-18").rule != "dividend_assignment_risk"
