@@ -237,3 +237,48 @@ material here — they are specific, verifiable, and useful to anyone else build
   (they have the longest runway and the least risk of going stale), **3 today or
   tomorrow while the position is intact**, 4 midweek, 5 after the Sep-3 expiry
   settles.
+
+---
+
+## Post — the cross-model audit · DRAFT 2026-09-18 (in the LinkedIn composer, not published)
+
+Link for the comments: https://github.com/matthewchung74/alpaca-gatekeeper/tree/post-mortem-gates
+(the fixes live on the `post-mortem-gates` branch; `main` is still the submitted version)
+
+### LinkedIn
+
+> My trading bot had a safety check that passed every single trade for three weeks. It had never checked anything.
+>
+> I built an autonomous options agent for the Alpaca × lablab.ai hackathon. One design rule: the LLM proposes a trade, and deterministic Python gates decide whether it is allowed to exist. Risk limits live in code, not in the prompt.
+>
+> One of those gates: both option legs need open interest of at least 500.
+>
+> [PASS] liquidity: both legs quoted with acceptable spreads
+>
+> Every trade. Three weeks. Green.
+>
+> This week I had a second AI model, from a different lab, audit the first one's work. Claude wrote the agent. OpenAI's Codex reviewed it.
+>
+> It found that the market-data feed I was using never includes open interest. The field was always missing, and my gate treated "missing" as "fine."
+>
+> A control that passes on missing data is not a control. It is a log line.
+>
+> It found three more like it:
+>
+> • A worthless protective leg (bid = 0) was read as "no quote," so the stop-loss silently could not fire.
+> • The daily loss limit was documented as "flatten and halt." It only blocked new entries.
+> • Partial fills booked the wrong P&L. A real −$1,300 was journaled as −$1,500.
+>
+> 138 tests were passing the whole time. Every one of these bugs lived in a path the tests never thought to question, because the same model wrote the code and the tests.
+>
+> What I took from it:
+>
+> 1. Fail closed. If a gate cannot see its input, the answer is no.
+> 2. Same-model review shares the same blind spots. A different model, asked only to find holes, found seven in an afternoon.
+> 3. "It passed" tells you nothing until you have watched it fail.
+>
+> All fixed now, each bug reproduced as a failing test first. For the record: this is paper trading and the account is roughly flat. The point is not returns. The point is that the safety layer I was proudest of had a hole I could not see from inside.
+>
+> Repo in the comments.
+>
+> #AITrading #AlpacaMarkets #lablab #Claude #Codex #BuildInPublic
