@@ -19,11 +19,11 @@ from .regime import TapeRead, classify, core_sides
 from .manage import decide_exit, held_qty, is_actually_held, mark_to_close, spread_from_row
 from .brain import Brain, build_snapshot
 from .config import (
-    COMPETITION_PROFILE, MIN_DAYS_TO_EXPIRY, STARTING_EQUITY, TARGET_EXPIRY,
+    COMPETITION_PROFILE, ET, MIN_DAYS_TO_EXPIRY, STARTING_EQUITY, TARGET_EXPIRY,
     UNIVERSE, Settings, in_no_trade_window, now_et,
 )
 from .journal import open_journal
-from .models import AgentDecision
+from .models import AgentDecision, ExitDecision
 
 
 def observe(profile: str, expiry: str) -> dict:
@@ -114,8 +114,49 @@ def read_tape(obs: dict, now, limits) -> tuple[dict[str, TapeRead], dict[str, tu
     return tape, sides
 
 
+def day_start_equity(acct: dict, first_mark: float | None) -> float | None:
+    """The day's baseline: the broker's prior close, else the first mark.
+
+    The first journal mark of a session is taken after the open, so a position
+    that gapped overnight had already lost the money before the "day" began and
+    the daily limit never saw it (2026-09-03: -1,900 overnight, day P&L +14).
+    """
+    try:
+        last = float(acct.get("last_equity") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    return last if last > 0 else first_mark
+
+
+def daily_loss_breached(*, equity: float, day_start: float, limits) -> bool:
+    return day_start > 0 and (equity - day_start) <= -abs(day_start * limits.max_daily_loss_pct)
+
+
+def halted_today(journal, profile: str, now) -> bool:
+    """Has the daily limit already tripped this session? Persisted in the
+    journal so a bounce back above the limit does not re-open entries."""
+    from datetime import datetime as _dt
+    today = now.astimezone(ET).date()
+    for c in journal.recent_cycles(limit=300, profile=profile):
+        if c.get("action") != "halt":
+            continue
+        try:
+            ts = _dt.fromisoformat(str(c.get("ts")))
+        except ValueError:
+            continue
+        if (ts if ts.tzinfo else ts.replace(tzinfo=ET)).astimezone(ET).date() == today:
+            return True
+    return False
+
+
+def record_halt(journal, profile: str, reason: str, equity: float | None = None) -> None:
+    journal.record_cycle(profile=profile, action="halt", equity=equity,
+                         reasoning=f"{reason}; book flattened, no entries until tomorrow")
+
+
 def manage_open_spreads(
-    settings: Settings, journal, obs: dict, now, *, dry_run: bool
+    settings: Settings, journal, obs: dict, now, *, dry_run: bool,
+    flatten: str | None = None,
 ) -> dict:
     """Close anything the exit rules call for, before considering new risk.
 
@@ -156,7 +197,10 @@ def manage_open_spreads(
         bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
         spot = (bid + ask) / 2 if bid and ask else None
 
-        d = decide_exit(sp, mark, now=now, spot=spot, limits=settings.limits)
+        if flatten:
+            d = ExitDecision(action="close", rule="daily_loss_flatten", reason=flatten)
+        else:
+            d = decide_exit(sp, mark, now=now, spot=spot, limits=settings.limits)
         mark_s = f"{mark:.2f}" if mark is not None else "n/a"
         print(f"    #{sp.id} {sp.underlying} {sp.short_strike}/{sp.long_strike} "
               f"cr {sp.entry_credit:.2f} mark {mark_s} -> {d.action}"
@@ -217,6 +261,14 @@ def manage_open_spreads(
             # finishes the job.
             what = (f"{fill['status']} with 0 filled" if fill["qty"] == 0
                     else f"partially closed {fill['qty']} of {qty}")
+            if fill["qty"] > 0:
+                # Bank what actually closed, at the price it closed at, and
+                # shrink the position. The final close used to book the whole
+                # original size at the last price (Codex review: 4 @ 1.50 then
+                # 6 @ 2.00 on a 0.50 credit is -1,300, journaled as -1,500).
+                part_px = fill["credit"] if fill["credit"] is not None else (mark or 0.0)
+                banked = sp.realized_so_far + sp.realized_pnl(part_px, qty=fill["qty"])
+                journal.reduce_spread(sp.id, qty=qty - fill["qty"], realized_pnl=banked)
             print(f"        close INCOMPLETE ({what}); spread stays open",
                   file=sys.stderr)
             journal.record_cycle(
@@ -226,7 +278,7 @@ def manage_open_spreads(
             continue
 
         exit_px = fill["credit"] if fill["credit"] is not None else (mark or 0.0)
-        pnl = sp.realized_pnl(exit_px)
+        pnl = sp.realized_so_far + sp.realized_pnl(exit_px, qty=qty)
         journal.close_spread(sp.id, exit_debit=exit_px, exit_rule=d.rule or "manual",
                              realized_pnl=pnl, close_order_id=oid)
         print(f"        CLOSED @ {exit_px:.2f} (limit {limit:.2f}, mark "
@@ -274,19 +326,39 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         return 1
 
     equity = obs["equity"]
-    day_start = journal.day_start_equity(now.strftime("%Y-%m-%d")) or equity
+    day_start = day_start_equity(
+        obs["account"], journal.day_start_equity(now.strftime("%Y-%m-%d"), profile)) or equity
+
+    # The daily limit, as documented: flatten the book and halt for the day.
+    # It used to reject new entries and nothing else.
+    halted = halted_today(journal, profile, now)
+    flatten = None
+    if daily_loss_breached(equity=equity, day_start=day_start, limits=settings.limits):
+        flatten = (f"daily loss {(equity - day_start) / day_start:+.2%} at/over the "
+                   f"{settings.limits.max_daily_loss_pct:.0%} limit")
+        print(f"  DAILY LIMIT: {flatten}; flattening and halting", file=sys.stderr)
+        if not halted and not dry_run:
+            record_halt(journal, profile, flatten, equity)
+        halted = True
     journal.record_mark(profile=profile, equity=equity,
                         cash=float(obs["account"].get("cash", 0)),
                         positions=obs["positions"])
 
     # Exits before entries, always.
-    open_marks = manage_open_spreads(settings, journal, obs, now, dry_run=dry_run)
+    open_marks = manage_open_spreads(settings, journal, obs, now, dry_run=dry_run,
+                                     flatten=flatten)
 
     if manage_only:
         # Exit sweeps run far more often than entry cycles: stops and profit
         # targets need to be responsive, but a fresh LLM opinion every few
         # minutes costs money and adds nothing.
         print("  manage-only pass complete")
+        return 0
+
+    if halted:
+        journal.record_cycle(profile=profile, action="stood_down", equity=equity,
+                             reasoning="Halted for the day by the daily loss limit; no entries.")
+        print("  halted for the day; no entry considered")
         return 0
 
     tape, sides = read_tape(obs, now, settings.limits)

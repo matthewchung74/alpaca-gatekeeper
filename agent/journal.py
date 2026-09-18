@@ -164,6 +164,12 @@ class SQLiteJournal:
                  realized_pnl, close_order_id, spread_id),
             )
 
+    def reduce_spread(self, spread_id, *, qty: int, realized_pnl: float) -> None:
+        """A partial close: fewer contracts remain, and some P&L is banked."""
+        with self._conn() as c:
+            c.execute("UPDATE spreads SET qty = ?, realized_pnl = ? WHERE id = ?",
+                      (qty, realized_pnl, spread_id))
+
     def all_spreads(self, profile: str) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(
@@ -197,13 +203,20 @@ class SQLiteJournal:
                 ).fetchall()
         return [dict(r) for r in rows]
 
-    def day_start_equity(self, day: str) -> float | None:
-        """First recorded equity on a given YYYY-MM-DD, for the daily-loss gate."""
+    def day_start_equity(self, day: str, profile: str | None = None) -> float | None:
+        """First recorded equity on a given YYYY-MM-DD. A fallback only: the
+        daily-loss baseline is the broker's prior close (loop.day_start_equity)."""
         with self._conn() as c:
-            row = c.execute(
-                "SELECT equity FROM marks WHERE ts LIKE ? ORDER BY id ASC LIMIT 1",
-                (f"{day}%",),
-            ).fetchone()
+            if profile is None:
+                row = c.execute(
+                    "SELECT equity FROM marks WHERE ts LIKE ? ORDER BY id ASC LIMIT 1",
+                    (f"{day}%",),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT equity FROM marks WHERE ts LIKE ? AND profile = ? "
+                    "ORDER BY id ASC LIMIT 1", (f"{day}%", profile),
+                ).fetchone()
         return row["equity"] if row else None
 
 

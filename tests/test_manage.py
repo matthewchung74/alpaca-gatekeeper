@@ -323,3 +323,44 @@ def test_a_rising_mark_means_opposite_things_per_sleeve():
                       now=MIDWEEK, spot=740.0, limits=LIMITS)
     assert dbt.rule == "profit_target"
     assert crd.rule == "stop_loss"
+
+
+# --- a worthless protective leg is a price, not missing data ------------------
+
+def test_zero_bid_on_the_long_leg_still_marks_and_stops():
+    """Codex review 2026-09-18: credit 0.50, short ask 1.50, long bid 0.
+    A one-sided market (nobody bids, someone offers) values the long at zero;
+    the close costs 1.50, exactly the 3x stop. It used to return None and hold."""
+    sp = spread(entry_credit=0.50)
+    q = {sp.short_symbol(): {"ap": 1.50, "bp": 1.45},
+         sp.long_symbol(): {"ap": 0.03, "bp": 0}}
+    mark = mark_to_close(sp, q)
+    assert mark == pytest.approx(1.50)
+    d = decide_exit(sp, mark, now=MIDWEEK, spot=760.0, limits=LIMITS)
+    assert d.action == "close" and d.rule == "stop_loss"
+
+
+def test_zero_bid_on_the_long_leg_lets_the_profit_target_fire():
+    sp = spread(entry_credit=0.50)
+    q = {sp.short_symbol(): {"ap": 0.05, "bp": 0.03},
+         sp.long_symbol(): {"ap": 0.02, "bp": 0}}
+    mark = mark_to_close(sp, q)
+    assert mark == pytest.approx(0.05)
+    assert decide_exit(sp, mark, now=MIDWEEK, spot=790.0, limits=LIMITS).rule == "profit_target"
+
+
+def test_a_long_leg_with_no_market_at_all_is_still_missing():
+    """Bid 0 AND ask 0 is no quote, not a worthless option."""
+    sp = spread()
+    q = {sp.short_symbol(): {"ap": 1.50, "bp": 1.45},
+         sp.long_symbol(): {"ap": 0, "bp": 0}}
+    assert mark_to_close(sp, q) is None
+    assert mark_to_close(sp, {sp.short_symbol(): {"ap": 1.5, "bp": 1.45},
+                              sp.long_symbol(): {"ap": 0.03}}) is None
+
+
+def test_partial_close_pnl_is_per_quantity():
+    sp = spread(qty=10, entry_credit=0.50)
+    assert sp.realized_pnl(1.50, qty=4) == pytest.approx(-400.0)
+    assert sp.realized_pnl(2.00, qty=6) == pytest.approx(-900.0)
+    assert sp.realized_pnl(2.00) == pytest.approx(-1500.0)      # default is the full size

@@ -101,6 +101,11 @@ class FirestoreJournal:
         self.db.collection(SPREADS).document(str(spread_id)).update(
             {"entry_credit": credit})
 
+    def reduce_spread(self, spread_id, *, qty: int, realized_pnl: float) -> None:
+        """A partial close: fewer contracts remain, and some P&L is banked."""
+        self.db.collection(SPREADS).document(str(spread_id)).update(
+            {"qty": qty, "realized_pnl": realized_pnl})
+
     def _spreads(self, profile: str) -> list[dict]:
         docs = self.db.collection(SPREADS).where(
             filter=firestore.FieldFilter("profile", "==", profile)
@@ -143,9 +148,11 @@ class FirestoreJournal:
         return [{"ts": d.get("ts"), "equity": d.get("equity")} for d in docs
                 if profile is None or d.get("profile") == profile]
 
-    def day_start_equity(self, day: str) -> float | None:
+    def day_start_equity(self, day: str, profile: str | None = None) -> float | None:
         docs = self.db.collection(MARKS).where(
             filter=firestore.FieldFilter("day", "==", day)
         ).stream()
         rows = sorted((d.to_dict() for d in docs), key=lambda r: r.get("ts") or "")
+        if profile is not None:
+            rows = [r for r in rows if r.get("profile") == profile]
         return rows[0]["equity"] if rows else None

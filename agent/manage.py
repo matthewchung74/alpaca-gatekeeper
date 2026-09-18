@@ -51,6 +51,7 @@ def spread_from_row(row: dict) -> OpenSpread:
         right=row["right"], short_strike=row["short_strike"],
         long_strike=row["long_strike"], qty=row["qty"],
         entry_credit=row["entry_credit"], sleeve=row.get("sleeve") or "core",
+        realized_so_far=float(row.get("realized_pnl") or 0.0),
     )
 
 
@@ -68,7 +69,7 @@ def mark_to_close(spread: OpenSpread, quotes: dict) -> float | None:
     short_q = quotes.get(spread.short_symbol()) or {}
     long_q = quotes.get(spread.long_symbol()) or {}
     short_ask = _f(short_q.get("ap"))
-    long_bid = _f(long_q.get("bp"))
+    long_bid = _bid(long_q)
     if short_ask is None or long_bid is None:
         return None
     if spread.is_credit:
@@ -161,6 +162,24 @@ def decide_exit(
     return ExitDecision(
         action="hold",
         reason=f"value {mark:.2f} between stop {stop_at:.2f} and target {target:.2f}")
+
+
+def _bid(q: dict) -> float | None:
+    """The long leg's bid, where zero is a price and not an absence.
+
+    A far-OTM protective option often has nobody bidding while someone still
+    offers: bid 0, ask 0.03. That option is worth zero to us, and treating it
+    as missing data returned no mark at all, so neither the stop nor the
+    profit target could fire (Codex review, 2026-09-18). Zero counts only
+    when the ask proves the market exists; bid 0 with ask 0 is no quote.
+    """
+    try:
+        bid = float(q.get("bp"))
+    except (TypeError, ValueError):
+        return None
+    if bid > 0:
+        return bid
+    return 0.0 if bid == 0 and _f(q.get("ap")) is not None else None
 
 
 def _f(v) -> float | None:

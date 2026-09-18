@@ -42,7 +42,11 @@ STARTING_EQUITY = 100_000.0
 @dataclass(frozen=True)
 class RiskLimits:
     """All thresholds in one place so the write-up can quote them verbatim."""
-    max_daily_loss_pct: float = 0.04        # flatten + halt for the day
+    # Flatten + halt for the day, measured from the broker's prior close so an
+    # overnight gap counts. Enforced in loop.run_cycle on every cycle AND every
+    # sweep: the book is closed, a halt row is journaled, and no entry is
+    # considered until the next session even if equity recovers.
+    max_daily_loss_pct: float = 0.04
     max_event_drawdown_pct: float = 0.15    # halt for the event
     max_underlying_notional_pct: float = 0.35
     max_concurrent_positions: int = 8

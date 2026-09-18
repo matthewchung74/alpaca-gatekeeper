@@ -126,6 +126,7 @@ class OpenSpread(BaseModel):
     qty: int
     entry_credit: float          # net price paid/received at entry, always positive
     sleeve: Sleeve = "core"
+    realized_so_far: float = 0.0  # P&L already banked by partial closes
 
     @property
     def is_credit(self) -> bool:
@@ -156,15 +157,19 @@ class OpenSpread(BaseModel):
              "position_intent": "sell_to_close"},
         ]
 
-    def realized_pnl(self, exit_price: float) -> float:
-        """P&L in dollars.
+    def realized_pnl(self, exit_price: float, qty: int | None = None) -> float:
+        """P&L in dollars on `qty` contracts (default: the whole position).
 
         Credit spread: we took in `entry_credit` and pay `exit_price` to close.
         Debit spread:  we paid `entry_credit` and receive `exit_price` to close.
+
+        Per-quantity because closes can be partial, at different prices. The
+        caller adds `realized_so_far` for the position's total.
         """
+        n = self.qty if qty is None else qty
         if self.is_credit:
-            return (self.entry_credit - exit_price) * 100.0 * self.qty
-        return (exit_price - self.entry_credit) * 100.0 * self.qty
+            return (self.entry_credit - exit_price) * 100.0 * n
+        return (exit_price - self.entry_credit) * 100.0 * n
 
 
 class ExitDecision(BaseModel):
