@@ -394,7 +394,7 @@ def test_snapshot_lists_entries_today_and_cooldowns():
         day_start_equity=100_000.0, positions=[], quotes={}, chains={}, bars={},
         news=[], limits=LIMITS, recent_spreads=rows,
     )
-    assert "CADENCE" in out and "entries today: 0 of max 1" in out
+    assert "CADENCE" in out and "entries today: 0 of max 2" in out
     assert "QQQ C until 09-11 09:40 ET" in out
 
 

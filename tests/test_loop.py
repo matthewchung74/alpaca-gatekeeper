@@ -316,7 +316,6 @@ def _wire(monkeypatch, observations, *, fills, marks=(0.45, 0.05)):
     monkeypatch.setattr(cli, "open_orders", lambda profile: [])
     monkeypatch.setattr(cli, "ex_dividend", lambda *a, **k: None)
     monkeypatch.setattr(cli, "fills", lambda profile, after: [])
-    monkeypatch.setattr(cli, "open_interest", lambda sym, profile: 5000)
     monkeypatch.setattr(loop, "resolve_expiry", lambda profile, now: "2026-09-10")
     seq = list(observations)
     monkeypatch.setattr(loop, "observe", lambda profile, expiry: seq.pop(0) if len(seq) > 1 else seq[0])
@@ -424,3 +423,29 @@ def test_no_trade_when_the_final_observation_cannot_be_made(tmp_path, monkeypatc
     assert loop._cycle_body(Settings(profile="dev"), j, manage_only=False) == 1
     assert sent == []
     assert any("final observation failed" in (c.get("error") or "") for c in j.recent_cycles(10, "dev"))
+
+
+def test_the_expiry_picker_prefers_the_liquid_friday_weekly():
+    """Nearest expiry >= 7 days out was the 09-28 MONDAY weekly: days old, and
+    not one spread with both legs at OI >= 500. Friday weeklies had hundreds."""
+    listed = {"2026-09-28", "2026-09-30", "2026-10-02", "2026-10-05", "2026-10-09"}
+    assert loop.pick_expiry(listed) == "2026-10-02"
+    assert loop.pick_expiry({"2026-09-28", "2026-09-30"}) == "2026-09-28"     # no Friday listed: nearest
+
+
+def test_expiry_lookup_pages_past_the_first_expiry(monkeypatch):
+    """One page of contracts held only the nearest expiry or two (~300 contracts
+    each), so a Friday further out was never in the list to be preferred."""
+    pages = {"": {"option_contracts": [{"expiration_date": "2026-09-28"}] * 3, "next_page_token": "p2"},
+             "p2": {"option_contracts": [{"expiration_date": "2026-09-30"},
+                                         {"expiration_date": "2026-10-02"}], "next_page_token": None}}
+    seen = []
+    def fake_run(*args, profile, **kw):
+        path = args[2]
+        seen.append(path)
+        tok = path.split("page_token=")[1] if "page_token=" in path else ""
+        return pages[tok]
+    monkeypatch.setattr(cli, "run", fake_run)
+    got = cli.list_expiries("SPY", "dev", "2026-09-28", "2026-10-08")
+    assert got == ["2026-09-28", "2026-09-30", "2026-10-02"]
+    assert "type=call" in seen[0] and "expiration_date_lte=2026-10-08" in seen[0] and len(seen) == 2

@@ -16,6 +16,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from . import alpaca_cli as cli
+from . import candidates as cand
 from . import regime
 from . import risk
 from .regime import TapeRead, classify, core_sides
@@ -55,6 +56,11 @@ def observe(profile: str, expiry: str) -> dict:
                 strike_gte=round(mid * 1.00), strike_lte=round(mid * 1.06),
             )
             chains[sym] = {**puts, **calls}
+            # Open interest, which the chain snapshot never carries. Missing
+            # stays missing, and the liquidity gate fails closed on it.
+            for osym, oi in cli.contracts_oi(sym, expiry, profile).items():
+                if osym in chains[sym]:
+                    chains[sym][osym]["openInterest"] = oi
             bars[sym] = cli.daily_bars(sym, profile, start)[-15:]
         except cli.CLIError as e:
             print(f"  warn: {sym} data unavailable: {e}", file=sys.stderr)
@@ -80,10 +86,12 @@ def resolve_expiry(profile: str, now) -> str:
     at all.
     """
     floor = (now + timedelta(days=MIN_DAYS_TO_EXPIRY)).strftime("%Y-%m-%d")
+    # Ten days past the floor always contains a Friday, holiday weeks included.
+    until = (now + timedelta(days=MIN_DAYS_TO_EXPIRY + 10)).strftime("%Y-%m-%d")
     common: set[str] | None = None
     for sym in UNIVERSE:
         try:
-            found = set(cli.list_expiries(sym, profile, floor))
+            found = set(cli.list_expiries(sym, profile, floor, until))
         except cli.CLIError as e:
             print(f"  warn: expiries for {sym} unavailable: {e}", file=sys.stderr)
             return TARGET_EXPIRY
@@ -92,7 +100,22 @@ def resolve_expiry(profile: str, now) -> str:
         print("  warn: no expiry common to the universe; using the configured one",
               file=sys.stderr)
         return TARGET_EXPIRY
-    return min(common)
+    return pick_expiry(common)
+
+
+def pick_expiry(listed: set[str]) -> str:
+    """The nearest FRIDAY among the listed expiries, else the nearest of any.
+
+    "Nearest, at least a week out" kept landing on Monday and Wednesday
+    weeklies that had been listed for days. On 2026-09-18 the 09-28 Monday
+    weekly had not one vertical with open interest of 500 on both legs, in
+    any of the three names; the 09-25 Friday weekly had hundreds. Friday
+    weeklies are where the open interest is, so they come first. Holds run
+    7-13 days instead of 7-9.
+    """
+    from datetime import date
+    fridays = [d for d in listed if date.fromisoformat(d).weekday() == 4]
+    return min(fridays) if fridays else min(listed)
 
 
 def read_tape(obs: dict, now, limits) -> tuple[dict[str, TapeRead], dict[str, tuple]]:
@@ -411,13 +434,6 @@ def final_observation(journal, profile: str, expiry: str, p, now, limits) -> dic
     obs = observe(profile, expiry)
     if p.underlying not in obs["quotes"] or p.underlying not in obs["chains"]:
         raise cli.CLIError(["observe"], 1, f"no fresh market data for {p.underlying}")
-    chain = obs["chains"][p.underlying]
-    for leg in p.legs():
-        snap = chain.get(leg["symbol"])
-        if snap is not None:
-            oi = cli.open_interest(leg["symbol"], profile)
-            if oi is not None:
-                snap["openInterest"] = oi
     tape, sides = read_tape(obs, now, limits)
     return {"obs": obs, "equity": obs["equity"], "tape": tape, "sides": sides,
             "marks": current_marks(journal, profile, obs["positions"])}
@@ -773,12 +789,19 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     recent_spreads = [r for r in journal.all_spreads(profile)
                       if (r.get("ts_open") or "") >= (now - timedelta(days=7)).strftime("%Y-%m-%d")]
 
+    found, funnel = cand.enumerate_candidates(
+        chains=obs["chains"], quotes=obs["quotes"], tape=tape, sides=sides, now=now,
+        expiry=expiry, limits=settings.limits, open_spreads=journal.open_spreads(profile),
+        profile=profile, session=session)
+    print(f"  candidates: {funnel['pairs']} pairs, {funnel['survivors']} survive; "
+          f"rejections {funnel['failed']}")
+
     snapshot = build_snapshot(
         now=now, equity=equity, day_start_equity=day_start,
         positions=obs["positions"], quotes=obs["quotes"], chains=obs["chains"],
         bars=obs.get("bars", {}), news=obs.get("news", []),
         limits=settings.limits, target_expiry=expiry, tape=tape, sides=sides,
-        recent_spreads=recent_spreads,
+        recent_spreads=recent_spreads, candidate_lines=cand.render(found, funnel),
     )
 
     try:

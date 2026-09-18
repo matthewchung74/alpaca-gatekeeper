@@ -189,20 +189,33 @@ def fill_result(order_id: str, profile: str, tries: int = 24,
 
 
 def list_expiries(underlying: str, profile: str, on_or_after: str,
-                  limit: int = 400) -> list[str]:
-    """Expiries actually listed for an underlying, nearest first.
+                  until: str | None = None) -> list[str]:
+    """Expiries actually listed for an underlying in [on_or_after, until], nearest first.
 
-    The contracts endpoint returns rows sorted by expiry, so a truncated page
-    still contains the nearest dates -- which is all the caller wants. Never
-    guess these from a calendar: SPY, QQQ and IWM do not share one weekly
+    Never guess these from a calendar: SPY, QQQ and IWM do not share one weekly
     pattern, and a guessed date produces an empty chain and a stood-down cycle.
+
+    Calls only, and paged to the end of the window. This used to take one page
+    of 400 contracts sorted by date, on the theory that "a truncated page still
+    contains the nearest dates". Each expiry lists about 300 contracts, so the
+    page held the nearest one or two expiries and nothing else -- enough to
+    find "the nearest", never enough to find the nearest FRIDAY.
     """
-    data = run("api", "GET",
-               f"/v2/options/contracts?underlying_symbols={underlying}"
-               f"&expiration_date_gte={on_or_after}&limit={limit}",
-               profile=profile)
-    rows = (data or {}).get("option_contracts") or []
-    return sorted({r["expiration_date"] for r in rows if r.get("expiration_date")})
+    found: set[str] = set()
+    token = ""
+    for _ in range(20):
+        path = (f"/v2/options/contracts?underlying_symbols={underlying}&type=call"
+                f"&expiration_date_gte={on_or_after}"
+                + (f"&expiration_date_lte={until}" if until else "")
+                + "&limit=1000" + (f"&page_token={token}" if token else ""))
+        data = run("api", "GET", path, profile=profile) or {}
+        found |= {r["expiration_date"] for r in data.get("option_contracts") or []
+                  if r.get("expiration_date")}
+        token = data.get("next_page_token") or ""
+        if not token:
+            break
+    return sorted(found)
+
 
 
 def fills(profile: str, after: str) -> list[dict]:
@@ -239,18 +252,29 @@ def ex_dividend(symbol: str, profile: str, since: str, until: str) -> tuple[str,
     return best
 
 
-def open_interest(symbol: str, profile: str) -> int | None:
-    """Open interest for one contract.
+def contracts_oi(underlying: str, expiry: str, profile: str) -> dict[str, int]:
+    """Open interest for every contract of one underlying and expiry.
 
-    The chain snapshot does not carry it; only the contracts endpoint does.
-    The liquidity gate's OI floor passed on missing data for two weeks because
-    nothing ever fetched this.
+    The chain snapshot does not carry it; only the contracts endpoint does,
+    and it returns a whole expiry per call. Fetched in observe(), BEFORE the
+    model chooses, so it can see which strikes are liquid rather than learn
+    at the gate that its pick was not.
     """
-    data = run("api", "GET", f"/v2/options/contracts/{symbol}", profile=profile) or {}
-    try:
-        return int(float(data.get("open_interest")))
-    except (TypeError, ValueError):
-        return None
+    out: dict[str, int] = {}
+    token = ""
+    for _ in range(10):
+        path = (f"/v2/options/contracts?underlying_symbols={underlying}"
+                f"&expiration_date={expiry}&limit=1000" + (f"&page_token={token}" if token else ""))
+        data = run("api", "GET", path, profile=profile) or {}
+        for c in data.get("option_contracts") or []:
+            try:
+                out[c["symbol"]] = int(float(c.get("open_interest") or 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+        token = data.get("next_page_token") or ""
+        if not token:
+            break
+    return out
 
 
 def news(symbols: list[str], profile: str, limit: int = 12) -> list[dict]:

@@ -120,7 +120,7 @@ Every gate is a pure function of the proposal plus observed account and market s
 | 18 | `book_risk` | Open max loss + proposal ≤ 24% of equity × regime multiplier |
 | 19 | `same_direction` | ≤ 2 open core spreads on one right across SPY/QQQ/IWM |
 | 20 | `losing_side` | No new spread on a right where an open spread marks ≥ 1.5× its credit |
-| 21 | `cadence` | 1 entry per day; 24h cooldown per underlying and right after a close |
+| 21 | `cadence` | 2 entries per day; 24h cooldown per underlying and right after a close |
 | 22 | `leg_overlap` | A new spread may not reuse a contract an open spread already holds |
 
 Gates 16 to 21 come from the post-mortem. Six of nine hackathon short strikes finished in the money; held to expiry the book would have lost about $11,400 against the $1,843 it did lose. The strikes sat inside the prior week's range at one to four days to expiry, the book stacked three same-direction spreads in three tickers that move together, and the model proposed a trade in every cycle it had budget for. Each of those is now a gate.
@@ -153,6 +153,12 @@ Three details that took a live position to get right:
 **Degraded data holds, except when it can't.** Losing quotes returns `hold` — but `expiry_flatten` and `assignment_risk` still fire without a mark, so a data outage cannot strand the book into assignment.
 
 ---
+
+## The model chooses from what can pass
+
+Before the model is asked anything, `agent/candidates.py` walks every vertical up to five points wide on the permitted sides and runs the same per-trade gate functions the final verdict uses: liquidity including open interest, delta band, range buffer, credit floor, leg overlap. The survivors go into the snapshot with their mid and natural credit, short delta and open interest, and the model is told to choose from that list or stand down. The count of pairs each gate rejected is journaled with every cycle, so whether a threshold is too tight is a number in the log.
+
+The expiry is the nearest **Friday** weekly at least seven days out. "Nearest expiry" kept landing on Monday and Wednesday weeklies listed days earlier: on 2026-09-18 the 09-28 Monday weekly had 1 surviving vertical out of 115 across all three names, and the 10-02 Friday had 26 of 183.
 
 ## What the model actually sees
 

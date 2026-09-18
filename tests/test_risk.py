@@ -391,11 +391,15 @@ def test_losing_side_blocks_adding_to_a_side_already_underwater():
     assert fine.passed and no_mark.passed
 
 
-def test_cadence_allows_one_entry_per_day():
-    today = [row(id="a", ts_open="2026-08-28T15:46:00+00:00")]      # 11:46 ET on MIDDAY's date
-    g = gate(evaluate(make_proposal(), recent_spreads=today), "cadence")
-    assert not g.passed and "1 entr" in g.detail
-    yesterday = [row(id="a", ts_open="2026-08-27T15:46:00+00:00")]
+def test_cadence_allows_two_entries_per_day():
+    """Raised from 1 to 2 on 2026-09-18 at Matt's call: paper account, see how it does."""
+    one = [row(id="a", ts_open="2026-08-28T15:46:00+00:00")]        # 11:46 ET on MIDDAY's date
+    assert gate(evaluate(make_proposal(), recent_spreads=one), "cadence").passed
+    two = one + [row(id="b", underlying="IWM", ts_open="2026-08-28T13:46:00+00:00")]
+    g = gate(evaluate(make_proposal(), recent_spreads=two), "cadence")
+    assert not g.passed and "2 entries" in g.detail
+    yesterday = [row(id="a", ts_open="2026-08-27T15:46:00+00:00"),
+                 row(id="b", ts_open="2026-08-27T13:46:00+00:00")]
     assert gate(evaluate(make_proposal(), recent_spreads=yesterday), "cadence").passed
 
 

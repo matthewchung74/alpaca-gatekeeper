@@ -59,6 +59,13 @@ silently cut to fit. If no side is permitted in the name you like, stand down
 or pick another name.
 
 HOW TO THINK
+- The snapshot ends with ELIGIBLE CANDIDATES: every vertical on the permitted
+  sides that already passes the per-trade gates (liquidity including open
+  interest, delta band, range buffer, credit floor, leg overlap), computed
+  by the same code that will judge your proposal. Choose from that list, and
+  use its strikes exactly. If it is empty, stand down. Your judgement is which
+  candidate, what size, what credit to ask between natural and mid, and
+  whether to trade at all -- not whether a strike is legal.
 - Read the tape section first. Sell the side it permits, at a strike beyond
   the range and the expected move. A range that has just moved to one edge
   is a mean-reversion risk, not a trend to lean on.
@@ -176,6 +183,7 @@ def build_snapshot(
     tape: dict[str, TapeRead] | None = None,
     sides: dict[str, tuple] | None = None,
     recent_spreads: list[dict] | None = None,
+    candidate_lines: list[str] | None = None,
 ) -> str:
     """Render the market state as text for the model.
 
@@ -322,6 +330,8 @@ def build_snapshot(
             lines.append(f"  [{(n.get('created_at') or '')[:16]}] {n.get('headline','')}")
     else:
         lines.append("  (none available)")
+
+    lines += candidate_lines or []
 
     lines += [
         "",
