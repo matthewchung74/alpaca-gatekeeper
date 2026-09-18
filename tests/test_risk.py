@@ -512,3 +512,45 @@ def test_trading_window_respects_an_early_close():
     assert not gate(evaluate(make_proposal(), now=at_1400, session=early), "trading_window").passed
     assert gate(evaluate(make_proposal(), now=datetime(2026, 11, 27, 11, 0, tzinfo=ET),
                          session=early), "trading_window").passed
+
+
+# --- Codex follow-up review 2026-09-18 -----------------------------------------
+
+def test_a_fractional_second_timestamp_keeps_its_timezone():
+    """The parser collected digits from the UTC offset too, lost the zone, and
+    read an hour-old quote as three hours in the FUTURE, which passed."""
+    now = datetime(2026, 9, 18, 14, 0, tzinfo=ET)                      # 18:00Z
+    assert risk._quote_age_minutes("2026-09-18T17:00:00.123456789Z", now) == pytest.approx(60, abs=0.1)
+    assert risk._quote_age_minutes("2026-09-18T17:59:30.123456Z", now) == pytest.approx(0.5, abs=0.1)
+    assert risk._quote_age_minutes("2026-09-18T13:59:00.5-04:00", now) == pytest.approx(1, abs=0.1)
+    p = make_proposal()
+    ch = make_chain(p)
+    for snap in ch.values():
+        snap["latestQuote"]["t"] = "2026-09-18T17:00:00.123456789Z"   # an hour old
+    g = gate(evaluate(p, chain=ch, now=now), "liquidity")
+    assert not g.passed and "stale" in g.detail
+
+
+def test_a_quote_from_the_future_is_not_a_fresh_quote():
+    now = datetime(2026, 9, 18, 14, 0, tzinfo=ET)
+    p = make_proposal()
+    ch = make_chain(p)
+    for snap in ch.values():
+        snap["latestQuote"]["t"] = "2026-09-18T21:00:00Z"             # three hours ahead
+    g = gate(evaluate(p, chain=ch, now=now), "liquidity")
+    assert not g.passed and "future" in g.detail
+
+
+def test_a_proposal_may_not_share_a_contract_with_an_open_spread():
+    """Two lots sharing a short leg pass reconciliation in aggregate but cannot
+    be closed lot by lot. Until the journal allocates per lot, refuse the overlap."""
+    held = [row(id="a", underlying="SPY", right="C", short_strike=770.0, long_strike=775.0)]
+    same_short = make_proposal(right="C", short_strike=770.0, long_strike=780.0)
+    crossed = make_proposal(right="C", short_strike=775.0, long_strike=780.0)     # their long is our short
+    clear = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    for p in (same_short, crossed):
+        held[0]["expiry"] = p.expiry
+        g = gate(evaluate(p, open_spreads=held), "leg_overlap")
+        assert not g.passed and "SPY" in g.detail
+    held[0]["expiry"] = clear.expiry
+    assert gate(evaluate(clear, open_spreads=held), "leg_overlap").passed

@@ -127,10 +127,21 @@ class FirestoreJournal:
         return _take(txn)
 
     def release_lock(self, name: str, holder: str) -> None:
+        """Let go, but only of a lock that is still ours.
+
+        One transaction. A separate read then delete could remove a lock that
+        expired and was re-taken by someone else between the two calls.
+        """
         ref = self.db.collection(LOCKS).document(name)
-        snap = ref.get()
-        if snap.exists and (snap.to_dict() or {}).get("holder") == holder:
-            ref.delete()
+        txn = self.db.transaction()
+
+        @firestore.transactional
+        def _drop(t) -> None:
+            snap = ref.get(transaction=t)
+            if snap.exists and (snap.to_dict() or {}).get("holder") == holder:
+                t.delete(ref)
+
+        _drop(txn)
 
     def reduce_spread(self, spread_id, *, qty: int, realized_pnl: float) -> None:
         """A partial close: fewer contracts remain, and some P&L is banked."""

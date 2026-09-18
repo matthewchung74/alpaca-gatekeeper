@@ -159,7 +159,8 @@ def test_reconcile_blocks_on_exposure_it_cannot_explain(tmp_path):
     assert any("SPY260910C00770000" in p for p in loop.reconcile(j, "dev", short_only, NOW, dry_run=False))
 
 
-def test_reconcile_retires_a_spread_the_broker_no_longer_holds(tmp_path):
+def test_reconcile_retires_a_spread_the_broker_no_longer_holds(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "fills", lambda profile, after: [])
     j = _book(tmp_path)
     later = datetime.now(ET).replace(year=2030)                 # the row is long settled
     problems = loop.reconcile(j, "dev", [], later, dry_run=False)
@@ -230,7 +231,9 @@ def test_orders_left_open_by_a_dead_run_are_cancelled(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "open_orders", lambda profile: orders)
     cancelled = []
     monkeypatch.setattr(cli, "cancel_order", lambda oid, profile: cancelled.append(oid) or True)
-    assert loop.cancel_stale_orders(j, "dev", now, dry_run=False) == ["o1", "o2"]
+    monkeypatch.setattr(cli, "fill_result", lambda oid, profile, **kw: {
+        "qty": 0, "credit": None, "status": "canceled", "timed_out": False})
+    assert loop.cancel_stale_orders(j, "dev", now, dry_run=False) == (["o1", "o2"], [])
     assert cancelled == ["o1", "o2"]
 
 
@@ -239,3 +242,185 @@ def test_next_session_skips_the_weekend():
            {"date": "2026-09-21", "open": "09:30", "close": "16:00"}]
     assert loop.next_session_date(datetime(2026, 9, 18, 12, 0, tzinfo=ET), cal) == "2026-09-21"
     assert loop.next_session_date(datetime(2026, 9, 21, 12, 0, tzinfo=ET), cal) is None
+
+
+# --- Codex follow-up review 2026-09-18 ------------------------------------------
+
+def test_a_liquidation_keeps_going_until_the_book_is_flat():
+    """Forced close fills 4 of 10, equity recovers above the limit, and the next
+    sweep used to leave the other 6 open under a halt that was still in force."""
+    assert loop.flatten_reason(halted=True, breached=False, open_spreads=[{"id": 1}]) is not None
+    assert loop.flatten_reason(halted=True, breached=False, open_spreads=[]) is None
+    assert loop.flatten_reason(halted=False, breached=False, open_spreads=[{"id": 1}]) is None
+    assert "limit" in loop.flatten_reason(halted=False, breached=True, open_spreads=[], detail="daily loss -4.1% at/over the 4% limit")
+
+
+def test_an_orphan_is_only_cancelled_when_the_broker_says_so(tmp_path, monkeypatch):
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    now = datetime(2026, 9, 18, 14, 0, tzinfo=ET)
+    orders = [{"id": "gone", "client_order_id": "hack-a", "submitted_at": "2026-09-18T17:40:00Z"},
+              {"id": "stuck", "client_order_id": "hack-b", "submitted_at": "2026-09-18T17:41:00Z"}]
+    monkeypatch.setattr(cli, "open_orders", lambda profile: orders)
+    monkeypatch.setattr(cli, "cancel_order", lambda oid, profile: oid == "gone")
+    monkeypatch.setattr(cli, "fill_result", lambda oid, profile, **kw: {
+        "qty": 0, "credit": None,
+        "status": "canceled" if oid == "gone" else "pending_cancel",
+        "timed_out": oid != "gone"})
+    cancelled, unresolved = loop.cancel_stale_orders(j, "dev", now, dry_run=False)
+    assert cancelled == ["gone"]
+    assert len(unresolved) == 1 and "stuck" in unresolved[0]
+
+
+def test_not_knowing_the_open_orders_is_not_the_same_as_having_none(tmp_path, monkeypatch):
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    def down(profile):
+        raise cli.CLIError(["order", "list"], 1, "503")
+    monkeypatch.setattr(cli, "open_orders", down)
+    cancelled, unresolved = loop.cancel_stale_orders(j, "dev", NOW, dry_run=False)
+    assert cancelled == [] and unresolved and "unavailable" in unresolved[0]
+
+
+def test_a_vanished_spread_is_not_booked_as_a_zero_pnl_trade(tmp_path, monkeypatch):
+    """Retiring a spread the broker no longer holds recorded realized_pnl 0.0
+    while logging 'P&L unknown'. Unknown is None, unless the fills say otherwise."""
+    j = _book(tmp_path)
+    later = datetime.now(ET).replace(year=2030)
+    monkeypatch.setattr(cli, "fills", lambda profile, after: [])
+    loop.reconcile(j, "dev", [], later, dry_run=False)
+    assert j.all_spreads("dev")[0]["realized_pnl"] is None
+
+
+def test_a_vanished_spread_recovers_its_pnl_from_the_brokers_fills(tmp_path, monkeypatch):
+    j = _book(tmp_path)                       # SPY 770/775 calls x10 @ 0.50 credit
+    later = datetime.now(ET).replace(year=2030)
+    monkeypatch.setattr(cli, "fills", lambda profile, after: [
+        {"symbol": "SPY260910C00770000", "side": "sell_short", "qty": "10", "price": "1.20"},   # the open
+        {"symbol": "SPY260910C00775000", "side": "buy", "qty": "10", "price": "0.70"},          # the open
+        {"symbol": "SPY260910C00770000", "side": "buy", "qty": "10", "price": "0.40"},          # closed by hand
+        {"symbol": "SPY260910C00775000", "side": "sell", "qty": "10", "price": "0.10"}])
+    loop.reconcile(j, "dev", [], later, dry_run=False)
+    row = j.all_spreads("dev")[0]
+    assert row["exit_debit"] == pytest.approx(0.30) and row["realized_pnl"] == pytest.approx(200.0)
+
+
+# --- the whole cycle body against a mocked broker ------------------------------
+
+def _wire(monkeypatch, observations, *, fills, marks=(0.45, 0.05)):
+    """Patch every broker touchpoint _cycle_body uses. `observations` are handed
+    out one per observe() call, the last one repeating."""
+    today = datetime.now(ET).replace(hour=11, minute=0, second=0, microsecond=0)
+    day = today.strftime("%Y-%m-%d")
+    monkeypatch.setattr(loop, "now_et", lambda: today)
+    monkeypatch.setattr(cli, "trading_calendar",
+                        lambda s, e, profile: [{"date": day, "open": "09:30", "close": "16:00"}])
+    monkeypatch.setattr(cli, "open_orders", lambda profile: [])
+    monkeypatch.setattr(cli, "ex_dividend", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "fills", lambda profile, after: [])
+    monkeypatch.setattr(cli, "open_interest", lambda sym, profile: 5000)
+    monkeypatch.setattr(loop, "resolve_expiry", lambda profile, now: "2026-09-10")
+    seq = list(observations)
+    monkeypatch.setattr(loop, "observe", lambda profile, expiry: seq.pop(0) if len(seq) > 1 else seq[0])
+    monkeypatch.setattr(cli, "option_quotes", lambda syms, profile: {
+        "SPY260910C00770000": {"ap": marks[0], "bp": marks[0] - 0.02},
+        "SPY260910C00775000": {"ap": marks[1] + 0.02, "bp": marks[1]}})
+    sent = []
+    monkeypatch.setattr(cli, "submit_mleg", lambda **kw: sent.append(kw) or {"id": f"o{len(sent)}"})
+    it = iter(fills)
+    monkeypatch.setattr(cli, "fill_result", lambda oid, profile, **kw: dict(
+        zip(("qty", "credit"), next(it)), status="filled", timed_out=False))
+    return sent, today
+
+
+def _account_obs(equity, held, spot=765.0):
+    return {"account": {"equity": str(equity), "last_equity": "100000", "cash": "0"},
+            "equity": float(equity),
+            "positions": [{"symbol": "SPY260910C00770000", "qty": str(-held)},
+                          {"symbol": "SPY260910C00775000", "qty": str(held)}] if held else [],
+            "quotes": {"SPY": {"bp": spot - 0.05, "ap": spot + 0.05}},
+            "chains": {}, "bars": {}, "news": []}
+
+
+def test_a_daily_liquidation_survives_a_partial_fill_and_a_recovery(tmp_path, monkeypatch):
+    """Codex follow-up, reproduced through the real cycle body. Equity 95,900 on
+    a 100,000 prior close; the forced close fills 4 of 10; the next sweep sees
+    96,100, back over the line. The other 6 used to be left open."""
+    j = _book(tmp_path)
+    s = Settings(profile="dev")
+    sent, _ = _wire(monkeypatch, [_account_obs(95_900, 10)], fills=[(4, 0.42), (6, 0.41)])
+    assert loop._cycle_body(s, j, manage_only=True) == 0
+    assert sent[0]["qty"] == 10
+    assert j.open_spreads("dev")[0]["qty"] == 6                       # partial: 6 still held
+    assert any(c["action"] == "halt" for c in j.recent_cycles(50, "dev"))
+
+    monkeypatch.setattr(loop, "observe", lambda profile, expiry: _account_obs(96_100, 6))
+    assert loop._cycle_body(s, j, manage_only=True) == 0
+    assert sent[1]["qty"] == 6                                        # the liquidation went on
+    assert j.open_spreads("dev") == []
+    done = j.all_spreads("dev")[0]
+    assert done["exit_rule"] == "daily_loss_flatten"
+    assert done["realized_pnl"] == pytest.approx((0.5 - 0.42) * 400 + (0.5 - 0.41) * 600)
+
+
+def test_the_gates_judge_the_market_as_it_is_after_the_model_answers(tmp_path, monkeypatch):
+    """The tape moved while the model was thinking. Calls were permitted when it
+    was asked; by the final observation spot sits in the bottom of the range and
+    they are not. The verdict must come from the final observation."""
+    from agent.models import AgentDecision
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    today = datetime.now(ET)
+    from datetime import timedelta as _td
+    bars = [{"t": (today - _td(days=14 - i)).strftime("%Y-%m-%dT04:00:00Z"),
+             "o": 760, "h": 770, "l": 750, "c": 760} for i in range(12)]
+
+    def market(spot):
+        o = _account_obs(100_000, 0, spot=spot)
+        o["bars"] = {"SPY": bars}
+        o["chains"] = {"SPY": {}}
+        return o
+
+    proposal = TradeProposal(underlying="SPY", expiry="2026-09-10", right="C", short_strike=780.0,
+                             long_strike=785.0, qty=2, net_price=0.60, sleeve="core", rationale="t")
+
+    class FakeBrain:
+        def __init__(self, **kw): pass
+        def preflight(self): pass
+        def decide(self, snapshot, limits):
+            assert "core may sell: P/C" in snapshot                   # calls were allowed when asked
+            return AgentDecision(reasoning="calls look fine", proposal=proposal)
+
+    monkeypatch.setattr(loop, "Brain", FakeBrain)
+    sent, _ = _wire(monkeypatch, [market(760.0), market(751.0)], fills=[])
+    assert loop._cycle_body(Settings(profile="dev"), j, manage_only=False) == 0
+    assert sent == []                                                 # nothing reached the broker
+    blocked = next(c for c in j.recent_cycles(10, "dev") if c["action"] == "blocked")
+    import json as _json
+    verdict = next(g for g in _json.loads(blocked["gates"]) if g["name"] == "regime_direction")
+    assert not verdict["passed"] and "range position 5%" in verdict["detail"]
+
+
+def test_no_trade_when_the_final_observation_cannot_be_made(tmp_path, monkeypatch):
+    from agent.models import AgentDecision
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    proposal = TradeProposal(underlying="SPY", expiry="2026-09-10", right="C", short_strike=780.0,
+                             long_strike=785.0, qty=2, net_price=0.60, sleeve="core", rationale="t")
+
+    class FakeBrain:
+        def __init__(self, **kw): pass
+        def preflight(self): pass
+        def decide(self, snapshot, limits):
+            return AgentDecision(reasoning="r", proposal=proposal)
+
+    monkeypatch.setattr(loop, "Brain", FakeBrain)
+    first = _account_obs(100_000, 0)
+    first["chains"] = {"SPY": {}}
+    sent, _ = _wire(monkeypatch, [first], fills=[])
+    calls = {"n": 0}
+    def observe(profile, expiry):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise cli.CLIError(["account", "get"], 1, "503")
+        return first
+    monkeypatch.setattr(loop, "observe", observe)
+    assert loop._cycle_body(Settings(profile="dev"), j, manage_only=False) == 1
+    assert sent == []
+    assert any("final observation failed" in (c.get("error") or "") for c in j.recent_cycles(10, "dev"))

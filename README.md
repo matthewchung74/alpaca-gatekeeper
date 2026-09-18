@@ -17,7 +17,7 @@ The usual answer is to put the risk rules in the prompt. That fails quietly. A m
 Gatekeeper takes the opposite position. **Claude decides what to trade. Deterministic Python decides whether that trade is allowed to exist.** The two are separate processes with a hard boundary between them:
 
 ```
-observe ──▶ reason (Claude Opus 5) ──▶ 22 gates (pure Python) ──▶ Alpaca CLI ──▶ journal
+observe ──▶ reason (Claude Opus 5) ──▶ 23 gates (pure Python) ──▶ Alpaca CLI ──▶ journal
              proposes                    disposes                  executes
 ```
 
@@ -93,7 +93,7 @@ The model sees the read in its snapshot and cannot change it.
 
 ---
 
-## The 22 gates
+## The 23 gates
 
 Every gate is a pure function of the proposal plus observed account and market state. A proposal must clear **all** of them.
 
@@ -121,6 +121,7 @@ Every gate is a pure function of the proposal plus observed account and market s
 | 19 | `same_direction` | ≤ 2 open core spreads on one right across SPY/QQQ/IWM |
 | 20 | `losing_side` | No new spread on a right where an open spread marks ≥ 1.5× its credit |
 | 21 | `cadence` | 1 entry per day; 24h cooldown per underlying and right after a close |
+| 22 | `leg_overlap` | A new spread may not reuse a contract an open spread already holds |
 
 Gates 16 to 21 come from the post-mortem. Six of nine hackathon short strikes finished in the money; held to expiry the book would have lost about $11,400 against the $1,843 it did lose. The strikes sat inside the prior week's range at one to four days to expiry, the book stacked three same-direction spreads in three tickers that move together, and the model proposed a trade in every cycle it had budget for. Each of those is now a gate.
 
@@ -221,7 +222,7 @@ agent/
   config.py            limits, event timing, the account guard
   models.py            TradeProposal / OpenSpread; derived risk lives here
   regime.py            tape read from the bars; regime -> budget and permitted sides
-  risk.py              the 22 gates
+  risk.py              the 23 gates
   manage.py            exit rules, structure-aware
   brain.py             Claude Opus 5, structured output
   alpaca_cli.py        the execution boundary

@@ -218,7 +218,10 @@ def _pos(sym, qty="-5"):
 def test_held_when_short_leg_is_in_positions():
     from agent.manage import is_actually_held
     sp = spread()
-    assert is_actually_held(sp, [_pos(sp.short_symbol())])
+    assert is_actually_held(sp, [{"symbol": sp.short_symbol(), "qty": "-5"},
+                                 {"symbol": sp.long_symbol(), "qty": "5"}])
+    # the short alone is a naked leg, not a spread we can close as one
+    assert not is_actually_held(sp, [{"symbol": sp.short_symbol(), "qty": "-5"}])
 
 
 def test_not_held_when_positions_empty():
@@ -247,14 +250,16 @@ def test_not_held_when_a_different_contract_is_open():
 def test_held_qty_reads_the_short_leg():
     from agent.manage import held_qty
     sp = spread(qty=12)
-    assert held_qty(sp, [{"symbol": sp.short_symbol(), "qty": "-12"}]) == 12
+    assert held_qty(sp, [{"symbol": sp.short_symbol(), "qty": "-12"},
+                         {"symbol": sp.long_symbol(), "qty": "12"}]) == 12
 
 
 def test_held_qty_reports_a_partial_fill():
     """Journal says 12, broker says 7. Closing 12 could open a 5-lot short."""
     from agent.manage import held_qty
     sp = spread(qty=12)
-    assert held_qty(sp, [{"symbol": sp.short_symbol(), "qty": "-7"}]) == 7
+    assert held_qty(sp, [{"symbol": sp.short_symbol(), "qty": "-7"},
+                         {"symbol": sp.long_symbol(), "qty": "7"}]) == 7
 
 
 def test_held_qty_zero_when_absent():
@@ -410,3 +415,23 @@ def test_dividend_rule_waits_for_the_last_session_and_ignores_puts():
     put = spread(right="P", short_strike=770.0, long_strike=765.0, entry_credit=0.50, expiry="2026-09-25")
     assert decide_exit(put, 0.90, now=EVE, spot=770.2, limits=LIMITS,
                        ex_dividend=("2026-09-18", 1.89), next_session="2026-09-18").rule != "dividend_assignment_risk"
+
+
+def test_close_size_is_the_lot_not_the_whole_short_leg():
+    """Codex follow-up: a 10-lot 770/775 and a 5-lot 770/780 share the 770
+    short. held_qty returned |-15| for both, so each tried to close 15."""
+    from agent.manage import held_qty
+    positions = [{"symbol": "SPY260925C00770000", "qty": "-15"},
+                 {"symbol": "SPY260925C00775000", "qty": "10"},
+                 {"symbol": "SPY260925C00780000", "qty": "5"}]
+    ten = spread(right="C", short_strike=770.0, long_strike=775.0, qty=10, expiry="2026-09-25")
+    five = spread(right="C", short_strike=770.0, long_strike=780.0, qty=5, expiry="2026-09-25")
+    assert held_qty(ten, positions) == 10 and held_qty(five, positions) == 5
+
+
+def test_a_leg_held_the_wrong_way_round_is_not_a_holding():
+    from agent.manage import held_qty
+    sp = spread(right="C", short_strike=770.0, long_strike=775.0, qty=10, expiry="2026-09-25")
+    long_the_short = [{"symbol": "SPY260925C00770000", "qty": "10"},
+                      {"symbol": "SPY260925C00775000", "qty": "10"}]
+    assert held_qty(sp, long_the_short) == 0

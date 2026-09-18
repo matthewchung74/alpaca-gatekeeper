@@ -198,25 +198,32 @@ def evaluate(
     g.append(_losing_side_gate(proposal, open_spreads or [], open_marks or {}, limits))
     g.append(_cadence_gate(proposal, recent_spreads or [], now, limits))
 
+    # --- Gate 22: no shared contracts ------------------------------------
+    g.append(_leg_overlap_gate(proposal, open_spreads or []))
+
     return g
 
 
+_TS = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)?$")
+
+
 def _quote_age_minutes(t, now: datetime) -> float | None:
-    """Age of an Alpaca quote timestamp (RFC 3339 with nanoseconds)."""
-    if not t:
+    """Age of an Alpaca quote timestamp (RFC 3339, nanosecond fraction, UTC).
+
+    Parsed by pattern, not by stripping characters. The first version pulled
+    "digits" out of everything after the dot, which swallowed the UTC offset,
+    lost the zone, and read an hour-old quote as three hours in the future --
+    and a negative age passed the freshness check (Codex follow-up, 2026-09-18).
+    """
+    m = _TS.match(str(t or "").strip())
+    if not m:
         return None
-    s = str(t).replace("Z", "+00:00")
-    if "." in s:                                   # trim nanoseconds to microseconds
-        head, _, rest = s.partition(".")
-        frac = "".join(ch for ch in rest if ch.isdigit())
-        tz = rest[len(frac):]
-        s = f"{head}.{frac[:6]}{tz}"
+    head, frac, zone = m.groups()
+    zone = "+00:00" if zone in (None, "Z") else zone       # Alpaca stamps UTC
     try:
-        ts = datetime.fromisoformat(s)
+        ts = datetime.fromisoformat(head + (f".{frac[:6]}" if frac else "") + zone)
     except ValueError:
         return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=ET)
     return (now - ts).total_seconds() / 60.0
 
 
@@ -249,6 +256,9 @@ def _liquidity_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits,
         age = _quote_age_minutes(q.get("t"), now)
         if age is None:
             problems.append(f"{label} leg {sym} quote has no timestamp")
+        elif age < -1.0:
+            problems.append(f"{label} leg {sym} quote is timestamped {-age:.0f} min in the "
+                            "future; clock or parse error, not a fresh quote")
         elif age > limits.max_quote_age_minutes:
             problems.append(f"{label} leg {sym} quote is stale ({age:.0f} min old)")
         if float(q.get("bs") or 0) <= 0 or float(q.get("as") or 0) <= 0:
@@ -492,6 +502,33 @@ def _credit_floor_gate(proposal: TradeProposal, limits: RiskLimits) -> GateResul
         name="credit_floor", passed=ok,
         detail=(f"credit {proposal.net_price:.2f} is {frac:.0%} of width {proposal.width:g} "
                 f"({'>=' if ok else '<'} {limits.min_credit_pct_of_width:.0%})"))
+
+
+def _leg_overlap_gate(proposal: TradeProposal, open_spreads: list[dict]) -> GateResult:
+    """A new spread may not reuse a contract an open spread already holds.
+
+    The broker nets positions per contract, the journal tracks them per
+    spread. Two lots sharing a leg reconcile in aggregate but cannot be sized
+    or closed lot by lot, and a close on one silently eats the other's hedge.
+    Until the journal allocates per lot, the overlap is refused at the door.
+    """
+    mine = {occ_symbol(proposal.underlying, proposal.expiry, proposal.right, k)
+            for k in (proposal.short_strike, proposal.long_strike)}
+    for r in open_spreads:
+        try:
+            theirs = {occ_symbol(r["underlying"], r["expiry"], r["right"], float(r[k]))
+                      for k in ("short_strike", "long_strike")}
+        except (KeyError, TypeError, ValueError):
+            continue
+        shared = mine & theirs
+        if shared:
+            return GateResult(
+                name="leg_overlap", passed=False,
+                detail=(f"{', '.join(sorted(shared))} is already a leg of open "
+                        f"{r['underlying']} {float(r['short_strike']):g}/{float(r['long_strike']):g}; "
+                        "spreads may not share a contract"))
+    return GateResult(name="leg_overlap", passed=True,
+                      detail="no contract shared with an open spread")
 
 
 def _book_risk_gate(proposal: TradeProposal, open_spreads: list[dict], equity: float,

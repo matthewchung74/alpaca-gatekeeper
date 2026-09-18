@@ -150,7 +150,7 @@ OUR_ORDERS = ("hack-", "exit-")          # client_order_id prefixes this agent u
 
 
 def cancel_stale_orders(journal, profile: str, now, *, dry_run: bool,
-                        older_than_s: int = 180) -> list[str]:
+                        older_than_s: int = 180) -> tuple[list[str], list[str]]:
     """Cancel any order of ours that an earlier run left working.
 
     Every order this agent sends is polled to a settled state and cancelled
@@ -158,13 +158,22 @@ def cancel_stale_orders(journal, profile: str, now, *, dry_run: bool,
     open order of ours at the START of a run belongs to a run that died, and
     it can still fill into a position nobody asked for. Orders placed by hand
     are left alone.
+
+    Returns (cancelled, unresolved). A cancel is a request: it is only counted
+    once the broker reports the order terminal, and `pending_cancel` is not
+    `canceled`. Anything unresolved -- a refused cancel, an order that would
+    not settle, or not being able to list orders at all -- blocks entries for
+    this run, because a working order can fill outside the exposure the gates
+    are about to measure. Anything that FILLED while we looked is picked up by
+    reconcile(), which runs after this on freshly read positions.
     """
     try:
         orders = cli.open_orders(profile)
     except cli.CLIError as e:
         print(f"  warn: open orders unavailable: {e}", file=sys.stderr)
-        return []
+        return [], [f"open orders unavailable ({str(e)[:80]}); cannot rule out a working order"]
     cancelled: list[str] = []
+    unresolved: list[str] = []
     for o in orders:
         coid = str(o.get("client_order_id") or "")
         if not coid.startswith(OUR_ORDERS):
@@ -175,23 +184,81 @@ def cancel_stale_orders(journal, profile: str, now, *, dry_run: bool,
             continue
         if (now - sent).total_seconds() < older_than_s:
             continue
-        print(f"  cancelling orphaned order {o.get('id')} ({coid}) from an earlier run",
-              file=sys.stderr)
+        oid = str(o.get("id"))
+        print(f"  cancelling orphaned order {oid} ({coid}) from an earlier run", file=sys.stderr)
         if dry_run:
             continue
-        cli.cancel_order(str(o.get("id")), profile)
-        cancelled.append(str(o.get("id")))
-    if cancelled:
-        journal.record_cycle(profile=profile, action="error",
-                             error="cancelled orphaned order(s) from an earlier run: "
-                                   + ", ".join(cancelled))
-    return cancelled
+        accepted = cli.cancel_order(oid, profile)
+        state = cli.fill_result(oid, profile, tries=6, delay=5.0)
+        if state["timed_out"]:
+            unresolved.append(f"orphaned order {oid} still {state['status']} "
+                              f"(cancel {'accepted' if accepted else 'refused'})")
+        elif state["qty"] > 0:
+            print(f"  orphaned order {oid} had filled {state['qty']}; reconciliation will pick "
+                  "it up", file=sys.stderr)
+            cancelled.append(oid)
+        else:
+            cancelled.append(oid)
+    if cancelled or unresolved:
+        journal.record_cycle(profile=profile, action="error", error=(
+            "orphaned orders from an earlier run -- settled: " + (", ".join(cancelled) or "none")
+            + "; unresolved: " + (" | ".join(unresolved) or "none")))
+    return cancelled, unresolved
+
+
+def flatten_reason(*, halted: bool, breached: bool, open_spreads: list,
+                   detail: str | None = None) -> str | None:
+    """Why the book must be closed right now, or None.
+
+    A breach starts the liquidation. The HALT keeps it going: a forced close
+    can fill 4 of 10, equity can bounce back over the line, and the remaining
+    6 must still go. The liquidation ends when the book is flat, not when the
+    number recovers.
+    """
+    if breached:
+        return detail or "daily loss at/over the limit"
+    if halted and open_spreads:
+        return "daily halt in force and the book is not flat; finishing the liquidation"
+    return None
 
 
 def in_session(now, session: tuple) -> bool:
     """EXITS run for the whole session, first and last minutes included. The
     five-minute lockouts are an entry rule; a stop must not wait for them."""
     return session[0] <= now <= session[1]
+
+
+def _recover_exit(sp, profile: str, since: str) -> tuple[float | None, float | None]:
+    """What a vanished spread closed at, from the broker's own fills.
+
+    Returns (exit_price, total_realized_pnl), or (None, None) when the fills do
+    not account for the whole position. Unknown is recorded as null. It used to
+    be recorded as 0.0 next to a log line saying "P&L unknown", and a zero is
+    a number: it counted as a flat trade in the win rate (Codex follow-up).
+    """
+    try:
+        rows = cli.fills(profile, since)
+    except cli.CLIError:
+        return None, None
+    bought = sold = 0.0
+    n_short = n_long = 0
+    for f in rows:
+        try:
+            q, px = int(float(f.get("qty") or 0)), float(f.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        side = str(f.get("side") or "")
+        if f.get("symbol") == sp.short_symbol() and side == "buy":          # closing the short
+            bought += q * px
+            n_short += q
+        elif f.get("symbol") == sp.long_symbol() and side == "sell":        # closing the long
+            sold += q * px
+            n_long += q
+    if sp.qty <= 0 or n_short != sp.qty or n_long != sp.qty:
+        return None, None
+    net = (bought - sold) / sp.qty                 # cost to close a credit spread
+    exit_px = net if sp.is_credit else -net        # value received on a debit spread
+    return round(exit_px, 4), sp.realized_so_far + sp.realized_pnl(exit_px, qty=sp.qty)
 
 
 def reconcile(journal, profile: str, positions: list[dict], now, *, dry_run: bool) -> list[str]:
@@ -252,11 +319,14 @@ def reconcile(journal, profile: str, positions: list[dict], now, *, dry_run: boo
             print(f"  reconcile: #{sp.id} {sp.underlying} {sp.short_strike:g}/{sp.long_strike:g} "
                   "is not at the broker; retiring it (P&L unknown)", file=sys.stderr)
             if not dry_run:
-                journal.close_spread(sp.id, exit_debit=None, exit_rule="missing_at_broker",
-                                     realized_pnl=sp.realized_so_far, close_order_id=None)
+                exit_px, pnl = _recover_exit(sp, profile, str(r.get("ts_open") or "")[:10])
+                journal.close_spread(sp.id, exit_debit=exit_px, exit_rule="missing_at_broker",
+                                     realized_pnl=pnl, close_order_id=None)
+                known = (f"P&L {pnl:+,.0f} recovered from the broker's fills" if pnl is not None
+                         else "P&L UNKNOWN (null, not zero): exclude from performance statistics")
                 journal.record_cycle(profile=profile, action="error", error=(
                     f"reconcile: spread {sp.id} {sp.underlying} {sp.short_strike:g}/"
-                    f"{sp.long_strike:g} not held at the broker; retired, P&L unknown"))
+                    f"{sp.long_strike:g} not held at the broker; retired, {known}"))
             continue
         live.append(sp)
 
@@ -311,30 +381,46 @@ def reconcile(journal, profile: str, positions: list[dict], now, *, dry_run: boo
     return problems
 
 
-def refresh_for_gates(obs: dict, p, profile: str) -> float | None:
-    """Fresh quotes, open interest and equity for the two legs, just before gating.
+def current_marks(journal, profile: str, positions: list[dict]) -> dict:
+    """Conservative marks for the spreads we hold, right now. Reads only."""
+    spreads = [sp for sp in (spread_from_row(r) for r in journal.open_spreads(profile))
+               if is_actually_held(sp, positions)]
+    if not spreads:
+        return {}
+    symbols = sorted({s for sp in spreads for s in (sp.short_symbol(), sp.long_symbol())})
+    quotes = cli.option_quotes(symbols, profile)
+    marks = {}
+    for sp in spreads:
+        m = mark_to_close(sp, quotes)
+        if m is not None:
+            marks[sp.id] = m
+    return marks
 
-    The snapshot predates the model call by a minute or two. A binding limit
-    constrains the price; it does not make a stale market a valid one.
-    Returns the refreshed equity, or None if the broker could not be reached
-    (the gates then judge the old data, and the freshness check decides).
+
+def final_observation(journal, profile: str, expiry: str, p, now, limits) -> dict:
+    """Everything the gates judge, read again AFTER the model has answered.
+
+    The model call takes a minute or two. The first refresh patched the two
+    legs' quotes and the equity and left the rest as it was before the call:
+    the tape that decides the permitted side and the budget, the Greeks and
+    IV, the broker's positions, the marks of the spreads already held. That is
+    a verdict assembled from two different moments (Codex follow-up). Now it
+    is one observation, or no trade: any failure here raises, and the caller
+    does not submit on a mix of old and new.
     """
-    chain = obs["chains"].setdefault(p.underlying, {})
-    legs = [leg["symbol"] for leg in p.legs()]
-    try:
-        fresh = cli.option_quotes(legs, profile)
-        for sym in legs:
-            snap = chain.setdefault(sym, {})
-            if fresh.get(sym):
-                snap["latestQuote"] = fresh[sym]
-            oi = cli.open_interest(sym, profile)
+    obs = observe(profile, expiry)
+    if p.underlying not in obs["quotes"] or p.underlying not in obs["chains"]:
+        raise cli.CLIError(["observe"], 1, f"no fresh market data for {p.underlying}")
+    chain = obs["chains"][p.underlying]
+    for leg in p.legs():
+        snap = chain.get(leg["symbol"])
+        if snap is not None:
+            oi = cli.open_interest(leg["symbol"], profile)
             if oi is not None:
                 snap["openInterest"] = oi
-        obs["quotes"][p.underlying] = cli.latest_quote(p.underlying, profile)
-        return float(cli.account(profile)["equity"])
-    except (cli.CLIError, KeyError, TypeError, ValueError) as e:
-        print(f"  warn: pre-gate refresh failed: {e}", file=sys.stderr)
-        return None
+    tape, sides = read_tape(obs, now, limits)
+    return {"obs": obs, "equity": obs["equity"], "tape": tape, "sides": sides,
+            "marks": current_marks(journal, profile, obs["positions"])}
 
 
 def day_start_equity(acct: dict, first_mark: float | None) -> float | None:
@@ -586,7 +672,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         return 0
 
     # We hold the lock, so any order of ours still working is an orphan.
-    cancel_stale_orders(journal, profile, now, dry_run=dry_run)
+    _, unresolved_orders = cancel_stale_orders(journal, profile, now, dry_run=dry_run)
 
     expiry = resolve_expiry(profile, now)
     print(f"  target expiry: {expiry}")
@@ -618,14 +704,21 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     # The daily limit, as documented: flatten the book and halt for the day.
     # It used to reject new entries and nothing else.
     halted = halted_today(journal, profile, now)
-    flatten = None
-    if daily_loss_breached(equity=equity, day_start=day_start, limits=settings.limits):
-        flatten = (f"daily loss {(equity - day_start) / day_start:+.2%} at/over the "
-                   f"{settings.limits.max_daily_loss_pct:.0%} limit")
-        print(f"  DAILY LIMIT: {flatten}; flattening and halting", file=sys.stderr)
+    breached = daily_loss_breached(equity=equity, day_start=day_start, limits=settings.limits)
+    if breached:
+        detail = (f"daily loss {(equity - day_start) / day_start:+.2%} at/over the "
+                  f"{settings.limits.max_daily_loss_pct:.0%} limit")
+        print(f"  DAILY LIMIT: {detail}; flattening and halting", file=sys.stderr)
         if not halted and not dry_run:
-            record_halt(journal, profile, flatten, equity)
+            record_halt(journal, profile, detail, equity)
         halted = True
+    else:
+        detail = None
+    # The halt, not the number, keeps a liquidation alive until the book is flat.
+    flatten = flatten_reason(halted=halted, breached=breached,
+                             open_spreads=journal.open_spreads(profile), detail=detail)
+    if flatten and not breached:
+        print(f"  {flatten}", file=sys.stderr)
     journal.record_mark(profile=profile, equity=equity,
                         cash=float(obs["account"].get("cash", 0)),
                         positions=obs["positions"])
@@ -633,6 +726,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     # Exits before entries, always.
     # Before managing anything, make sure the journal describes the book.
     unexplained = reconcile(journal, profile, obs["positions"], now, dry_run=dry_run)
+    unexplained += unresolved_orders
     for msg in unexplained:
         print(f"  RECONCILE: {msg}", file=sys.stderr)
     if unexplained and not manage_only and not dry_run:
@@ -721,15 +815,42 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     if new_qty != p.qty:
         p = p.model_copy(update={"qty": new_qty})
 
-    # The snapshot is a minute or two old by now. Judge the trade on the market
-    # as it stands, and the book on the most defensive read in the universe so
-    # a sideways ticker cannot admit risk a bear book would refuse.
-    fresh_equity = refresh_for_gates(obs, p, profile)
-    if fresh_equity is not None:
-        equity = fresh_equity
+    # One fresh, consistent observation for the verdict, or no trade.
     now = now_et()
+    try:
+        final = final_observation(journal, profile, expiry, p, now, settings.limits)
+    except cli.CLIError as e:
+        journal.record_cycle(profile=profile, action="error", snapshot=snapshot,
+                             reasoning=decision.reasoning, proposal=p.model_dump(),
+                             regime=cycle_regime, equity=equity,
+                             error=f"final observation failed; not submitting on stale data: {e}")
+        print(f"  final observation failed; not submitting: {e}", file=sys.stderr)
+        return 1
+    obs, equity, tape, open_marks = final["obs"], final["equity"], final["tape"], final["marks"]
+
+    # A breach seen only now takes the same road as one seen at the top of the
+    # cycle: halt, flatten, no entry. It used to just fail the daily_loss gate.
+    if daily_loss_breached(equity=equity, day_start=day_start, limits=settings.limits):
+        detail = (f"daily loss {(equity - day_start) / day_start:+.2%} at/over the "
+                  f"{settings.limits.max_daily_loss_pct:.0%} limit (seen at the final observation)")
+        print(f"  DAILY LIMIT: {detail}; flattening and halting", file=sys.stderr)
+        if not dry_run:
+            record_halt(journal, profile, detail, equity)
+        manage_open_spreads(settings, journal, obs, now, dry_run=dry_run, flatten=detail,
+                            close_t=session[1])
+        return 0
+
+    # Size and direction follow the FRESH tape; the book answers to the most
+    # defensive read in the universe, so a sideways ticker cannot admit risk a
+    # bear book would refuse.
+    cycle_regime = tape[p.underlying].regime if p.underlying in tape else cycle_regime
     book_regime = min((t.regime for t in tape.values()),
                       key=lambda r: regime.policy_for(r).size_multiplier)
+    eff_pct = regime.budget_pct_for(cycle_regime, p.sleeve, settings.limits)
+    fresh_qty, note = regime.resize_to_budget(p, equity=equity, effective_pct=eff_pct)
+    if fresh_qty != p.qty:
+        print(f"  regime policy on the final observation [{cycle_regime}]: {note}")
+        p = p.model_copy(update={"qty": fresh_qty})
 
     gates = risk.evaluate(
         p, profile=profile, now=now, equity=equity, day_start_equity=day_start,

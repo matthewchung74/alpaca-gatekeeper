@@ -205,6 +205,12 @@ def list_expiries(underlying: str, profile: str, on_or_after: str,
     return sorted({r["expiration_date"] for r in rows if r.get("expiration_date")})
 
 
+def fills(profile: str, after: str) -> list[dict]:
+    """The broker's own record of executions since `after` (YYYY-MM-DD), oldest first."""
+    return run("account", "activity", "list", "--activity-types", "FILL", "--after", after,
+               "--direction", "asc", "--page-size", "100", profile=profile) or []
+
+
 def open_orders(profile: str) -> list[dict]:
     """Open parent orders. --nested rolls legs under their multi-leg parent."""
     return run("order", "list", "--status", "open", "--nested", "--limit", "100",

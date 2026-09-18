@@ -27,11 +27,19 @@ def held_qty(spread: OpenSpread, positions: list[dict]) -> int:
     Sized off the SHORT leg, and always the broker's number rather than the
     journal's: closing a size we do not hold can open an opposite position.
     """
-    short_sym = spread.short_symbol()
+    by_sym: dict[str, int] = {}
     for p in positions:
-        if p.get("symbol") == short_sym:
-            return abs(int(float(p.get("qty") or 0)))
-    return 0
+        try:
+            by_sym[str(p.get("symbol"))] = int(float(p.get("qty") or 0))
+        except (TypeError, ValueError):
+            continue
+    # Signed, both legs, and never more than this lot. The old version took
+    # abs() of the short leg alone: a position held the wrong way round
+    # counted as held, and two lots sharing a short each tried to close the
+    # whole of it against a hedge only big enough for one (Codex follow-up).
+    short_held = max(0, -by_sym.get(spread.short_symbol(), 0))
+    long_held = max(0, by_sym.get(spread.long_symbol(), 0))
+    return min(spread.qty, short_held, long_held)
 
 
 def is_actually_held(spread: OpenSpread, positions: list[dict]) -> bool:
