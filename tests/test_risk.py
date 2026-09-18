@@ -12,6 +12,7 @@ from agent import risk
 LIMITS = RiskLimits()
 MIDDAY = datetime(2026, 8, 28, 13, 0, tzinfo=ET)   # after kickoff, mid-session
 WEEK_OUT = "2026-09-04"       # 7 days after MIDDAY
+QUOTE_T = "2026-08-28T16:59:30.123456789Z"   # 30s before MIDDAY, Alpaca's nanosecond format
 
 
 def tape(**kw) -> TapeRead:
@@ -39,7 +40,8 @@ def make_chain(p: TradeProposal, *, bid=1.48, ask=1.54, oi=5000) -> dict:
     chain = {}
     for strike in (p.short_strike, p.long_strike):
         sym = occ_symbol(p.underlying, p.expiry, p.right, strike)
-        chain[sym] = {"latestQuote": {"bp": bid, "ap": ask}, "openInterest": oi}
+        chain[sym] = {"latestQuote": {"bp": bid, "ap": ask, "bs": 50, "as": 50, "t": QUOTE_T},
+                      "openInterest": oi}
     return chain
 
 
@@ -436,3 +438,77 @@ def test_range_buffer_ignores_the_stale_range_in_a_trend():
     sideways = tape(regime="sideways", range_position=0.1, lookback_high=790.0, lookback_low=755.0)
     assert gate(evaluate(p, chain=chain_with_iv(p), quotes=q, tape=inside_range), "range_buffer").passed
     assert not gate(evaluate(p, chain=chain_with_iv(p), quotes=q, tape=sideways), "range_buffer").passed
+
+
+# --- Codex review 2026-09-18: market data validity ---------------------------
+
+def _liq(p, **quote_over):
+    ch = make_chain(p)
+    for snap in ch.values():
+        snap["latestQuote"].update(quote_over)
+    return gate(evaluate(p, chain=ch), "liquidity")
+
+
+def test_liquidity_rejects_a_crossed_market():
+    g = _liq(make_proposal(), bp=1.60, ap=1.50)
+    assert not g.passed and "crossed" in g.detail
+
+
+def test_liquidity_rejects_a_stale_quote():
+    g = _liq(make_proposal(), t="2020-01-02T15:00:00Z")
+    assert not g.passed and "stale" in g.detail
+
+
+def test_liquidity_rejects_a_quote_with_no_timestamp_or_no_size():
+    assert not _liq(make_proposal(), t=None).passed
+    g = _liq(make_proposal(), bs=0)
+    assert not g.passed and "size" in g.detail
+
+
+def test_liquidity_fails_closed_when_open_interest_is_missing():
+    p = make_proposal()
+    ch = make_chain(p)
+    for snap in ch.values():
+        snap.pop("openInterest")
+    g = gate(evaluate(p, chain=ch), "liquidity")
+    assert not g.passed and "open interest" in g.detail
+
+
+# --- directional risk must not net one wing against the other ----------------
+
+def test_directional_risk_does_not_cancel_opposite_wings():
+    """A 900 put wing and a 900 call wing used to report 0. A condor still
+    loses a full wing in either tail; each side is measured on its own."""
+    held = [row(id="a", right="P", short_strike=750.0, long_strike=745.0, qty=2, entry_credit=0.5),
+            row(id="b", right="C", short_strike=780.0, long_strike=785.0, qty=2, entry_credit=0.5)]
+    p = make_proposal(right="C", short_strike=790.0, long_strike=795.0, qty=1)
+    g = gate(evaluate(p, open_spreads=held), "directional_risk")
+    assert "rally 1,353" in g.detail and "selloff 900" in g.detail
+
+
+def test_directional_risk_blocks_the_side_that_is_over_even_if_the_other_is_large():
+    big_puts = [row(id="a", right="P", short_strike=750.0, long_strike=745.0, qty=40, entry_credit=0.5)]  # 18,000
+    calls = [row(id="b", right="C", short_strike=780.0, long_strike=785.0, qty=40, entry_credit=0.5)]     # 18,000
+    p = make_proposal(right="C", short_strike=790.0, long_strike=795.0, qty=6)                           # +2,718 -> 20,718
+    assert not gate(evaluate(p, open_spreads=big_puts + calls), "directional_risk").passed
+
+
+def test_book_risk_uses_the_books_regime_not_the_proposed_tickers():
+    """A sideways ticker must not admit risk past the cap a bear book imposes."""
+    held = [row(id="a", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=15)]  # 6,750
+    p = make_proposal(qty=5)                                                              # +2,265
+    assert gate(evaluate(p, open_spreads=held, regime="sideways"), "book_risk").passed
+    g = gate(evaluate(p, open_spreads=held, regime="sideways", book_regime="bear"), "book_risk")
+    assert not g.passed and "bear" in g.detail
+
+
+# --- the session is what the exchange says it is -----------------------------
+
+def test_trading_window_respects_an_early_close():
+    early = (datetime(2026, 11, 27, 9, 30, tzinfo=ET), datetime(2026, 11, 27, 13, 0, tzinfo=ET))
+    at_1258 = datetime(2026, 11, 27, 12, 58, tzinfo=ET)
+    at_1400 = datetime(2026, 11, 27, 14, 0, tzinfo=ET)
+    assert not gate(evaluate(make_proposal(), now=at_1258, session=early), "trading_window").passed
+    assert not gate(evaluate(make_proposal(), now=at_1400, session=early), "trading_window").passed
+    assert gate(evaluate(make_proposal(), now=datetime(2026, 11, 27, 11, 0, tzinfo=ET),
+                         session=early), "trading_window").passed

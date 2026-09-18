@@ -21,7 +21,8 @@ def proposal(**kw) -> TradeProposal:
 def chain_for(p: TradeProposal) -> dict:
     return {
         occ_symbol(p.underlying, p.expiry, p.right, s):
-            {"latestQuote": {"bp": 1.48, "ap": 1.54}, "openInterest": 5000}
+            {"latestQuote": {"bp": 1.48, "ap": 1.54, "bs": 50, "as": 50,
+                             "t": "2026-08-28T16:59:30.123456789Z"}, "openInterest": 5000}
         for s in (p.short_strike, p.long_strike)
     }
 

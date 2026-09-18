@@ -84,10 +84,16 @@ def decide_exit(
     now: datetime,
     spot: float | None,
     limits: RiskLimits,
+    close_t: datetime | None = None,
 ) -> ExitDecision:
-    """Pure function. Given a spread and a mark, should it be closed?"""
+    """Pure function. Given a spread and a mark, should it be closed?
+
+    `close_t` is the exchange's actual close for the day. On an early-close
+    session the 16:00 default would flatten two and a half hours too late.
+    """
     is_expiry_day = now.strftime("%Y-%m-%d") == spread.expiry
-    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if close_t is None:
+        close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
     near_close = now >= close_t - timedelta(minutes=limits.flatten_minutes_before_close)
 
     # 1. Assignment risk -- highest priority, and independent of the mark.

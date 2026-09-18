@@ -8,9 +8,11 @@ there is no in-memory state to lose.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import uuid
-from datetime import timedelta
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 from . import alpaca_cli as cli
 from . import regime
@@ -20,10 +22,12 @@ from .manage import decide_exit, held_qty, is_actually_held, mark_to_close, spre
 from .brain import Brain, build_snapshot
 from .config import (
     COMPETITION_PROFILE, ET, MIN_DAYS_TO_EXPIRY, STARTING_EQUITY, TARGET_EXPIRY,
-    UNIVERSE, Settings, in_no_trade_window, now_et,
+    UNIVERSE, Settings, now_et,
 )
 from .journal import open_journal
-from .models import AgentDecision, ExitDecision
+from .models import AgentDecision, ExitDecision, TradeProposal, parse_strike
+
+OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
 
 def observe(profile: str, expiry: str) -> dict:
@@ -114,6 +118,175 @@ def read_tape(obs: dict, now, limits) -> tuple[dict[str, TapeRead], dict[str, tu
     return tape, sides
 
 
+def session_bounds(now, calendar: list[dict]) -> tuple | None:
+    """(open, close) for today from the broker's calendar; None if closed today.
+
+    The exchange's own hours, so an early close (13:00 the day after
+    Thanksgiving) moves the expiry flatten and the entry lockout with it.
+    """
+    today = now.strftime("%Y-%m-%d")
+    for row in calendar or []:
+        if row.get("date") != today:
+            continue
+        try:
+            oh, om = (int(x) for x in str(row["open"]).split(":"))
+            ch, cm = (int(x) for x in str(row["close"]).split(":"))
+        except (KeyError, ValueError):
+            return None
+        return (now.replace(hour=oh, minute=om, second=0, microsecond=0),
+                now.replace(hour=ch, minute=cm, second=0, microsecond=0))
+    return None
+
+
+def in_session(now, session: tuple) -> bool:
+    """EXITS run for the whole session, first and last minutes included. The
+    five-minute lockouts are an entry rule; a stop must not wait for them."""
+    return session[0] <= now <= session[1]
+
+
+def reconcile(journal, profile: str, positions: list[dict], now, *, dry_run: bool) -> list[str]:
+    """Make the journal agree with the broker, and name what it cannot explain.
+
+    The exit rules only ever visit journaled spreads, so anything the broker
+    holds that the journal does not know about is managed by nothing. Three
+    repairs, in order:
+
+      1. A journaled spread the broker no longer holds at all is retired
+         (expired, assigned away, or closed by hand). P&L is unknown.
+      2. An unjournaled clean vertical -- one short leg, one long leg, same
+         name, expiry, right and size -- is ADOPTED at the broker's average
+         prices, so the stops and targets manage it from the next line on.
+         This is the 2026-08-31 orphan: an entry that filled after the poll
+         gave up.
+      3. Anything else -- a naked leg, a size mismatch, stock from an
+         assignment -- is returned as a problem. The caller blocks entries
+         while any problem stands.
+    """
+    actual: dict[str, int] = {}
+    avg: dict[str, float] = {}
+    stock: list[str] = []
+    for p in positions:
+        sym = str(p.get("symbol", ""))
+        try:
+            q = int(float(p.get("qty") or 0))
+        except (TypeError, ValueError):
+            q = 0
+        if not q:
+            continue
+        if OCC.match(sym):
+            actual[sym] = q
+            try:
+                avg[sym] = float(p.get("avg_entry_price") or 0)
+            except (TypeError, ValueError):
+                avg[sym] = 0.0
+        else:
+            stock.append(f"{sym} x{q}")
+
+    problems: list[str] = []
+    if stock:
+        problems.append("stock position(s) " + ", ".join(stock)
+                        + ": possible assignment; the agent only manages option spreads")
+
+    # 1. retire spreads the broker no longer holds in any part
+    rows = journal.open_spreads(profile)
+    live = []
+    for r in rows:
+        sp = spread_from_row(r)
+        try:
+            opened = datetime.fromisoformat(str(r.get("ts_open")))
+            age = now - (opened if opened.tzinfo else opened.replace(tzinfo=ET))
+        except (TypeError, ValueError):
+            age = timedelta(0)
+        gone = not actual.get(sp.short_symbol()) and not actual.get(sp.long_symbol())
+        if gone and age > timedelta(minutes=5):
+            print(f"  reconcile: #{sp.id} {sp.underlying} {sp.short_strike:g}/{sp.long_strike:g} "
+                  "is not at the broker; retiring it (P&L unknown)", file=sys.stderr)
+            if not dry_run:
+                journal.close_spread(sp.id, exit_debit=None, exit_rule="missing_at_broker",
+                                     realized_pnl=sp.realized_so_far, close_order_id=None)
+                journal.record_cycle(profile=profile, action="error", error=(
+                    f"reconcile: spread {sp.id} {sp.underlying} {sp.short_strike:g}/"
+                    f"{sp.long_strike:g} not held at the broker; retired, P&L unknown"))
+            continue
+        live.append(sp)
+
+    expected: dict[str, int] = defaultdict(int)
+    for sp in live:
+        expected[sp.short_symbol()] -= sp.qty
+        expected[sp.long_symbol()] += sp.qty
+    diff = {s: actual.get(s, 0) - expected.get(s, 0) for s in set(actual) | set(expected)}
+    diff = {s: d for s, d in diff.items() if d}
+
+    # 2. adopt clean orphan verticals
+    groups: dict[tuple, list[str]] = defaultdict(list)
+    for s in diff:
+        m = OCC.match(s)
+        groups[(m[1], m[2], m[3])].append(s)
+    for (root, yymmdd, right), syms in groups.items():
+        if len(syms) != 2 or any(s in expected for s in syms):
+            continue
+        short = next((s for s in syms if diff[s] < 0), None)
+        long_ = next((s for s in syms if diff[s] > 0), None)
+        if not short or not long_ or -diff[short] != diff[long_]:
+            continue
+        net = avg.get(short, 0.0) - avg.get(long_, 0.0)
+        if net == 0:
+            continue
+        try:
+            adopted = TradeProposal(
+                underlying=root, expiry=f"20{yymmdd[:2]}-{yymmdd[2:4]}-{yymmdd[4:]}", right=right,
+                short_strike=parse_strike(short), long_strike=parse_strike(long_),
+                qty=diff[long_], net_price=round(abs(net), 4),
+                sleeve="core" if net > 0 else "satellite",
+                rationale="adopted by reconciliation: held at the broker, absent from the journal")
+        except ValueError:
+            continue
+        if not adopted.has_valid_structure():
+            continue
+        print(f"  reconcile: adopting unjournaled {root} {right} {adopted.short_strike:g}/"
+              f"{adopted.long_strike:g} x{adopted.qty} @ {adopted.net_price:.2f}", file=sys.stderr)
+        if not dry_run:
+            journal.record_spread(profile=profile, proposal=adopted, order_id=None)
+            journal.record_cycle(profile=profile, action="error", proposal=adopted.model_dump(),
+                                 error=(f"reconcile: adopted unjournaled {root} {right} "
+                                        f"{adopted.short_strike:g}/{adopted.long_strike:g} "
+                                        f"x{adopted.qty}; now under exit management"))
+        for s in syms:
+            diff.pop(s)
+
+    # 3. whatever is left is unexplained
+    for s, d in sorted(diff.items()):
+        problems.append(f"{s}: broker holds {actual.get(s, 0):+d}, journal expects "
+                        f"{expected.get(s, 0):+d}")
+    return problems
+
+
+def refresh_for_gates(obs: dict, p, profile: str) -> float | None:
+    """Fresh quotes, open interest and equity for the two legs, just before gating.
+
+    The snapshot predates the model call by a minute or two. A binding limit
+    constrains the price; it does not make a stale market a valid one.
+    Returns the refreshed equity, or None if the broker could not be reached
+    (the gates then judge the old data, and the freshness check decides).
+    """
+    chain = obs["chains"].setdefault(p.underlying, {})
+    legs = [leg["symbol"] for leg in p.legs()]
+    try:
+        fresh = cli.option_quotes(legs, profile)
+        for sym in legs:
+            snap = chain.setdefault(sym, {})
+            if fresh.get(sym):
+                snap["latestQuote"] = fresh[sym]
+            oi = cli.open_interest(sym, profile)
+            if oi is not None:
+                snap["openInterest"] = oi
+        obs["quotes"][p.underlying] = cli.latest_quote(p.underlying, profile)
+        return float(cli.account(profile)["equity"])
+    except (cli.CLIError, KeyError, TypeError, ValueError) as e:
+        print(f"  warn: pre-gate refresh failed: {e}", file=sys.stderr)
+        return None
+
+
 def day_start_equity(acct: dict, first_mark: float | None) -> float | None:
     """The day's baseline: the broker's prior close, else the first mark.
 
@@ -156,7 +329,7 @@ def record_halt(journal, profile: str, reason: str, equity: float | None = None)
 
 def manage_open_spreads(
     settings: Settings, journal, obs: dict, now, *, dry_run: bool,
-    flatten: str | None = None,
+    flatten: str | None = None, close_t=None,
 ) -> dict:
     """Close anything the exit rules call for, before considering new risk.
 
@@ -200,7 +373,8 @@ def manage_open_spreads(
         if flatten:
             d = ExitDecision(action="close", rule="daily_loss_flatten", reason=flatten)
         else:
-            d = decide_exit(sp, mark, now=now, spot=spot, limits=settings.limits)
+            d = decide_exit(sp, mark, now=now, spot=spot, limits=settings.limits,
+                            close_t=close_t)
         mark_s = f"{mark:.2f}" if mark is not None else "n/a"
         print(f"    #{sp.id} {sp.underlying} {sp.short_strike}/{sp.long_strike} "
               f"cr {sp.entry_credit:.2f} mark {mark_s} -> {d.action}"
@@ -296,9 +470,24 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
 
     print(f"[{now:%H:%M:%S}] cycle start  profile={profile}  dry_run={dry_run}")
 
-    if manage_only and in_no_trade_window(now, settings.limits):
+    # The exchange's own hours for today. A failed calendar call degrades to
+    # the regular session rather than to no trading at all.
+    try:
+        day = now.strftime("%Y-%m-%d")
+        session = session_bounds(now, cli.trading_calendar(day, day, profile))
+        if session is None:
+            print("  the market is closed today; nothing to do")
+            return 0
+    except cli.CLIError as e:
+        print(f"  warn: calendar unavailable, assuming regular hours: {e}", file=sys.stderr)
+        session = (now.replace(hour=9, minute=30, second=0, microsecond=0),
+                   now.replace(hour=16, minute=0, second=0, microsecond=0))
+
+    if manage_only and not in_session(now, session):
         # Sweeps run every 10 minutes across the whole day. Outside the session
         # a closing order cannot fill, so skip rather than queue dead orders.
+        # Inside it they always run: the first and last five minutes are an
+        # ENTRY lockout, and a stop must not wait for them.
         print("  outside the trading session; sweep is a no-op")
         return 0
 
@@ -345,8 +534,16 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
                         positions=obs["positions"])
 
     # Exits before entries, always.
+    # Before managing anything, make sure the journal describes the book.
+    unexplained = reconcile(journal, profile, obs["positions"], now, dry_run=dry_run)
+    for msg in unexplained:
+        print(f"  RECONCILE: {msg}", file=sys.stderr)
+    if unexplained and not manage_only and not dry_run:
+        journal.record_cycle(profile=profile, action="error", equity=equity,
+                             error="reconcile: " + " | ".join(unexplained))
+
     open_marks = manage_open_spreads(settings, journal, obs, now, dry_run=dry_run,
-                                     flatten=flatten)
+                                     flatten=flatten, close_t=session[1])
 
     if manage_only:
         # Exit sweeps run far more often than entry cycles: stops and profit
@@ -359,6 +556,10 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         journal.record_cycle(profile=profile, action="stood_down", equity=equity,
                              reasoning="Halted for the day by the daily loss limit; no entries.")
         print("  halted for the day; no entry considered")
+        return 0
+    if unexplained:
+        # No new risk while the broker holds something the journal cannot explain.
+        print("  book not reconciled; no entry considered")
         return 0
 
     tape, sides = read_tape(obs, now, settings.limits)
@@ -408,6 +609,16 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
     if new_qty != p.qty:
         p = p.model_copy(update={"qty": new_qty})
 
+    # The snapshot is a minute or two old by now. Judge the trade on the market
+    # as it stands, and the book on the most defensive read in the universe so
+    # a sideways ticker cannot admit risk a bear book would refuse.
+    fresh_equity = refresh_for_gates(obs, p, profile)
+    if fresh_equity is not None:
+        equity = fresh_equity
+    now = now_et()
+    book_regime = min((t.regime for t in tape.values()),
+                      key=lambda r: regime.policy_for(r).size_multiplier)
+
     gates = risk.evaluate(
         p, profile=profile, now=now, equity=equity, day_start_equity=day_start,
         open_positions=obs["positions"], chain=obs["chains"].get(p.underlying, {}),
@@ -415,7 +626,7 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         chains=obs["chains"], quotes=obs["quotes"], target_expiry=expiry,
         open_spreads=journal.open_spreads(profile),
         tape=tape.get(p.underlying), open_marks=open_marks,
-        recent_spreads=recent_spreads,
+        recent_spreads=recent_spreads, session=session, book_regime=book_regime,
     )
     for g in gates:
         print(f"    {g}")

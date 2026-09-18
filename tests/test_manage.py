@@ -364,3 +364,13 @@ def test_partial_close_pnl_is_per_quantity():
     assert sp.realized_pnl(1.50, qty=4) == pytest.approx(-400.0)
     assert sp.realized_pnl(2.00, qty=6) == pytest.approx(-900.0)
     assert sp.realized_pnl(2.00) == pytest.approx(-1500.0)      # default is the full size
+
+
+def test_expiry_flatten_follows_an_early_close():
+    """13:00 close: a 15:30 flatten is two and a half hours too late."""
+    sp = spread(expiry="2026-11-27")
+    close_t = datetime(2026, 11, 27, 13, 0, tzinfo=ET)
+    at_1235 = datetime(2026, 11, 27, 12, 35, tzinfo=ET)
+    d = decide_exit(sp, 0.30, now=at_1235, spot=790.0, limits=LIMITS, close_t=close_t)
+    assert d.action == "close" and d.rule == "expiry_flatten"
+    assert decide_exit(sp, 0.30, now=at_1235, spot=790.0, limits=LIMITS).action == "hold"

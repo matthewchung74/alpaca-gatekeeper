@@ -52,6 +52,10 @@ class RiskLimits:
     max_concurrent_positions: int = 8
     min_open_interest: int = 500
     max_spread_pct_of_mid: float = 0.10     # bid-ask width sanity
+    # A quote older than this is not a market. The snapshot is taken before
+    # the model call, which can run a minute or two; the loop refreshes both
+    # legs just before the gates, so anything this old is genuinely stale.
+    max_quote_age_minutes: int = 10
     # Short-leg delta band, enforced by the delta_band gate. The range_buffer
     # gate now decides where the strike goes (outside the recent range, one
     # expected move out), which lands near 0.15 delta at 7-14 DTE. The floor
@@ -184,10 +188,19 @@ def assert_may_trade(profile: str, when: datetime | None = None) -> None:
         )
 
 
-def in_no_trade_window(when: datetime, limits: RiskLimits) -> bool:
-    """True during the first/last few minutes of the session, where spreads are noisy."""
-    open_t = when.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_t = when.replace(hour=16, minute=0, second=0, microsecond=0)
+def in_no_trade_window(when: datetime, limits: RiskLimits,
+                       session: tuple[datetime, datetime] | None = None) -> bool:
+    """True outside the session and during its first/last few minutes.
+
+    ENTRIES only. `session` is the exchange's own (open, close) for the day,
+    from the broker's calendar, so an early close moves the lockout with it.
+    Without it, the regular 09:30-16:00 hours are assumed.
+    """
+    if session is not None:
+        open_t, close_t = session
+    else:
+        open_t = when.replace(hour=9, minute=30, second=0, microsecond=0)
+        close_t = when.replace(hour=16, minute=0, second=0, microsecond=0)
     if when < open_t or when > close_t:
         return True
     if when < open_t + timedelta(minutes=limits.no_trade_open_minutes):

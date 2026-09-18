@@ -205,6 +205,20 @@ def list_expiries(underlying: str, profile: str, on_or_after: str,
     return sorted({r["expiration_date"] for r in rows if r.get("expiration_date")})
 
 
+def open_interest(symbol: str, profile: str) -> int | None:
+    """Open interest for one contract.
+
+    The chain snapshot does not carry it; only the contracts endpoint does.
+    The liquidity gate's OI floor passed on missing data for two weeks because
+    nothing ever fetched this.
+    """
+    data = run("api", "GET", f"/v2/options/contracts/{symbol}", profile=profile) or {}
+    try:
+        return int(float(data.get("open_interest")))
+    except (TypeError, ValueError):
+        return None
+
+
 def news(symbols: list[str], profile: str, limit: int = 12) -> list[dict]:
     """Recent headlines for the universe (Benzinga via Alpaca)."""
     data = run("data", "news", "--symbols", ",".join(symbols),

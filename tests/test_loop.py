@@ -124,3 +124,54 @@ def test_daily_halt_flattens_the_book_and_persists_for_the_day(tmp_path, monkeyp
     loop.record_halt(j, "dev", "daily loss -4.2% at/over the 4% limit")
     assert loop.halted_today(j, "dev", datetime.now(ET))
     assert not loop.halted_today(j, "comp", datetime.now(ET))
+
+
+# --- reconciliation: the broker's book is the truth ---------------------------
+
+def _pos(sym, qty, avg):
+    return {"symbol": sym, "qty": str(qty), "avg_entry_price": str(avg)}
+
+
+def test_reconcile_is_quiet_when_broker_and_journal_agree(tmp_path):
+    j = _book(tmp_path)
+    assert loop.reconcile(j, "dev", _obs(10)["positions"], NOW, dry_run=False) == []
+
+
+def test_reconcile_adopts_an_unjournaled_vertical(tmp_path):
+    """An entry that filled after the cancel gave up: held, journaled nowhere,
+    managed by nothing (2026-08-31). Now it is adopted at the broker's prices."""
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    positions = [_pos("QQQ260924C00728000", -15, 1.20), _pos("QQQ260924C00731000", 15, 0.75)]
+    problems = loop.reconcile(j, "dev", positions, NOW, dry_run=False)
+    assert problems == []                      # adopted, so nothing is unexplained
+    row = j.open_spreads("dev")[0]
+    assert (row["underlying"], row["right"], row["short_strike"], row["long_strike"]) == ("QQQ", "C", 728.0, 731.0)
+    assert row["qty"] == 15 and row["entry_credit"] == pytest.approx(0.45) and row["sleeve"] == "core"
+
+
+def test_reconcile_blocks_on_exposure_it_cannot_explain(tmp_path):
+    j = _book(tmp_path)
+    naked = _obs(10)["positions"] + [_pos("IWM260924P00280000", -5, 1.0)]
+    assert any("IWM260924P00280000" in p for p in loop.reconcile(j, "dev", naked, NOW, dry_run=False))
+    stock = _obs(10)["positions"] + [_pos("SPY", -1000, 770.0)]
+    assert any("stock" in p for p in loop.reconcile(j, "dev", stock, NOW, dry_run=False))
+    short_only = [_pos("SPY260910C00775000", 10, 0.2)]          # short leg gone: assignment?
+    assert any("SPY260910C00770000" in p for p in loop.reconcile(j, "dev", short_only, NOW, dry_run=False))
+
+
+def test_reconcile_retires_a_spread_the_broker_no_longer_holds(tmp_path):
+    j = _book(tmp_path)
+    later = datetime.now(ET).replace(year=2030)                 # the row is long settled
+    problems = loop.reconcile(j, "dev", [], later, dry_run=False)
+    assert j.open_spreads("dev") == []
+    assert j.all_spreads("dev")[0]["exit_rule"] == "missing_at_broker"
+    assert problems == []
+
+
+def test_session_bounds_come_from_the_calendar():
+    cal = [{"date": "2026-11-27", "open": "09:30", "close": "13:00"}]
+    o, c = loop.session_bounds(datetime(2026, 11, 27, 10, 0, tzinfo=ET), cal)
+    assert (o.hour, o.minute, c.hour, c.minute) == (9, 30, 13, 0)
+    assert loop.session_bounds(datetime(2026, 11, 26, 10, 0, tzinfo=ET), cal) is None   # holiday
+    assert loop.in_session(datetime(2026, 11, 27, 9, 31, tzinfo=ET), (o, c))            # first minutes count for exits
+    assert not loop.in_session(datetime(2026, 11, 27, 13, 1, tzinfo=ET), (o, c))

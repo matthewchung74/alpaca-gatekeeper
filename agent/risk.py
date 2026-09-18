@@ -42,6 +42,8 @@ def evaluate(
     tape: regime_mod.TapeRead | None = None,
     open_marks: dict | None = None,
     recent_spreads: list[dict] | None = None,
+    session: tuple | None = None,
+    book_regime: str | None = None,
 ) -> list[GateResult]:
     """Run every gate. Order matters only for readability; all of them run."""
     g: list[GateResult] = []
@@ -168,14 +170,14 @@ def evaluate(
     ))
 
     # --- Gate 12: no-trade window ----------------------------------------
-    blocked = in_no_trade_window(now, limits)
+    blocked = in_no_trade_window(now, limits, session)
     g.append(GateResult(
         name="trading_window", passed=not blocked,
         detail=f"{now:%H:%M} {'inside' if blocked else 'outside'} the no-trade window",
     ))
 
     # --- Gate 13: liquidity ----------------------------------------------
-    g.append(_liquidity_gate(proposal, chain, limits))
+    g.append(_liquidity_gate(proposal, chain, limits, now))
 
     # --- Gate 14: short-leg delta ----------------------------------------
     g.append(_delta_gate(proposal, chain, limits))
@@ -190,7 +192,8 @@ def evaluate(
     g.append(_credit_floor_gate(proposal, limits))
 
     # --- Gates 18-21: the shape of the whole book ------------------------
-    g.append(_book_risk_gate(proposal, open_spreads or [], equity, regime, limits))
+    g.append(_book_risk_gate(proposal, open_spreads or [], equity,
+                             book_regime or regime, limits))
     g.append(_same_direction_gate(proposal, open_spreads or [], limits))
     g.append(_losing_side_gate(proposal, open_spreads or [], open_marks or {}, limits))
     g.append(_cadence_gate(proposal, recent_spreads or [], now, limits))
@@ -198,7 +201,27 @@ def evaluate(
     return g
 
 
-def _liquidity_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits) -> GateResult:
+def _quote_age_minutes(t, now: datetime) -> float | None:
+    """Age of an Alpaca quote timestamp (RFC 3339 with nanoseconds)."""
+    if not t:
+        return None
+    s = str(t).replace("Z", "+00:00")
+    if "." in s:                                   # trim nanoseconds to microseconds
+        head, _, rest = s.partition(".")
+        frac = "".join(ch for ch in rest if ch.isdigit())
+        tz = rest[len(frac):]
+        s = f"{head}.{frac[:6]}{tz}"
+    try:
+        ts = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ET)
+    return (now - ts).total_seconds() / 60.0
+
+
+def _liquidity_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits,
+                    now: datetime) -> GateResult:
     """Both legs must be real, quoted, and tight.
 
     Doubles as P&L credibility: Alpaca paper can fill wide-spread illiquid
@@ -217,15 +240,33 @@ def _liquidity_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits) ->
         if bid <= 0 or ask <= 0:
             problems.append(f"{label} leg {sym} unquoted (bid={bid}, ask={ask})")
             continue
+        # Codex review 2026-09-18: a crossed market stamped 2020 with no open
+        # interest used to pass. A quote is only a market if it is ordered,
+        # recent, and someone is actually there.
+        if ask < bid:
+            problems.append(f"{label} leg {sym} crossed (bid {bid} > ask {ask})")
+            continue
+        age = _quote_age_minutes(q.get("t"), now)
+        if age is None:
+            problems.append(f"{label} leg {sym} quote has no timestamp")
+        elif age > limits.max_quote_age_minutes:
+            problems.append(f"{label} leg {sym} quote is stale ({age:.0f} min old)")
+        if float(q.get("bs") or 0) <= 0 or float(q.get("as") or 0) <= 0:
+            problems.append(f"{label} leg {sym} has no displayed size")
         mid = (bid + ask) / 2
         if mid > 0 and (ask - bid) / mid > limits.max_spread_pct_of_mid:
             problems.append(
                 f"{label} leg {sym} spread {(ask - bid) / mid:.1%} > "
                 f"{limits.max_spread_pct_of_mid:.0%} of mid"
             )
+        # The chain snapshot never carries open interest; the loop fetches it
+        # from the contracts endpoint before the gates. Missing fails closed:
+        # for two weeks this check passed because the number was never there.
         oi = snap.get("openInterest")
-        if oi is not None and int(oi) < limits.min_open_interest:
-            problems.append(f"{label} leg {sym} OI {oi} < {limits.min_open_interest}")
+        if oi is None:
+            problems.append(f"{label} leg {sym} open interest unknown")
+        elif int(oi) < limits.min_open_interest:
+            problems.append(f"{label} leg {sym} open interest {oi} < {limits.min_open_interest}")
 
     if problems:
         return GateResult(name="liquidity", passed=False, detail="; ".join(problems))
@@ -321,30 +362,39 @@ def _directional_risk_gate(
         return GateResult(name="directional_risk", passed=True,
                           detail="no equity reported; exposure unmeasurable")
 
-    held = 0.0
+    # Each tail on its own. This used to subtract the put wing from the call
+    # wing, so a 900 put spread and a 900 call spread reported zero -- but a
+    # condor still loses a whole wing whichever way the market runs, and
+    # across three tickers and two expiries the wings do not even share a
+    # payoff. Opposite sides never offset here.
+    rally = selloff = 0.0
     for row in open_spreads:
         try:
             loss = _spread_max_loss(row)
             up = _hurt_by_a_rally(row["right"], row.get("sleeve"))
         except (KeyError, TypeError, ValueError):
             continue
-        held += loss if up else -loss
+        if up:
+            rally += loss
+        else:
+            selloff += loss
 
-    mine = proposal.total_max_loss
-    marginal = mine if _hurt_by_a_rally(proposal.right, proposal.sleeve) else -mine
-    total = held + marginal
-    ratio = abs(total) / equity
+    mine_up = _hurt_by_a_rally(proposal.right, proposal.sleeve)
+    if mine_up:
+        rally += proposal.total_max_loss
+    else:
+        selloff += proposal.total_max_loss
+    side, amount = ("a rally", rally) if mine_up else ("a selloff", selloff)
+    ratio = amount / equity
     ok = ratio <= limits.max_directional_risk_pct
-    side = "a rally" if total > 0 else "a selloff"
 
     return GateResult(
         name="directional_risk", passed=ok,
-        detail=(f"{abs(total):,.0f} of {equity:,.0f} equity = {ratio:.1%} at risk on "
-                f"{side}, {'within' if ok else 'OVER'} "
+        detail=(f"{amount:,.0f} of {equity:,.0f} equity = {ratio:.1%} at risk on "
+                f"{side} with this trade, {'within' if ok else 'OVER'} "
                 f"{limits.max_directional_risk_pct:.0%} "
-                f"(held {held:+,.0f}, this trade {marginal:+,.0f})"),
+                f"(book after: rally {rally:,.0f}, selloff {selloff:,.0f}; sides never net)"),
     )
-
 
 def _mid(q: dict) -> float | None:
     try:
