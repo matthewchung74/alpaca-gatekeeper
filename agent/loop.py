@@ -796,12 +796,26 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     print(f"  candidates: {funnel['pairs']} pairs, {funnel['survivors']} survive; "
           f"rejections {funnel['failed']}")
 
+    snap_book_regime = min((t.regime for t in tape.values()),
+                           key=lambda r: regime.policy_for(r).size_multiplier)
+    book_lines = ["", "BOOK (binding; a proposal is cut to the room shown):"]
+    open_now = journal.open_spreads(profile)
+    for right, word in (("C", "short calls (lose on a rally)"), ("P", "short puts (lose on a selloff)")):
+        n = sum(1 for r in open_now if r.get("right") == right and (r.get("sleeve") or "core") == "core")
+        room, room_note = risk.room_for_trade(
+            equity=equity, regime=cycle_regime, book_regime=snap_book_regime, open_spreads=open_now,
+            right=right, sleeve="core", limits=settings.limits)
+        book_lines.append(f"  {word}: {n} of max {settings.limits.max_same_direction} open; {room_note}")
+    book_lines.append(f"  book regime (most defensive read in the universe): {snap_book_regime}; "
+                      f"{len(open_now)} of max {settings.limits.max_concurrent_positions} spreads open")
+
     snapshot = build_snapshot(
         now=now, equity=equity, day_start_equity=day_start,
         positions=obs["positions"], quotes=obs["quotes"], chains=obs["chains"],
         bars=obs.get("bars", {}), news=obs.get("news", []),
         limits=settings.limits, target_expiry=expiry, tape=tape, sides=sides,
         recent_spreads=recent_spreads, candidate_lines=cand.render(found, funnel),
+        book_lines=book_lines,
     )
 
     try:
@@ -869,7 +883,12 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     cycle_regime = tape[p.underlying].regime if p.underlying in tape else cycle_regime
     book_regime = min((t.regime for t in tape.values()),
                       key=lambda r: regime.policy_for(r).size_multiplier)
-    eff_pct = regime.budget_pct_for(cycle_regime, p.sleeve, settings.limits)
+    room, room_note = risk.room_for_trade(
+        equity=equity, regime=cycle_regime, book_regime=book_regime,
+        open_spreads=journal.open_spreads(profile), right=p.right, sleeve=p.sleeve,
+        limits=settings.limits)
+    print(f"  {room_note}")
+    eff_pct = room / equity if equity > 0 else 0.0
     fresh_qty, note = regime.resize_to_budget(p, equity=equity, effective_pct=eff_pct)
     if fresh_qty != p.qty:
         print(f"  regime policy on the final observation [{cycle_regime}]: {note}")

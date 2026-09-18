@@ -163,10 +163,13 @@ def evaluate(
     ))
 
     # --- Gate 11: position count -----------------------------------------
-    ok = len(open_positions) < limits.max_concurrent_positions
+    # Spreads, from the journal. This counted broker LEGS, so a limit of 8
+    # silently meant four spreads.
+    n_open = len(open_spreads or [])
+    ok = n_open < limits.max_concurrent_positions
     g.append(GateResult(
         name="position_count", passed=ok,
-        detail=f"{len(open_positions)} open vs max {limits.max_concurrent_positions}",
+        detail=f"{n_open} open spreads vs max {limits.max_concurrent_positions}",
     ))
 
     # --- Gate 12: no-trade window ----------------------------------------
@@ -529,6 +532,43 @@ def _leg_overlap_gate(proposal: TradeProposal, open_spreads: list[dict]) -> Gate
                         "spreads may not share a contract"))
     return GateResult(name="leg_overlap", passed=True,
                       detail="no contract shared with an open spread")
+
+
+def room_for_trade(*, equity: float, regime: str, book_regime: str, open_spreads: list[dict],
+                   right: str, sleeve: str, limits: RiskLimits) -> tuple[float, str]:
+    """Dollars of max loss a new trade may carry: the tightest of three budgets.
+
+    The tranche budget, what is left of the book budget, and what is left on
+    this trade's side of the directional cap. Sizing used to look at the
+    tranche alone, so a full-size proposal into a nearly full book was refused
+    by book_risk instead of being cut to fit. Downsizing beats blocking.
+    """
+    held = rally = selloff = 0.0
+    for row in open_spreads:
+        try:
+            loss = _spread_max_loss(row)
+            up = _hurt_by_a_rally(row["right"], row.get("sleeve"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        held += loss
+        if up:
+            rally += loss
+        else:
+            selloff += loss
+    up = _hurt_by_a_rally(right, sleeve)
+    budgets = {
+        "tranche": equity * regime_mod.budget_pct_for(regime, sleeve, limits),
+        "book": equity * limits.max_book_risk_pct
+                * regime_mod.policy_for(book_regime).size_multiplier - held,
+        ("rally" if up else "selloff") + " side": equity * limits.max_directional_risk_pct
+                                                  - (rally if up else selloff),
+    }
+    name, room = min(budgets.items(), key=lambda kv: kv[1])
+    room = max(room, 0.0)
+    return room, (f"room {room:,.0f}, set by the {name} budget (tranche {budgets['tranche']:,.0f}, "
+                  f"book {max(budgets['book'], 0):,.0f} left, "
+                  f"{'rally' if up else 'selloff'} side "
+                  f"{max(budgets[('rally' if up else 'selloff') + ' side'], 0):,.0f} left)")
 
 
 def _book_risk_gate(proposal: TradeProposal, open_spreads: list[dict], equity: float,

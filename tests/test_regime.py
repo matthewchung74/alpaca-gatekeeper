@@ -394,7 +394,7 @@ def test_snapshot_lists_entries_today_and_cooldowns():
         day_start_equity=100_000.0, positions=[], quotes={}, chains={}, bars={},
         news=[], limits=LIMITS, recent_spreads=rows,
     )
-    assert "CADENCE" in out and "entries today: 0 of max 2" in out
+    assert "CADENCE" in out and "entries today: 0 of max 4" in out
     assert "QQQ C until 09-11 09:40 ET" in out
 
 
@@ -407,3 +407,13 @@ def test_fomc_decision_day_is_a_scheduled_event():
     fomc = [e for e in ev if "FOMC" in e["event"]]
     assert len(fomc) == 1 and fomc[0]["date"] == "2026-09-16"
     assert not [e for e in upcoming(within_days=3, today=date(2026, 9, 21)) if "FOMC" in e["event"]]
+
+
+def test_snapshot_shows_the_room_left_in_the_book():
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    out = build_snapshot(
+        now=datetime(2026, 9, 21, 9, 46, tzinfo=ET), equity=100_000.0, day_start_equity=100_000.0,
+        positions=[], quotes={}, chains={}, bars={}, news=[], limits=LIMITS,
+        book_lines=["", "BOOK (binding):", "  open max loss 5,853 of book budget 8,400; room 2,547"])
+    assert "BOOK (binding):" in out and "room 2,547" in out

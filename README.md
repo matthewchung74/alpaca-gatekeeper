@@ -83,13 +83,15 @@ Now `regime.classify` reads the last ten completed sessions: a trend if spot has
 
 | Read | Core budget | Core may sell |
 |---|---|---|
-| sideways, middle of range | 12.00% | puts or calls |
-| sideways, bottom quarter | 12.00% | **puts** only |
-| sideways, top quarter | 12.00% | **calls** only |
-| bull | 10.20% | **puts** only |
-| bear | 4.20% | **calls** only |
+| sideways, middle of range | 4.00% | puts or calls |
+| sideways, bottom quarter | 4.00% | **puts** only |
+| sideways, top quarter | 4.00% | **calls** only |
+| bull | 3.40% | **puts** only |
+| bear | 1.40% | **calls** only |
 
 The model sees the read in its snapshot and cannot change it.
+
+Budgets are per trade and deliberately small. The hackathon ran 12% tranches, where two positions filled the 24% book and nothing else could be entered until one closed. A tranche is now a third of that inside the same book cap, directional cap and daily limit: the same total risk in more, smaller positions, each proposal cut to whatever room the tranche, the book and its side have left.
 
 ---
 
@@ -110,7 +112,7 @@ Every gate is a pure function of the proposal plus observed account and market s
 | 8 | `regime_direction` | The sleeve may only lean the way the regime permits |
 | 9 | `tranche_risk` | Max loss within the sleeve's regime-adjusted budget |
 | 10 | `concentration` | 35% of equity per underlying |
-| 11 | `position_count` | 8 concurrent positions |
+| 11 | `position_count` | 8 open spreads |
 | 12 | `trading_window` | Not in the first or last 5 minutes of a session |
 | 13 | `liquidity` | Both legs quoted, spread ≤ 10% of mid, OI ≥ 500 |
 | 14 | `delta_band` | Short-leg \|delta\| within 0.10–0.35 |
@@ -118,9 +120,9 @@ Every gate is a pure function of the proposal plus observed account and market s
 | 16 | `range_buffer` | Short strike ≥ 1 expected move from spot; in a sideways tape also outside the 10-session high-low |
 | 17 | `credit_floor` | Credit ≥ 10% of width |
 | 18 | `book_risk` | Open max loss + proposal ≤ 24% of equity × regime multiplier |
-| 19 | `same_direction` | ≤ 2 open core spreads on one right across SPY/QQQ/IWM |
+| 19 | `same_direction` | ≤ 5 open core spreads on one right across SPY/QQQ/IWM |
 | 20 | `losing_side` | No new spread on a right where an open spread marks ≥ 1.5× its credit |
-| 21 | `cadence` | 2 entries per day; 24h cooldown per underlying and right after a close |
+| 21 | `cadence` | 4 entries per day; 24h cooldown per underlying and right after a close |
 | 22 | `leg_overlap` | A new spread may not reuse a contract an open spread already holds |
 
 Gates 16 to 21 come from the post-mortem. Six of nine hackathon short strikes finished in the money; held to expiry the book would have lost about $11,400 against the $1,843 it did lose. The strikes sat inside the prior week's range at one to four days to expiry, the book stacked three same-direction spreads in three tickers that move together, and the model proposed a trade in every cycle it had budget for. Each of those is now a gate.

@@ -49,7 +49,7 @@ class RiskLimits:
     max_daily_loss_pct: float = 0.04
     max_event_drawdown_pct: float = 0.15    # halt for the event
     max_underlying_notional_pct: float = 0.35
-    max_concurrent_positions: int = 8
+    max_concurrent_positions: int = 8       # open SPREADS (it used to count legs: 8 legs = 4 spreads)
     min_open_interest: int = 500
     max_spread_pct_of_mid: float = 0.10     # bid-ask width sanity
     # A quote older than this is not a market. The snapshot is taken before
@@ -111,7 +111,9 @@ class RiskLimits:
     # sideways tranche, and three call spreads in three tickers that move
     # together were one bet. These look at the whole book.
     max_book_risk_pct: float = 0.24         # open max loss + proposal, x regime multiplier
-    max_same_direction: int = 2             # open core spreads on one right, whole universe
+    # Open core spreads on one right, whole universe. 5 x 4% = the 20%
+    # directional cap, so this and that gate agree on where a side is full.
+    max_same_direction: int = 5
     losing_side_multiple: float = 1.5       # no add-on where a spread marks >= this x credit
     # --- Cadence ---
     # Four cycles a day produced a proposal in 13 of 13 cycles with budget, so
@@ -119,18 +121,26 @@ class RiskLimits:
     # rules freeze and against the advice to wait for survival data: it is a
     # paper account and he wants to see how it does. Every other gate still
     # applies to the second entry (same-direction cap, book risk, cooldown).
-    max_entries_per_day: int = 2
+    # ... and to 4 the same day, with the smaller tranches: one per scheduled cycle.
+    max_entries_per_day: int = 4
     reentry_cooldown_hours: int = 24        # same underlying and right, after any close
     no_trade_open_minutes: int = 5
     no_trade_close_minutes: int = 5
-    max_tranche_risk_pct: float = 0.12      # worst case on any one CORE tranche
+    # Worst case on any one CORE tranche. Was 0.12 for the tournament, where two
+    # full-size positions filled the 24% book and nothing else could be
+    # entered until one closed: two to four entries a week. Cut to a third on
+    # 2026-09-18 at Matt's call ("option A"): the same TOTAL risk -- book cap,
+    # directional cap and daily limit are unchanged -- split into more, smaller
+    # positions, so one stop-out costs a third as much and the record grows
+    # three times faster. A rule change during the freeze, by his decision.
+    max_tranche_risk_pct: float = 0.04
 
     # --- Satellite sleeve ---
     # The convex half of the barbell. Core sells premium and wins slowly with
     # high probability; satellite buys direction and loses small, often, in
     # exchange for a larger payoff when a trend actually runs. Sized well under
     # core because its hit rate is much lower.
-    max_satellite_risk_pct: float = 0.04
+    max_satellite_risk_pct: float = 0.013      # a third of a core tranche, as before; the sleeve is OFF
     satellite_profit_target_pct: float = 0.60   # take 60% of max profit
     satellite_stop_pct: float = 0.50            # cut at 50% of the debit paid
 

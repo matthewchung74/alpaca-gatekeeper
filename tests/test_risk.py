@@ -190,11 +190,15 @@ def test_concentration_gate_counts_existing_exposure():
     assert not next(g for g in gates if g.name == "concentration").passed
 
 
-def test_position_count_gate():
-    p = make_proposal()
-    many = [{"symbol": f"QQQ26090{i}P00500000", "market_value": "100"} for i in range(8)]
-    gates = evaluate(p, open_positions=many)
-    assert not next(g for g in gates if g.name == "position_count").passed
+def test_position_count_counts_spreads_not_legs():
+    """It counted broker LEGS, so "8 concurrent positions" meant four spreads.
+    With smaller tranches the book is meant to hold more than four."""
+    legs = [{"symbol": f"SPY260903P00{700 + i}000", "qty": "1"} for i in range(10)]   # five spreads' legs
+    five = [row(id=str(i)) for i in range(5)]
+    assert gate(evaluate(make_proposal(), open_positions=legs, open_spreads=five), "position_count").passed
+    eight = [row(id=str(i)) for i in range(8)]
+    g = gate(evaluate(make_proposal(), open_positions=legs, open_spreads=eight), "position_count")
+    assert not g.passed and "8 open spreads" in g.detail
 
 
 def test_halt_flag_blocks():
@@ -373,10 +377,11 @@ def test_book_risk_scales_with_the_regime_multiplier():
 
 
 def test_same_direction_caps_open_spreads_on_one_right_across_the_universe():
-    held = [row(id="a", underlying="QQQ", right="C"), row(id="b", underlying="IWM", right="C")]
+    held = [row(id=str(i), underlying=u, right="C") for i, u in enumerate(("QQQ", "IWM", "SPY", "QQQ", "IWM"))]
     p = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    assert gate(evaluate(p, open_spreads=held[:4]), "same_direction").passed        # four is fine
     g = gate(evaluate(p, open_spreads=held), "same_direction")
-    assert not g.passed and "2 open" in g.detail
+    assert not g.passed and "5 open" in g.detail
     assert gate(evaluate(make_proposal(right="P"), open_spreads=held), "same_direction").passed
 
 
@@ -391,16 +396,15 @@ def test_losing_side_blocks_adding_to_a_side_already_underwater():
     assert fine.passed and no_mark.passed
 
 
-def test_cadence_allows_two_entries_per_day():
-    """Raised from 1 to 2 on 2026-09-18 at Matt's call: paper account, see how it does."""
-    one = [row(id="a", ts_open="2026-08-28T15:46:00+00:00")]        # 11:46 ET on MIDDAY's date
-    assert gate(evaluate(make_proposal(), recent_spreads=one), "cadence").passed
-    two = one + [row(id="b", underlying="IWM", ts_open="2026-08-28T13:46:00+00:00")]
-    g = gate(evaluate(make_proposal(), recent_spreads=two), "cadence")
-    assert not g.passed and "2 entries" in g.detail
-    yesterday = [row(id="a", ts_open="2026-08-27T15:46:00+00:00"),
-                 row(id="b", ts_open="2026-08-27T13:46:00+00:00")]
-    assert gate(evaluate(make_proposal(), recent_spreads=yesterday), "cadence").passed
+def test_cadence_allows_four_entries_per_day():
+    """1 -> 2 -> 4 on 2026-09-18, all at Matt's call: one entry per scheduled
+    cycle, now that each entry is a third of the size."""
+    def opened(n, day="28"):
+        return [row(id=str(i), underlying="IWM", ts_open=f"2026-08-{day}T1{i}:46:00+00:00") for i in range(n)]
+    assert gate(evaluate(make_proposal(), recent_spreads=opened(3)), "cadence").passed
+    g = gate(evaluate(make_proposal(), recent_spreads=opened(4)), "cadence")
+    assert not g.passed and "4 entries" in g.detail
+    assert gate(evaluate(make_proposal(), recent_spreads=opened(4, day="27")), "cadence").passed
 
 
 def test_cadence_cools_down_after_a_close_in_the_same_name_and_side():
@@ -558,3 +562,35 @@ def test_a_proposal_may_not_share_a_contract_with_an_open_spread():
         assert not g.passed and "SPY" in g.detail
     held[0]["expiry"] = clear.expiry
     assert gate(evaluate(clear, open_spreads=held), "leg_overlap").passed
+
+
+# --- option A: smaller tranches, the same total risk ---------------------------
+
+def test_a_tranche_is_a_third_of_what_it_was_and_the_book_is_not():
+    assert LIMITS.max_tranche_risk_pct == pytest.approx(0.04)
+    assert LIMITS.max_book_risk_pct == pytest.approx(0.24)
+    assert LIMITS.max_directional_risk_pct == pytest.approx(0.20)
+    assert LIMITS.max_daily_loss_pct == pytest.approx(0.04)
+    assert LIMITS.max_same_direction * LIMITS.max_tranche_risk_pct <= LIMITS.max_directional_risk_pct + 1e-9
+
+
+def test_room_is_the_tightest_of_tranche_book_and_side():
+    """Downsizing beats blocking, so size to the room that is actually left
+    rather than to a full tranche the book gate would then refuse."""
+    from agent.risk import room_for_trade
+    eq = 100_000.0
+    assert room_for_trade(equity=eq, regime="sideways", book_regime="sideways", open_spreads=[],
+                          right="C", sleeve="core", limits=LIMITS)[0] == pytest.approx(4_000)
+    # book nearly full: 22,950 of 24,000 held -> 1,050 of room
+    full = [row(id="a", right="P", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=51)]
+    room, note = room_for_trade(equity=eq, regime="sideways", book_regime="sideways", open_spreads=full,
+                                right="C", sleeve="core", limits=LIMITS)
+    assert room == pytest.approx(1_050) and "book" in note
+    # the call side nearly full: 18,900 of 20,000 -> 1,100, tighter than a 4,000 tranche
+    calls = [row(id="a", right="C", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=42)]
+    room, note = room_for_trade(equity=eq, regime="sideways", book_regime="sideways", open_spreads=calls,
+                                right="C", sleeve="core", limits=LIMITS)
+    assert room == pytest.approx(1_100) and "rally" in note
+    # a bear book shrinks the whole budget: 24% x 35% = 8,400, tranche 1,400
+    assert room_for_trade(equity=eq, regime="bear", book_regime="bear", open_spreads=[],
+                          right="C", sleeve="core", limits=LIMITS)[0] == pytest.approx(1_400)

@@ -13,6 +13,7 @@ from .models import AgentDecision, parse_strike
 from .regime import TapeRead
 
 PER_WING_CAP = 30   # per underlying, per side
+_L = RiskLimits()   # the prompt quotes limits from config so the two cannot drift
 
 SYSTEM = f"""\
 You are the reasoning layer of an autonomous options trading agent competing in \
@@ -50,10 +51,14 @@ The snapshot carries, per underlying, a regime (bull / bear / sideways) read
 from the daily bars, the position of spot inside the recent range, the
 expected move to expiry, and the sides the core sleeve may sell. You do not
 set any of it. The budget and the permitted sides follow from it:
-  sideways -> core 12.00%. Bottom quarter of the range: puts only. Top
-              quarter: calls only. Middle: either.
-  bull     -> core 10.20% (P credit only).
-  bear     -> core 4.20% (C credit only).
+  sideways -> core {_L.max_tranche_risk_pct * 1.00:.2%} per trade. Bottom quarter of the
+              range: puts only. Top quarter: calls only. Middle: either.
+  bull     -> core {_L.max_tranche_risk_pct * 0.85:.2%} per trade (P credit only).
+  bear     -> core {_L.max_tranche_risk_pct * 0.35:.2%} per trade (C credit only).
+Trades are deliberately small: up to {_L.max_same_direction} open spreads per side and
+{_L.max_entries_per_day} entries a day, inside a book capped at {_L.max_book_risk_pct:.0%} of equity (scaled down
+by the most defensive read in the universe). The BOOK section shows the room
+that is left; a proposal is cut to fit it.
 A side the read forbids is rejected outright; a size above the budget is
 silently cut to fit. If no side is permitted in the name you like, stand down
 or pick another name.
@@ -184,6 +189,7 @@ def build_snapshot(
     sides: dict[str, tuple] | None = None,
     recent_spreads: list[dict] | None = None,
     candidate_lines: list[str] | None = None,
+    book_lines: list[str] | None = None,
 ) -> str:
     """Render the market state as text for the model.
 
@@ -331,6 +337,7 @@ def build_snapshot(
     else:
         lines.append("  (none available)")
 
+    lines += book_lines or []
     lines += candidate_lines or []
 
     lines += [
