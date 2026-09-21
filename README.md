@@ -162,6 +162,25 @@ Before the model is asked anything, `agent/candidates.py` walks every vertical u
 
 The expiry is the nearest **Friday** weekly at least seven days out. "Nearest expiry" kept landing on Monday and Wednesday weeklies listed days earlier: on 2026-09-18 the 09-28 Monday weekly had 1 surviving vertical out of 115 across all three names, and the 10-02 Friday had 26 of 183.
 
+## How it measures itself
+
+Nobody has shown this strategy has an edge, and its rules were tuned off a handful of trades. So the agent now keeps a **shadow ledger**: every entry cycle journals every vertical it enumerated, traded or not, with the claim each one makes ("at expiry the underlying closes beyond the short strike") and the gate codes that refused it. A daily job after the close settles each claim two ways: held to expiry, which is exact from the underlying's close, and managed by the agent's own 50% target and 3x stop, which is approximate from daily option bars.
+
+`python -m agent.shadow report` prints four things, each with an **effective sample size** (neighbouring strikes on one underlying, side and expiry share a terminal price and count as one observation):
+
+- **Gate regret**, per gate: what the spreads it alone refused went on to do, against what it admitted.
+- **Calibration** by short delta: the market's implied hold rate (1 − delta) against the realized one. Positive edge means the premium was rich. This is the edge test.
+- **Model versus field**: the model's pick against the mean eligible candidate in the same cycle.
+- **View × structure** on real closed trades: was the claim right, and did the exits do their job. A lucky win, where the view failed but the trade profited, is named and counts for nothing.
+
+## How it learns
+
+After each settlement the learning step may move **one** tunable gate parameter **one** rung on its ladder, and only one change is ever in flight. Tunable: the open-interest floor, the bid-ask width, the expected-move multiple, the credit floor, and the delta band. Never tunable: tranche, book, directional and daily-loss caps, position count, leg overlap, quote validity, direction, cadence.
+
+A gate is loosened when the spreads it alone refused have at least 20 effective observations, a positive mean return, and beat the admitted set with one-sided 95% confidence. It is tightened when the marginal band it admits loses money by the same test. Every change is then judged on data collected after it, and reverted and locked for eight weeks if the newly admitted band loses. With six clusters a week, the first change cannot come for about four weeks.
+
+Position size is earned the same way: half a tranche until ten attributable closed trades with a positive mean, then three quarters, then full at twenty-five. A drawdown steps it back down. Lucky wins buy no size.
+
 ## What the model actually sees
 
 One `messages.parse()` call per cycle, returning a validated Pydantic object. No tool loop, no multi-turn.
@@ -199,6 +218,7 @@ Cloud Scheduler ──▶ Cloud Run Job ──▶ Alpaca CLI  +  Anthropic API
 |---|---|
 | `agent-cycle` (Cloud Run Job) | Full entry cycle. 09:45 / 11:45 / 13:45 / 15:45 ET |
 | `agent-sweep` (Cloud Run Job) | Exit management only, no model call. Every 10 min |
+| `agent-settle` (Cloud Run Job) | Settle the shadow ledger and run the learning step. 16:30 ET |
 | `dashboard` (Cloud Run service) | Public decision log, scale-to-zero |
 | Firestore | The journal |
 | Secret Manager | Alpaca and Anthropic credentials, injected at runtime |
@@ -236,6 +256,12 @@ agent/
   alpaca_cli.py        the execution boundary
   journal.py           SQLite (local) / Firestore (cloud), one interface
   loop.py              one cycle: observe -> manage -> reason -> gate -> execute
+  candidates.py        every vertical the rules could permit; the model's menu and the ledger rows
+  shadow.py            settle ledger claims against real prices
+  shadow_stats.py      effective n, gate regret, calibration, view x structure
+  rules.py             the tunable dials, their ladders, the rules version
+  learning.py          one dial, one rung, on evidence, checked later
+  sizing.py            the size ladder
 dashboard/             FastAPI + a single self-contained page
 tests/                 97 tests
 ```
