@@ -218,6 +218,58 @@ def list_expiries(underlying: str, profile: str, on_or_after: str,
 
 
 
+def option_bars(symbols: list[str], start: str, end: str, profile: str) -> dict[str, list[dict]]:
+    """Daily bars per contract over [start, end], in batches of 100, paged.
+
+    Used only by the shadow ledger's settlement. Paper option bars contain
+    absurd prints (a 3-wide spread's short leg printed 15.88 on 2026-09-21),
+    so callers must clamp anything derived from them.
+    """
+    out: dict[str, list[dict]] = {s: [] for s in symbols}
+    for i in range(0, len(symbols), 100):
+        batch = symbols[i:i + 100]
+        token = ""
+        for _ in range(20):
+            args = ["data", "option", "bars", "--symbols", ",".join(batch), "--timeframe", "1Day",
+                    "--start", start, "--end", end, "--limit", "1000"]
+            if token:
+                args += ["--page-token", token]
+            data = run(*args, profile=profile) or {}
+            for sym, bars in (data.get("bars") or {}).items():
+                out.setdefault(sym, []).extend(bars or [])
+            token = data.get("next_page_token") or ""
+            if not token:
+                break
+    return out
+
+
+def daily_close(symbol: str, day: str, profile: str) -> float | None:
+    """The underlying's close on one day, or None if no bar exists for it.
+
+    Asks for a short window ending the day before today: the free data plan
+    returns 403 for any window that reaches into the last fifteen minutes,
+    and a future `day` would do exactly that.
+    """
+    from datetime import date, timedelta
+    try:
+        d = date.fromisoformat(day)
+    except ValueError:
+        return None
+    if d >= date.today():
+        return None
+    start = (d - timedelta(days=4)).isoformat()
+    end = (d + timedelta(days=1)).isoformat()             # --end is exclusive
+    data = run("data", "bars", "--symbol", symbol, "--timeframe", "1Day",
+               "--start", start, "--end", end, profile=profile)
+    for b in (data or {}).get("bars", []) or []:
+        if str(b.get("t", ""))[:10] == day:
+            try:
+                return float(b["c"])
+            except (KeyError, TypeError, ValueError):
+                return None
+    return None
+
+
 def fills(profile: str, after: str) -> list[dict]:
     """The broker's own record of executions since `after` (YYYY-MM-DD), oldest first."""
     return run("account", "activity", "list", "--activity-types", "FILL", "--after", after,
