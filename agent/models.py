@@ -195,6 +195,10 @@ class GateResult(BaseModel):
     name: str
     passed: bool
     detail: str
+    # Machine-readable causes, "<gate>:<cause>". `detail` is for people; this is
+    # for the shadow ledger, which has to know WHICH parameter refused a spread
+    # before it can say whether that parameter is earning its keep.
+    codes: list[str] = []
 
     def __str__(self) -> str:
         return f"[{'PASS' if self.passed else 'BLOCK'}] {self.name}: {self.detail}"

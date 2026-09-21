@@ -594,3 +594,38 @@ def test_room_is_the_tightest_of_tranche_book_and_side():
     # a bear book shrinks the whole budget: 24% x 35% = 8,400, tranche 1,400
     assert room_for_trade(equity=eq, regime="bear", book_regime="bear", open_spreads=[],
                           right="C", sleeve="core", limits=LIMITS)[0] == pytest.approx(1_400)
+
+
+# --- improved gatekeeper: per-account equity, failure codes --------------------
+
+def test_event_drawdown_is_measured_from_the_accounts_own_start():
+    """The new account starts at 50,000. Against the old hardcoded 100,000 it
+    would have been 'down 50%' and halted on its first cycle."""
+    p = make_proposal()
+    assert gate(evaluate(p, profile="igk", equity=49_000.0, day_start_equity=49_000.0), "event_drawdown").passed
+    assert not gate(evaluate(p, profile="igk", equity=42_400.0, day_start_equity=42_400.0), "event_drawdown").passed
+    assert gate(evaluate(p, profile="dev", equity=90_000.0, day_start_equity=90_000.0), "event_drawdown").passed
+
+
+def test_a_thin_market_fails_with_one_precise_code():
+    p = make_proposal()
+    gates = evaluate(p, chain=make_chain(p, oi=120))
+    assert gate(gates, "liquidity").codes == ["liquidity:oi"]
+    assert risk.failure_codes(gates) == ["credit_floor", "liquidity:oi", "range_buffer:nodata"]
+
+
+def test_range_buffer_names_both_of_its_causes():
+    p = make_proposal(expiry=WEEK_OUT, short_strike=752.0, long_strike=747.0)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert sorted(g.codes) == ["range_buffer:em", "range_buffer:range"]
+
+
+def test_delta_band_says_which_way_it_failed():
+    p = make_proposal()
+    ch = make_chain(p)
+    sym = occ_symbol(p.underlying, p.expiry, p.right, p.short_strike)
+    ch[sym]["greeks"] = {"delta": -0.04}
+    assert gate(evaluate(p, chain=ch), "delta_band").codes == ["delta_band:low"]
+    ch[sym]["greeks"] = {"delta": -0.41}
+    assert gate(evaluate(p, chain=ch), "delta_band").codes == ["delta_band:high"]

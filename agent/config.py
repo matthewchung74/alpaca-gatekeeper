@@ -36,7 +36,16 @@ COMPETITION_PROFILE = "comp"
 # honest, which keeps the P&L credible to judges.
 UNIVERSE = ["SPY", "QQQ", "IWM"]
 
-STARTING_EQUITY = 100_000.0
+STARTING_EQUITY = 100_000.0          # the judged account; the frozen dashboard reads this
+
+# What each account started with. The event-drawdown gate measures from here:
+# against the old single constant the 50,000 account would have read as "down
+# 50%" and halted on its first cycle.
+_STARTING_EQUITY_BY_PROFILE = {"comp": 100_000.0, "dev": 100_000.0, "igk": 50_000.0}
+
+
+def starting_equity_for(profile: str) -> float:
+    return _STARTING_EQUITY_BY_PROFILE.get(profile, STARTING_EQUITY)
 
 
 @dataclass(frozen=True)

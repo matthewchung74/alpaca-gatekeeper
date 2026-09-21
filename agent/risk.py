@@ -75,8 +75,9 @@ def evaluate(
     ))
 
     # --- Gate 3: event drawdown ------------------------------------------
-    from .config import STARTING_EQUITY
-    dd = (equity - STARTING_EQUITY) / STARTING_EQUITY
+    from .config import starting_equity_for
+    start = starting_equity_for(profile)
+    dd = (equity - start) / start
     ok = dd > -limits.max_event_drawdown_pct
     g.append(GateResult(
         name="event_drawdown", passed=ok,
@@ -239,50 +240,62 @@ def _liquidity_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits,
     would spot a P&L built on that.
     """
     problems: list[str] = []
+    codes: set[str] = set()
     for label, strike in (("short", proposal.short_strike), ("long", proposal.long_strike)):
         sym = occ_symbol(proposal.underlying, proposal.expiry, proposal.right, strike)
         snap = chain.get(sym)
         if not snap:
             problems.append(f"{label} leg {sym} not in chain")
+            codes.add("missing")
             continue
         q = snap.get("latestQuote") or {}
         bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
         if bid <= 0 or ask <= 0:
             problems.append(f"{label} leg {sym} unquoted (bid={bid}, ask={ask})")
+            codes.add("unquoted")
             continue
         # Codex review 2026-09-18: a crossed market stamped 2020 with no open
         # interest used to pass. A quote is only a market if it is ordered,
         # recent, and someone is actually there.
         if ask < bid:
             problems.append(f"{label} leg {sym} crossed (bid {bid} > ask {ask})")
+            codes.add("crossed")
             continue
         age = _quote_age_minutes(q.get("t"), now)
         if age is None:
             problems.append(f"{label} leg {sym} quote has no timestamp")
+            codes.add("notime")
         elif age < -1.0:
             problems.append(f"{label} leg {sym} quote is timestamped {-age:.0f} min in the "
                             "future; clock or parse error, not a fresh quote")
+            codes.add("future")
         elif age > limits.max_quote_age_minutes:
             problems.append(f"{label} leg {sym} quote is stale ({age:.0f} min old)")
+            codes.add("stale")
         if float(q.get("bs") or 0) <= 0 or float(q.get("as") or 0) <= 0:
             problems.append(f"{label} leg {sym} has no displayed size")
+            codes.add("size")
         mid = (bid + ask) / 2
         if mid > 0 and (ask - bid) / mid > limits.max_spread_pct_of_mid:
             problems.append(
                 f"{label} leg {sym} spread {(ask - bid) / mid:.1%} > "
                 f"{limits.max_spread_pct_of_mid:.0%} of mid"
             )
+            codes.add("spread")
         # The chain snapshot never carries open interest; the loop fetches it
         # from the contracts endpoint before the gates. Missing fails closed:
         # for two weeks this check passed because the number was never there.
         oi = snap.get("openInterest")
         if oi is None:
             problems.append(f"{label} leg {sym} open interest unknown")
+            codes.add("oi")
         elif int(oi) < limits.min_open_interest:
             problems.append(f"{label} leg {sym} open interest {oi} < {limits.min_open_interest}")
+            codes.add("oi")
 
     if problems:
-        return GateResult(name="liquidity", passed=False, detail="; ".join(problems))
+        return GateResult(name="liquidity", passed=False, detail="; ".join(problems),
+                          codes=sorted(f"liquidity:{c}" for c in codes))
     return GateResult(name="liquidity", passed=True,
                       detail="both legs quoted with acceptable spreads")
 
@@ -319,6 +332,7 @@ def _delta_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits) -> Gat
     inside = lo <= d <= hi
     return GateResult(
         name="delta_band", passed=inside,
+        codes=[] if inside else [f"delta_band:{'low' if d < lo else 'high'}"],
         detail=(f"short {proposal.short_strike:g}{proposal.right} delta {d:.3f} "
                 f"{'within' if inside else 'OUTSIDE'} [{lo:.2f}, {hi:.2f}]"
                 + ("" if inside else
@@ -466,29 +480,33 @@ def _range_buffer_gate(proposal: TradeProposal, tape, chain: dict,
         # move is a credit-spread rule applied to the wrong structure.
         return GateResult(name="range_buffer", passed=True, detail="debit spread; not applied")
     if tape is None or tape.lookback_high is None or tape.lookback_low is None:
-        return GateResult(name="range_buffer", passed=False,
+        return GateResult(name="range_buffer", passed=False, codes=["range_buffer:nodata"],
                           detail="no completed-session range available; cannot place the strike")
     if spot is None:
-        return GateResult(name="range_buffer", passed=False,
+        return GateResult(name="range_buffer", passed=False, codes=["range_buffer:nodata"],
                           detail=f"no quote for {proposal.underlying}; cannot measure distance")
     sym = occ_symbol(proposal.underlying, proposal.expiry, proposal.right, proposal.short_strike)
     iv = (chain.get(sym) or {}).get("impliedVolatility")
     if iv is None:
-        return GateResult(name="range_buffer", passed=False,
+        return GateResult(name="range_buffer", passed=False, codes=["range_buffer:nodata"],
                           detail=f"no IV published for short leg {sym}; cannot size the expected move")
     dte = max((date.fromisoformat(proposal.expiry) - now.date()).days, 1)
     k = proposal.short_strike
     c = range_clearance(proposal.right, k, spot, float(iv), dte, tape, limits)
     dist, need = c.dist, c.need
     problems: list[str] = []
+    codes: list[str] = []
     if dist < need:
         problems.append(f"{dist:.2f} from spot < {limits.expected_move_multiple:g}x "
                         f"expected move {c.em:.2f} ({dte} DTE, IV {float(iv):.1%})")
+        codes.append("range_buffer:em")
     if c.inside:
+        codes.append("range_buffer:range")
         problems.append(f"short {k:g} inside the {limits.range_lookback}-session range "
                         f"{tape.lookback_low:.2f}-{tape.lookback_high:.2f}")
     if problems:
-        return GateResult(name="range_buffer", passed=False, detail="; ".join(problems))
+        return GateResult(name="range_buffer", passed=False, detail="; ".join(problems),
+                          codes=codes)
     return GateResult(name="range_buffer", passed=True,
                       detail=(f"short {k:g} is {dist:.2f} from spot {spot:.2f} "
                               f"(>= {need:.2f}) and outside {tape.lookback_low:.2f}-"
@@ -698,6 +716,16 @@ def _cadence_gate(proposal: TradeProposal, recent: list[dict], now: datetime,
     return GateResult(name="cadence", passed=True,
                       detail=(f"{len(opened_today)} entries today; no {proposal.underlying} "
                               f"{proposal.right} close in the last {limits.reentry_cooldown_hours}h"))
+
+
+def failure_codes(gates: list[GateResult]) -> list[str]:
+    """Every cause a proposal was refused for, sorted. A gate with one possible
+    cause reports its own name; a gate with several reports "<gate>:<cause>"."""
+    out: set[str] = set()
+    for g in gates:
+        if not g.passed:
+            out.update(g.codes or [g.name])
+    return sorted(out)
 
 
 def all_passed(gates: list[GateResult]) -> bool:
