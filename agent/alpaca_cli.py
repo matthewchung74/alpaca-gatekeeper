@@ -257,17 +257,21 @@ def daily_close(symbol: str, day: str, profile: str) -> float | None:
         return None
     if d >= date.today():
         return None
-    start = (d - timedelta(days=4)).isoformat()
+    start = (d - timedelta(days=6)).isoformat()
     end = (d + timedelta(days=1)).isoformat()             # --end is exclusive
     data = run("data", "bars", "--symbol", symbol, "--timeframe", "1Day",
                "--start", start, "--end", end, profile=profile)
+    # The LAST session at or before `day`. An option's expiration date can fall
+    # on a weekend or holiday (SPY lists a Saturday 2026-09-19), and it then
+    # settles on the prior session's close.
+    last = None
     for b in (data or {}).get("bars", []) or []:
-        if str(b.get("t", ""))[:10] == day:
+        if str(b.get("t", ""))[:10] <= day:
             try:
-                return float(b["c"])
+                last = float(b["c"])
             except (KeyError, TypeError, ValueError):
-                return None
-    return None
+                continue
+    return last
 
 
 def fills(profile: str, after: str) -> list[dict]:
