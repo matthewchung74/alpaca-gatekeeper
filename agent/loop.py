@@ -795,6 +795,14 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         profile=profile, session=session)
     print(f"  candidates: {funnel['pairs']} pairs, {funnel['survivors']} survive; "
           f"rejections {funnel['failed']}")
+    # The shadow ledger: every pair, with the claim it makes, BEFORE the model
+    # is asked. Settled against real prices after expiry; see agent/shadow.py.
+    shadow_id = None
+    if ledger_rows and not dry_run:
+        shadow_id = journal.record_shadow(
+            profile=profile, ts=now.isoformat(), expiry=expiry,
+            rules_version=int(getattr(settings, "rules_version", 0)), rows=ledger_rows)
+        print(f"  shadow ledger: {len(ledger_rows)} rows journaled ({shadow_id})")
 
     snap_book_regime = min((t.regime for t in tape.values()),
                            key=lambda r: regime.policy_for(r).size_multiplier)
@@ -837,6 +845,8 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         return 0
 
     p = decision.proposal
+    if shadow_id is not None:
+        journal.mark_shadow(shadow_id, chosen=(p.underlying, p.right, p.short_strike, p.long_strike))
     cycle_regime = tape[p.underlying].regime if p.underlying in tape else cycle_regime
     kind = "cr" if p.is_credit else "db"
     print(f"  proposal: {p.underlying} {p.expiry} {p.right} "
@@ -1001,6 +1011,8 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
             print(f"  PARTIAL FILL: {fill['qty']} of {decision.proposal.qty} -- "
                   "journaling the size actually held")
         journal.record_spread(profile=profile, proposal=p, order_id=order_id)
+        if shadow_id is not None:
+            journal.mark_shadow(shadow_id, traded=(p.underlying, p.right, p.short_strike, p.long_strike))
     elif not dry_run:
         journal.record_spread(profile=profile, proposal=p, order_id=order_id)
     journal.record_cycle(

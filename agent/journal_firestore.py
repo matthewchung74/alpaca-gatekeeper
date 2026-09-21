@@ -20,6 +20,7 @@ from typing import Any
 from google.cloud import firestore
 
 LOCKS = "locks"
+SHADOW = "shadow"
 CYCLES = "cycles"
 MARKS = "marks"
 SPREADS = "spreads"
@@ -142,6 +143,51 @@ class FirestoreJournal:
                 t.delete(ref)
 
         _drop(txn)
+
+    # --- the shadow ledger ---------------------------------------------------
+
+    def record_shadow(self, *, profile: str, ts: str, expiry: str, rules_version: int,
+                      rows: list[dict]) -> str:
+        ref = self.db.collection(SHADOW).document()
+        ref.set({"ts": ts, "profile": profile, "expiry": expiry, "rules_version": rules_version,
+                 "rows": json.dumps(rows, default=str), "settled_at": None})
+        return ref.id
+
+    def mark_shadow(self, shadow_id, *, chosen=None, traded=None) -> None:
+        from .journal import _mark
+        ref = self.db.collection(SHADOW).document(str(shadow_id))
+        snap = ref.get()
+        if not snap.exists:
+            return
+        rows = _mark(json.loads((snap.to_dict() or {}).get("rows") or "[]"), chosen, traded)
+        ref.update({"rows": json.dumps(rows)})
+
+    def unsettled_shadow(self, profile: str, on_or_before: str) -> list[dict]:
+        # Single-field filter, narrowed in Python: no composite index needed.
+        docs = self.db.collection(SHADOW).where(
+            filter=firestore.FieldFilter("profile", "==", profile)).stream()
+        out = []
+        for d in docs:
+            doc = {**d.to_dict(), "id": d.id}
+            if doc.get("settled_at") is None and str(doc.get("expiry")) <= on_or_before:
+                doc["rows"] = json.loads(doc.get("rows") or "[]")
+                out.append(doc)
+        return sorted(out, key=lambda x: x.get("ts") or "")
+
+    def settle_shadow(self, shadow_id, rows: list[dict]) -> None:
+        self.db.collection(SHADOW).document(str(shadow_id)).update(
+            {"rows": json.dumps(rows, default=str), "settled_at": _now()})
+
+    def settled_shadow(self, profile: str, since: str | None = None) -> list[dict]:
+        docs = self.db.collection(SHADOW).where(
+            filter=firestore.FieldFilter("profile", "==", profile)).stream()
+        out = []
+        for d in docs:
+            doc = {**d.to_dict(), "id": d.id}
+            if doc.get("settled_at") and (doc.get("ts") or "") >= (since or ""):
+                doc["rows"] = json.loads(doc.get("rows") or "[]")
+                out.append(doc)
+        return sorted(out, key=lambda x: x.get("ts") or "")
 
     def reduce_spread(self, spread_id, *, qty: int, realized_pnl: float) -> None:
         """A partial close: fewer contracts remain, and some P&L is banked."""

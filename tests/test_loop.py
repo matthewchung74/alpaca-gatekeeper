@@ -449,3 +449,70 @@ def test_expiry_lookup_pages_past_the_first_expiry(monkeypatch):
     got = cli.list_expiries("SPY", "dev", "2026-09-28", "2026-10-08")
     assert got == ["2026-09-28", "2026-09-30", "2026-10-02"]
     assert "type=call" in seen[0] and "expiration_date_lte=2026-10-08" in seen[0] and len(seen) == 2
+
+
+# --- the shadow ledger lives in the journal ------------------------------------
+
+def _rows():
+    return [dict(u="SPY", r="P", ks=740.0, kl=735.0, w=5, cr=1.10, nat=1.05, d=0.15, iv=0.15,
+                 oi=2000, spr=0.03, emr=1.2, spot=760.0, fail=[], chosen=False, traded=False),
+            dict(u="SPY", r="C", ks=781.0, kl=783.0, w=2, cr=0.30, nat=0.28, d=0.17, iv=0.15,
+                 oi=250, spr=0.04, emr=1.3, spot=760.0, fail=["liquidity:oi"], chosen=False, traded=False)]
+
+
+def test_shadow_ledger_round_trips_and_marks_one_row(tmp_path):
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    sid = j.record_shadow(profile="dev", ts="2026-09-21T13:46:00+00:00", expiry="2026-10-02",
+                          rules_version=3, rows=_rows())
+    j.mark_shadow(sid, chosen=("SPY", "P", 740.0, 735.0))
+    j.mark_shadow(sid, traded=("SPY", "P", 740.0, 735.0))
+    docs = j.unsettled_shadow("dev", on_or_before="2026-10-02")
+    assert len(docs) == 1 and docs[0]["id"] == sid and docs[0]["rules_version"] == 3
+    rows = docs[0]["rows"]
+    assert rows[0]["chosen"] and rows[0]["traded"] and not rows[1]["chosen"]
+    assert j.unsettled_shadow("dev", on_or_before="2026-10-01") == []          # not yet expired
+    assert j.unsettled_shadow("comp", on_or_before="2026-10-02") == []         # other account
+
+
+def test_settled_documents_leave_the_unsettled_set(tmp_path):
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    sid = j.record_shadow(profile="dev", ts="2026-09-21T13:46:00+00:00", expiry="2026-10-02",
+                          rules_version=1, rows=_rows())
+    settled = [dict(r, held=True, v_exp=0.0, ret_hold=0.28, ret_mgd=0.14, mgd_rule="profit_target")
+               for r in _rows()]
+    j.settle_shadow(sid, settled)
+    assert j.unsettled_shadow("dev", on_or_before="2026-12-31") == []
+    got = j.settled_shadow("dev")
+    assert len(got) == 1 and got[0]["rows"][0]["ret_hold"] == 0.28 and got[0]["settled_at"]
+
+
+def test_the_entry_cycle_journals_the_ledger_and_marks_the_pick(tmp_path, monkeypatch):
+    from agent.models import AgentDecision
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    today = datetime.now(ET)
+    from datetime import timedelta as _td
+    bars = [{"t": (today - _td(days=14 - i)).strftime("%Y-%m-%dT04:00:00Z"),
+             "o": 760, "h": 770, "l": 750, "c": 760} for i in range(12)]
+    obs = _account_obs(100_000, 0)
+    obs["bars"] = {"SPY": bars}
+    obs["chains"] = {"SPY": {}}
+    proposal = TradeProposal(underlying="SPY", expiry="2026-09-10", right="C", short_strike=780.0,
+                             long_strike=785.0, qty=2, net_price=0.60, sleeve="core", rationale="t")
+
+    class FakeBrain:
+        def __init__(self, **kw): pass
+        def preflight(self): pass
+        def decide(self, snapshot, limits):
+            return AgentDecision(reasoning="r", proposal=proposal)
+
+    monkeypatch.setattr(loop, "Brain", FakeBrain)
+    monkeypatch.setattr(loop.cand, "enumerate_candidates", lambda **kw: ([], {"pairs": 2, "survivors": 0, "failed": {}}, [
+        dict(u="SPY", r="C", ks=780.0, kl=785.0, w=5, cr=0.6, nat=0.55, d=0.15, iv=0.15, oi=900,
+             spr=0.03, emr=1.1, spot=760.0, fail=[], chosen=False, traded=False)]))
+    sent, _ = _wire(monkeypatch, [obs], fills=[(2, 0.60)])
+    loop._cycle_body(Settings(profile="dev"), j, manage_only=False)
+    docs = j.unsettled_shadow("dev", on_or_before="2026-12-31")
+    assert len(docs) == 1
+    row = docs[0]["rows"][0]
+    assert row["chosen"] is True
+    assert row["traded"] is (len(sent) == 1)

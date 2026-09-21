@@ -72,6 +72,19 @@ CREATE TABLE IF NOT EXISTS locks (
     holder   TEXT NOT NULL,
     expires  REAL NOT NULL           -- unix seconds
 );
+
+-- The shadow ledger: every candidate spread each entry cycle saw, traded or
+-- not, with the claim it registered, settled later against real prices.
+CREATE TABLE IF NOT EXISTS shadow (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    profile       TEXT NOT NULL,
+    expiry        TEXT NOT NULL,
+    rules_version INTEGER NOT NULL DEFAULT 0,
+    rows          TEXT NOT NULL,      -- JSON list
+    settled_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_open ON shadow(profile, settled_at, expiry);
 """
 
 
@@ -189,6 +202,45 @@ class SQLiteJournal:
         with self._conn() as c:
             c.execute("DELETE FROM locks WHERE name = ? AND holder = ?", (name, holder))
 
+    # --- the shadow ledger ---------------------------------------------------
+
+    def record_shadow(self, *, profile: str, ts: str, expiry: str, rules_version: int,
+                      rows: list[dict]) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO shadow (ts, profile, expiry, rules_version, rows) VALUES (?,?,?,?,?)",
+                (ts, profile, expiry, rules_version, json.dumps(rows, default=str)))
+            return cur.lastrowid
+
+    def mark_shadow(self, shadow_id, *, chosen=None, traded=None) -> None:
+        """Flag the row matching (u, r, ks, kl) as the model's pick, or as filled."""
+        with self._conn() as c:
+            row = c.execute("SELECT rows FROM shadow WHERE id = ?", (shadow_id,)).fetchone()
+            if not row:
+                return
+            rows = _mark(json.loads(row["rows"]), chosen, traded)
+            c.execute("UPDATE shadow SET rows = ? WHERE id = ?", (json.dumps(rows), shadow_id))
+
+    def unsettled_shadow(self, profile: str, on_or_before: str) -> list[dict]:
+        with self._conn() as c:
+            found = c.execute(
+                "SELECT * FROM shadow WHERE profile = ? AND settled_at IS NULL AND expiry <= ? "
+                "ORDER BY id", (profile, on_or_before)).fetchall()
+        return [_shadow_doc(r) for r in found]
+
+    def settle_shadow(self, shadow_id, rows: list[dict]) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE shadow SET rows = ?, settled_at = ? WHERE id = ?",
+                      (json.dumps(rows, default=str), datetime.now().astimezone().isoformat(),
+                       shadow_id))
+
+    def settled_shadow(self, profile: str, since: str | None = None) -> list[dict]:
+        with self._conn() as c:
+            found = c.execute(
+                "SELECT * FROM shadow WHERE profile = ? AND settled_at IS NOT NULL "
+                "AND ts >= ? ORDER BY id", (profile, since or "")).fetchall()
+        return [_shadow_doc(r) for r in found]
+
     def reduce_spread(self, spread_id, *, qty: int, realized_pnl: float) -> None:
         """A partial close: fewer contracts remain, and some P&L is banked."""
         with self._conn() as c:
@@ -243,6 +295,24 @@ class SQLiteJournal:
                     "ORDER BY id ASC LIMIT 1", (f"{day}%", profile),
                 ).fetchone()
         return row["equity"] if row else None
+
+
+def _mark(rows: list[dict], chosen, traded) -> list[dict]:
+    for flag, key in (("chosen", chosen), ("traded", traded)):
+        if key is None:
+            continue
+        u, r, ks, kl = key
+        for row in rows:
+            if (row.get("u"), row.get("r"), float(row.get("ks")), float(row.get("kl"))) == \
+                    (u, r, float(ks), float(kl)):
+                row[flag] = True
+    return rows
+
+
+def _shadow_doc(r) -> dict:
+    d = dict(r)
+    d["rows"] = json.loads(d["rows"]) if isinstance(d.get("rows"), str) else (d.get("rows") or [])
+    return d
 
 
 def _dumps(v: Any) -> str | None:
