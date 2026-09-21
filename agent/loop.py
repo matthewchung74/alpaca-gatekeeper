@@ -789,7 +789,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     recent_spreads = [r for r in journal.all_spreads(profile)
                       if (r.get("ts_open") or "") >= (now - timedelta(days=7)).strftime("%Y-%m-%d")]
 
-    found, funnel = cand.enumerate_candidates(
+    found, funnel, ledger_rows = cand.enumerate_candidates(
         chains=obs["chains"], quotes=obs["quotes"], tape=tape, sides=sides, now=now,
         expiry=expiry, limits=settings.limits, open_spreads=journal.open_spreads(profile),
         profile=profile, session=session)

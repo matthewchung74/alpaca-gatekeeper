@@ -40,7 +40,9 @@ def run(ch, **kw):
                 tape={"SPY": tape()}, sides={"SPY": ("P", "C")}, now=NOW, expiry=EXPIRY,
                 limits=LIMITS, open_spreads=[], profile="dev")
     args.update(kw)
-    return candidates.enumerate_candidates(**args)
+    found, funnel, rows = candidates.enumerate_candidates(**args)
+    run.rows = rows
+    return found, funnel
 
 
 def test_survivors_clear_every_shape_gate_and_sit_beyond_the_range():
@@ -79,3 +81,35 @@ def test_the_snapshot_lists_candidates_and_the_funnel():
     text = "\n".join(candidates.render(found, funnel, per_side=3))
     assert "ELIGIBLE CANDIDATES" in text and "SPY" in text and "survive" in text
     assert "range_buffer" in text
+
+
+# --- the shadow ledger rows ------------------------------------------------------
+
+def test_every_pair_becomes_a_ledger_row_with_its_failure_codes():
+    # bottom of the range: the tape forbids short calls, and so must the rows say
+    found, funnel = run(chain(), tape={"SPY": tape(range_position=0.05)}, sides={"SPY": ("P",)})
+    rows = run.rows
+    assert len(rows) > funnel["pairs"]                      # both sides and a wider delta range
+    calls = [r for r in rows if r["r"] == "C"]
+    assert calls and all("regime_direction" in r["fail"] for r in calls)      # refused, but recorded
+    assert {(c.right, c.short_strike, c.long_strike) for c in found} == \
+           {(r["r"], r["ks"], r["kl"]) for r in rows if not r["fail"]}
+    assert all(r["chosen"] is False and r["traded"] is False for r in rows)
+
+
+def test_ledger_rows_carry_the_metrics_the_learning_step_needs():
+    run(chain(oi=lambda k: 250 if k == 783 else 900))
+    r = next(x for x in run.rows if x["r"] == "C" and x["ks"] == 781 and x["kl"] == 783)
+    assert r["u"] == "SPY" and r["w"] == 2 and r["spot"] == 760.0
+    assert r["oi"] == 250                                   # the thinner leg
+    assert 0 < r["spr"] < 0.10 and r["iv"] == 0.15 and 0.05 < r["d"] < 0.45
+    assert r["emr"] > 1.0                                   # 21 points out against a ~19.7 expected move
+    assert r["cr"] > 0 and r["nat"] <= r["cr"]
+    assert "liquidity:oi" in r["fail"]
+
+
+def test_deltas_outside_the_live_band_are_recorded_but_never_offered():
+    found, _ = run(chain())
+    near = [r for r in run.rows if r["d"] > LIMITS.max_short_delta]
+    assert near and all("delta_band:high" in r["fail"] for r in near)
+    assert all(c.short_delta <= LIMITS.max_short_delta for c in found)

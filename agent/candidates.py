@@ -28,6 +28,9 @@ from .models import TradeProposal, parse_strike
 SHAPE_GATES = ("universe", "expiry", "defined_risk", "price_sanity", "regime_direction",
                "liquidity", "delta_band", "range_buffer", "credit_floor", "leg_overlap")
 MAX_WIDTH = 5.0          # the prompt's 2-5 point guidance; wider pays too little per point
+# The ledger looks wider than the live band on purpose: a gate can only be
+# judged against what it refused, so the refused set has to be recorded.
+LEDGER_DELTA = (0.05, 0.45)
 
 
 @dataclass(frozen=True)
@@ -55,23 +58,33 @@ def _mid(q: dict) -> float | None:
 def enumerate_candidates(*, chains: dict, quotes: dict, tape: dict, sides: dict,
                          now: datetime, expiry: str, limits: RiskLimits,
                          open_spreads: list[dict], profile: str,
-                         session: tuple | None = None) -> tuple[list[Candidate], dict]:
-    """Every permitted vertical up to MAX_WIDTH wide, and why the rest failed."""
+                         session: tuple | None = None) -> tuple[list[Candidate], dict, list[dict]]:
+    """Every vertical up to MAX_WIDTH wide, on BOTH sides and across the ledger
+    delta range: the survivors (the model's menu), the funnel (why the rest
+    failed, on the permitted sides), and one ledger row per pair.
+
+    `found` and `funnel` describe what the live rules permit. `rows` also
+    covers the sides and deltas the rules refuse, so every gate has a refused
+    set the shadow ledger can score later.
+    """
     found: list[Candidate] = []
     failed: Counter = Counter()
+    rows: list[dict] = []
     pairs = 0
+    spot_by: dict[str, float | None] = {sym: _mid(quotes.get(sym) or {}) for sym in chains}
     for sym, chain in chains.items():
         by_right: dict[str, dict[float, dict]] = {"P": {}, "C": {}}
         for osym, snap in chain.items():
             if len(osym) > len(sym) + 6 and osym.startswith(sym):
                 by_right[osym[len(sym) + 6]][parse_strike(osym)] = snap
-        for right in sides.get(sym, ()):
+        for right in ("P", "C"):
+            permitted = right in sides.get(sym, ())
             strikes = by_right.get(right, {})
             for k_short, short in strikes.items():
                 delta = (short.get("greeks") or {}).get("delta")
-                if delta is None or not (limits.min_short_delta <= abs(float(delta))
-                                         <= limits.max_short_delta):
-                    continue            # outside the band the chain is filtered to anyway
+                if delta is None or not (LEDGER_DELTA[0] <= abs(float(delta)) <= LEDGER_DELTA[1]):
+                    continue
+                in_band = limits.min_short_delta <= abs(float(delta)) <= limits.max_short_delta
                 for k_long, long_ in strikes.items():
                     width = (k_long - k_short) if right == "C" else (k_short - k_long)
                     if not (0 < width <= MAX_WIDTH):
@@ -79,11 +92,12 @@ def enumerate_candidates(*, chains: dict, quotes: dict, tape: dict, sides: dict,
                     ms, ml = _mid(short.get("latestQuote") or {}), _mid(long_.get("latestQuote") or {})
                     if ms is None or ml is None or ms - ml <= 0:
                         continue
-                    pairs += 1
                     credit = round(ms - ml, 2)
                     if credit <= 0:
-                        failed["price_sanity"] += 1
                         continue
+                    live = permitted and in_band
+                    if live:
+                        pairs += 1
                     p = TradeProposal(underlying=sym, expiry=expiry, right=right,
                                       short_strike=k_short, long_strike=k_long, qty=1,
                                       net_price=credit, sleeve="core", rationale="candidate")
@@ -92,12 +106,29 @@ def enumerate_candidates(*, chains: dict, quotes: dict, tape: dict, sides: dict,
                         open_positions=[], chain=chain, limits=limits, quotes=quotes,
                         target_expiry=expiry, open_spreads=open_spreads,
                         tape=tape.get(sym), session=session)
-                    bad = [g.name for g in gates if g.name in SHAPE_GATES and not g.passed]
+                    shape = [g for g in gates if g.name in SHAPE_GATES]
+                    bad = [g.name for g in shape if not g.passed]
+                    sq, lq = short["latestQuote"], long_["latestQuote"]
+                    spot = spot_by.get(sym)
+                    dist = (k_short - spot) if right == "C" else (spot - k_short)
+                    em = _expected_move(spot, short.get("impliedVolatility"), expiry, now)
+                    rows.append({
+                        "u": sym, "r": right, "ks": k_short, "kl": k_long, "w": width,
+                        "cr": credit, "nat": round(float(sq["bp"]) - float(lq["ap"]), 2),
+                        "d": round(abs(float(delta)), 3),
+                        "iv": short.get("impliedVolatility"),
+                        "oi": min(int(short.get("openInterest") or 0), int(long_.get("openInterest") or 0)),
+                        "spr": round(max(_rel_spread(sq), _rel_spread(lq)), 4),
+                        "emr": round(dist / em, 3) if em else None,
+                        "spot": spot, "fail": risk.failure_codes(shape),
+                        "chosen": False, "traded": False,
+                    })
+                    if not live:
+                        continue
                     for name in bad:
                         failed[name] += 1
                     if bad:
                         continue
-                    sq, lq = short["latestQuote"], long_["latestQuote"]
                     found.append(Candidate(
                         underlying=sym, right=right, short_strike=k_short, long_strike=k_long,
                         width=width, credit=credit,
@@ -106,7 +137,26 @@ def enumerate_candidates(*, chains: dict, quotes: dict, tape: dict, sides: dict,
                         short_oi=int(short.get("openInterest") or 0),
                         long_oi=int(long_.get("openInterest") or 0)))
     found.sort(key=lambda c: (c.underlying, c.right, -c.credit / c.width))
-    return found, {"pairs": pairs, "survivors": len(found), "failed": dict(failed)}
+    return found, {"pairs": pairs, "survivors": len(found), "failed": dict(failed)}, rows
+
+
+def _rel_spread(q: dict) -> float:
+    try:
+        bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
+    except (TypeError, ValueError):
+        return 1.0
+    mid = (bid + ask) / 2
+    return (ask - bid) / mid if mid > 0 else 1.0
+
+
+def _expected_move(spot, iv, expiry: str, now: datetime) -> float | None:
+    from datetime import date
+    import math
+    try:
+        dte = max((date.fromisoformat(expiry) - now.date()).days, 1)
+        return float(spot) * float(iv) * math.sqrt(dte / 365.0)
+    except (TypeError, ValueError):
+        return None
 
 
 def render(found: list[Candidate], funnel: dict, per_side: int = 6) -> list[str]:
