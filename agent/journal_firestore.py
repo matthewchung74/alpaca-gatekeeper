@@ -21,6 +21,7 @@ from google.cloud import firestore
 
 LOCKS = "locks"
 SHADOW = "shadow"
+RULES = "rules"
 CYCLES = "cycles"
 MARKS = "marks"
 SPREADS = "spreads"
@@ -143,6 +144,18 @@ class FirestoreJournal:
                 t.delete(ref)
 
         _drop(txn)
+
+    # --- rules versions --------------------------------------------------------
+
+    def get_rules(self, profile: str) -> dict | None:
+        snap = self.db.collection(RULES).document(profile).get()
+        if not snap.exists:
+            return None
+        return json.loads((snap.to_dict() or {}).get("doc") or "null")
+
+    def put_rules(self, profile: str, doc: dict) -> None:
+        self.db.collection(RULES).document(profile).set(
+            {"doc": json.dumps(doc, default=str), "ts": _now()})
 
     # --- the shadow ledger ---------------------------------------------------
 

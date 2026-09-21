@@ -168,6 +168,18 @@ class RiskLimits:
     itm_flatten_buffer: float = 0.50        # in dollars of underlying price
     flatten_minutes_before_close: int = 30
 
+    # --- Learning (agent/learning.py) ---
+    # The shadow ledger may move ONE tunable gate parameter ONE ladder step
+    # when the refused (or marginal admitted) set has this much independent
+    # evidence and beats the comparison set with one-sided 95% confidence.
+    # The change is then judged on data collected after it, and reverted and
+    # locked if the newly admitted band loses money. Measured in effective n
+    # (clusters of underlying x side x expiry), not rows.
+    learn_enabled: bool = True
+    learn_min_n: float = 20.0
+    learn_min_review_n: float = 8.0
+    learn_lock_days: int = 56
+
 
 @dataclass(frozen=True)
 class Settings:

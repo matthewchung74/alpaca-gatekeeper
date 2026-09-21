@@ -85,6 +85,11 @@ CREATE TABLE IF NOT EXISTS shadow (
     settled_at    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_open ON shadow(profile, settled_at, expiry);
+
+CREATE TABLE IF NOT EXISTS rules (
+    profile  TEXT PRIMARY KEY,
+    doc      TEXT NOT NULL            -- JSON: version, overrides, in_flight, locks, history
+);
 """
 
 
@@ -201,6 +206,18 @@ class SQLiteJournal:
     def release_lock(self, name: str, holder: str) -> None:
         with self._conn() as c:
             c.execute("DELETE FROM locks WHERE name = ? AND holder = ?", (name, holder))
+
+    # --- rules versions --------------------------------------------------------
+
+    def get_rules(self, profile: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT doc FROM rules WHERE profile = ?", (profile,)).fetchone()
+        return json.loads(row["doc"]) if row else None
+
+    def put_rules(self, profile: str, doc: dict) -> None:
+        with self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO rules (profile, doc) VALUES (?, ?)",
+                      (profile, json.dumps(doc, default=str)))
 
     # --- the shadow ledger ---------------------------------------------------
 
