@@ -190,6 +190,7 @@ def build_snapshot(
     recent_spreads: list[dict] | None = None,
     candidate_lines: list[str] | None = None,
     book_lines: list[str] | None = None,
+    base_rates: dict | None = None,
 ) -> str:
     """Render the market state as text for the model.
 
@@ -339,6 +340,21 @@ def build_snapshot(
 
     lines += book_lines or []
     lines += candidate_lines or []
+
+    # What this account's own settled ledger says about claims like these.
+    # Information for the model; no gate reads it.
+    if base_rates is not None:
+        lines += ["", "MEASURED BASE RATES (this account's settled shadow ledger; information, not a rule):"]
+        shown = 0
+        for bucket, c in base_rates.items():
+            if c.get("n_eff", 0) < limits.learn_min_n:
+                continue
+            shown += 1
+            lines.append(f"  delta {bucket}: claims held {c['realized_hold']:.0%} of the time, market priced "
+                         f"{c['implied_hold']:.0%} (edge {c['edge']:+.0%}); mean return per $ risked "
+                         f"{c['mean_ret_hold']:+.2f}; effective n {c['n_eff']:.0f}")
+        if not shown:
+            lines.append("  not enough data yet to say anything")
 
     lines += [
         "",

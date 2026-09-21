@@ -17,6 +17,8 @@ from datetime import datetime, timedelta
 
 from . import alpaca_cli as cli
 from . import candidates as cand
+from . import rules as rules_mod
+from . import sizing
 from . import regime
 from . import risk
 from .regime import TapeRead, classify, core_sides
@@ -439,6 +441,21 @@ def final_observation(journal, profile: str, expiry: str, p, now, limits) -> dic
             "marks": current_marks(journal, profile, obs["positions"])}
 
 
+def size_multiplier(journal, profile: str, equity: float) -> tuple[float, str]:
+    """The size ladder's multiplier for this account, from its own closed record."""
+    closed = [s for s in journal.all_spreads(profile) if s.get("status") == "closed"]
+    closes: dict = {}
+    for s in closed:
+        key = (s.get("underlying"), s.get("expiry"))
+        if key not in closes:
+            try:
+                closes[key] = cli.daily_close(key[0], key[1], profile)
+            except cli.CLIError:
+                closes[key] = None
+    peak = max([equity] + [float(m.get("equity") or 0) for m in journal.equity_curve(profile)])
+    return sizing.tier(closed=closed, closes=closes, equity=equity, peak=peak)
+
+
 def day_start_equity(acct: dict, first_mark: float | None) -> float | None:
     """The day's baseline: the broker's prior close, else the first mark.
 
@@ -631,6 +648,13 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
     ten minutes off); a cycle waits up to 90 seconds for a sweep to finish.
     """
     journal = open_journal(settings.journal_path)
+    # The rules version: base limits plus this account's learned overrides,
+    # resolved once per run so a cycle and its sweeps agree on the dials.
+    from dataclasses import replace
+    limits, version = rules_mod.limits_for(journal, settings.profile, settings.limits)
+    settings = replace(settings, limits=limits, rules_version=version)
+    if version:
+        print(f"  rules version {version} in force")
     if dry_run:
         return _cycle_body(settings, journal, dry_run=True, manage_only=manage_only)
     profile = settings.profile
@@ -801,7 +825,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     if ledger_rows and not dry_run:
         shadow_id = journal.record_shadow(
             profile=profile, ts=now.isoformat(), expiry=expiry,
-            rules_version=int(getattr(settings, "rules_version", 0)), rows=ledger_rows)
+            rules_version=int(settings.rules_version), rows=ledger_rows)
         print(f"  shadow ledger: {len(ledger_rows)} rows journaled ({shadow_id})")
 
     snap_book_regime = min((t.regime for t in tape.values()),
@@ -817,13 +841,22 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     book_lines.append(f"  book regime (most defensive read in the universe): {snap_book_regime}; "
                       f"{len(open_now)} of max {settings.limits.max_concurrent_positions} spreads open")
 
+    try:
+        from . import shadow_stats
+        settled = journal.settled_shadow(profile)
+        base_rates = shadow_stats.calibration(
+            [dict(r, expiry=d.get("expiry")) for d in settled for r in (d.get("rows") or [])])
+    except Exception as e:  # noqa: BLE001 - base rates are information, never a reason to skip a cycle
+        print(f"  warn: base rates unavailable: {e}", file=sys.stderr)
+        base_rates = {}
+
     snapshot = build_snapshot(
         now=now, equity=equity, day_start_equity=day_start,
         positions=obs["positions"], quotes=obs["quotes"], chains=obs["chains"],
         bars=obs.get("bars", {}), news=obs.get("news", []),
         limits=settings.limits, target_expiry=expiry, tape=tape, sides=sides,
         recent_spreads=recent_spreads, candidate_lines=cand.render(found, funnel),
-        book_lines=book_lines,
+        book_lines=book_lines, base_rates=base_rates,
     )
 
     try:
@@ -897,7 +930,9 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         equity=equity, regime=cycle_regime, book_regime=book_regime,
         open_spreads=journal.open_spreads(profile), right=p.right, sleeve=p.sleeve,
         limits=settings.limits)
-    print(f"  {room_note}")
+    mult, why = size_multiplier(journal, profile, equity)
+    room *= mult
+    print(f"  {room_note}; size ladder x{mult:g} ({why}) -> room {room:,.0f}")
     eff_pct = room / equity if equity > 0 else 0.0
     fresh_qty, note = regime.resize_to_budget(p, equity=equity, effective_pct=eff_pct)
     if fresh_qty != p.qty:

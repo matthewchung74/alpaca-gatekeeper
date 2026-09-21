@@ -188,6 +188,7 @@ class Settings:
     journal_path: str = field(
         default_factory=lambda: os.environ.get("JOURNAL_PATH", "data/journal.db"))
     model: str = "claude-opus-5"
+    rules_version: int = 0                  # set per run from the journal (agent/rules.py)
 
     @property
     def is_competition(self) -> bool:

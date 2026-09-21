@@ -417,3 +417,16 @@ def test_snapshot_shows_the_room_left_in_the_book():
         positions=[], quotes={}, chains={}, bars={}, news=[], limits=LIMITS,
         book_lines=["", "BOOK (binding):", "  open max loss 5,853 of book budget 8,400; room 2,547"])
     assert "BOOK (binding):" in out and "room 2,547" in out
+
+
+def test_snapshot_shows_measured_base_rates_only_with_enough_data():
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    thin = {"0.10-0.20": {"n": 6, "n_eff": 2.0, "implied_hold": 0.85, "realized_hold": 1.0, "edge": 0.15, "mean_ret_hold": 0.2}}
+    out = build_snapshot(now=datetime(2026, 9, 22, 9, 46, tzinfo=ET), equity=50_000.0, day_start_equity=50_000.0,
+                         positions=[], quotes={}, chains={}, bars={}, news=[], limits=LIMITS, base_rates=thin)
+    assert "MEASURED BASE RATES" in out and "not enough data" in out and "85%" not in out
+    solid = {"0.10-0.20": {"n": 90, "n_eff": 24.0, "implied_hold": 0.85, "realized_hold": 0.90, "edge": 0.05, "mean_ret_hold": 0.12}}
+    out = build_snapshot(now=datetime(2026, 9, 22, 9, 46, tzinfo=ET), equity=50_000.0, day_start_equity=50_000.0,
+                         positions=[], quotes={}, chains={}, bars={}, news=[], limits=LIMITS, base_rates=solid)
+    assert "delta 0.10-0.20" in out and "held 90%" in out and "market priced 85%" in out

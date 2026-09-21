@@ -516,3 +516,41 @@ def test_the_entry_cycle_journals_the_ledger_and_marks_the_pick(tmp_path, monkey
     row = docs[0]["rows"][0]
     assert row["chosen"] is True
     assert row["traded"] is (len(sent) == 1)
+
+
+# --- the loop trades on the rules version, not the base config -----------------
+
+def test_a_run_applies_the_journaled_rules_version(tmp_path, monkeypatch):
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    j.put_rules("dev", {"version": 4, "overrides": {"min_open_interest": 300}, "in_flight": None,
+                        "locks": {}, "history": []})
+    monkeypatch.setattr(loop, "open_journal", lambda path=None: j)
+    seen = {}
+    monkeypatch.setattr(loop, "_cycle_body", lambda settings, journal, **kw: seen.update(
+        oi=settings.limits.min_open_interest, version=settings.rules_version) or 0)
+    assert loop.run_cycle(Settings(profile="dev"), manage_only=True) == 0
+    assert seen == {"oi": 300, "version": 4}
+
+
+def test_the_ledger_is_stamped_with_the_rules_version(tmp_path, monkeypatch):
+    from agent.models import AgentDecision
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    j.put_rules("dev", {"version": 7, "overrides": {}, "in_flight": None, "locks": {}, "history": []})
+    obs = _account_obs(100_000, 0)
+    obs["chains"] = {"SPY": {}}
+
+    class FakeBrain:
+        def __init__(self, **kw): pass
+        def preflight(self): pass
+        def decide(self, snapshot, limits):
+            return AgentDecision(reasoning="r", proposal=None)
+
+    monkeypatch.setattr(loop, "Brain", FakeBrain)
+    monkeypatch.setattr(loop.cand, "enumerate_candidates", lambda **kw: ([], {"pairs": 1, "survivors": 0, "failed": {}}, [
+        dict(u="SPY", r="C", ks=780.0, kl=785.0, w=5, cr=0.6, nat=0.55, d=0.15, iv=0.15, oi=900,
+             spr=0.03, emr=1.1, spot=760.0, fail=[], chosen=False, traded=False)]))
+    _wire(monkeypatch, [obs], fills=[])
+    from dataclasses import replace
+    s = replace(Settings(profile="dev"), rules_version=7)
+    loop._cycle_body(s, j, manage_only=False)
+    assert j.unsettled_shadow("dev", "2026-12-31")[0]["rules_version"] == 7
