@@ -284,3 +284,37 @@ Link for the comments: https://github.com/matthewchung74/alpaca-gatekeeper/tree/
 > Repo in the comments.
 >
 > #AITrading #AlpacaMarkets #lablab #Claude #BuildInPublic
+
+
+---
+
+## Post — I read everyone else's code · DRAFT 2026-09-21 (in the LinkedIn composer, not published)
+
+Link in the post: https://github.com/matthewchung74/alpaca-gatekeeper/tree/improved-gatekeeper
+
+### LinkedIn
+
+> My trading bot is losing money, so I did what any engineer would do: read everyone else's code.
+>
+> Quick recap. I built an options-trading agent for the Alpaca × lablab.ai hackathon. An LLM proposes a credit spread, deterministic Python gates decide if it's allowed to exist. Three weeks in, two paper accounts, both down about 2%. The controls work. The strategy has not proven it does.
+>
+> So I went through seven other entries, including the most-voted ones, and read the actual code, not the READMEs. Some highlights:
+>
+> • Three had no AI in the trading loop. The "AI" was if-statements with a nice logo.
+> • One backtested with random numbers. Literally np.random.
+> • Three traded plain stocks. In an options-only competition.
+> • All seven were missing the exact thing mine is missing: any proof the strategy has an edge.
+>
+> But two had ideas good enough to steal.
+>
+> 🔎 VegaGuard's shadow ledger. It journals every trade it considered and rejected, then checks later what those would have done. My bot now records about 250 spreads it did NOT take every cycle and grades them at expiry. For the first time I can ask each safety gate: are you saving me money, or costing me trades that would have won?
+>
+> 🎯 Theo's honesty grid. Every trade gets two grades: was the view right, and was the structure right. A trade that profits despite a wrong view is labeled luck, and luck teaches the bot nothing. Copied verbatim in spirit.
+>
+> Then I went one step further. The bot now tunes its own gates: one dial, one notch, only after roughly a month of evidence, and it reverts the change if the newly admitted trades lose. No LLM anywhere in that loop. Just arithmetic and patience. Size is earned the same way, and lucky wins buy no size.
+>
+> Still paper. Still no edge shown. But now it can measure, which beats guessing.
+>
+> Code: https://github.com/matthewchung74/alpaca-gatekeeper/tree/improved-gatekeeper
+>
+> #AITrading #AlpacaMarkets #lablab #BuildInPublic #Claude
