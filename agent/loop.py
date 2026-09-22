@@ -1042,8 +1042,8 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
             "qty": fill["qty"],
             "net_price": fill["credit"] if fill["credit"] is not None else p.net_price,
         })
-        if fill["qty"] < decision.proposal.qty:
-            print(f"  PARTIAL FILL: {fill['qty']} of {decision.proposal.qty} -- "
+        if fill["qty"] < requested.qty:
+            print(f"  PARTIAL FILL: {fill['qty']} of {requested.qty} -- "
                   "journaling the size actually held")
         journal.record_spread(profile=profile, proposal=p, order_id=order_id)
         if shadow_id is not None:
