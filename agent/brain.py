@@ -137,7 +137,7 @@ def _boundary_line(sym: str, read: TapeRead, quote: dict, chain: dict, now,
 
 
 class Brain:
-    def __init__(self, model: str = "claude-opus-5", client: anthropic.Anthropic | None = None):
+    def __init__(self, model: str = "claude-opus-5-5", client: anthropic.Anthropic | None = None):
         self.model = model
         self.client = client or anthropic.Anthropic()
 
@@ -148,9 +148,12 @@ class Brain:
         then died on 'credit balance is too low'. Check the API before paying
         for any of that. Raises the SDK's own exception on failure.
         """
+        # Adaptive thinking at low effort, one token out: Opus 5.5 rejects
+        # thinking.type "disabled" outright, and the point here is only to
+        # prove the key and the balance, not to get an answer.
         self.client.messages.create(
             model=self.model, max_tokens=1,
-            thinking={"type": "disabled"}, output_config={"effort": "low"},
+            thinking={"type": "adaptive"}, output_config={"effort": "low"},
             messages=[{"role": "user", "content": "ping"}],
         )
 
