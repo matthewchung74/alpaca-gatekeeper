@@ -861,6 +861,10 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
 
     try:
         decision: AgentDecision = brain.decide(snapshot, settings.limits)
+        spent = getattr(brain, "last_usage", None)
+        if spent:
+            print(f"  model {spent['model']}: {spent['input']:,} in / {spent['output']:,} out"
+                  + (f", ${spent['cost_usd']:.4f}" if spent.get("cost_usd") is not None else ""))
     except Exception as e:  # noqa: BLE001 - a brain failure must not trade
         journal.record_cycle(profile=profile, action="error", snapshot=snapshot,
                              equity=equity, error=f"brain: {e}")
@@ -873,6 +877,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         journal.record_cycle(
             profile=profile, action="stood_down", snapshot=snapshot,
             reasoning=decision.reasoning, regime=cycle_regime, equity=equity,
+           usage=spent,
         )
         print("  stood down (no proposal)")
         return 0
@@ -957,7 +962,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         journal.record_cycle(
             profile=profile, action="blocked", snapshot=snapshot,
             reasoning=decision.reasoning, proposal=p.model_dump(),
-            gates=gate_payload, regime=cycle_regime, equity=equity,
+            gates=gate_payload, regime=cycle_regime, equity=equity, usage=spent,
         )
         print(f"  BLOCKED by {len(risk.blockers(gates))} gate(s)")
         return 0
@@ -1055,6 +1060,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         snapshot=snapshot, reasoning=decision.reasoning,
         proposal=requested.model_dump(),
         gates=gate_payload, regime=cycle_regime, equity=equity, order_id=order_id,
+        usage=spent,
     )
     print(f"  {'DRY RUN' if dry_run else 'SUBMITTED'}  order_id={order_id}  coid={coid}")
     return 0

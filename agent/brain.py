@@ -9,6 +9,7 @@ from __future__ import annotations
 import anthropic
 
 from .config import ET, TARGET_EXPIRY, UNIVERSE, RiskLimits
+from . import usage as usage_mod
 from .models import AgentDecision, parse_strike
 from .regime import TapeRead
 
@@ -140,6 +141,7 @@ class Brain:
     def __init__(self, model: str = "claude-opus-5-5", client: anthropic.Anthropic | None = None):
         self.model = model
         self.client = client or anthropic.Anthropic()
+        self.last_usage: dict | None = None      # tokens and cost of the most recent call
 
     def preflight(self) -> None:
         """One cheap call so a dead key or an empty balance fails loudly and early.
@@ -151,11 +153,12 @@ class Brain:
         # Adaptive thinking at low effort, one token out: Opus 5.5 rejects
         # thinking.type "disabled" outright, and the point here is only to
         # prove the key and the balance, not to get an answer.
-        self.client.messages.create(
+        response = self.client.messages.create(
             model=self.model, max_tokens=1,
             thinking={"type": "adaptive"}, output_config={"effort": "low"},
             messages=[{"role": "user", "content": "ping"}],
         )
+        self.last_usage = usage_mod.summarise(getattr(response, "usage", None), self.model)
 
     def decide(self, snapshot: str, limits: RiskLimits) -> AgentDecision:
         """Return a structured decision, or a stand-down if the model declines."""
@@ -168,6 +171,7 @@ class Brain:
             messages=[{"role": "user", "content": snapshot}],
             output_format=AgentDecision,
         )
+        self.last_usage = usage_mod.summarise(getattr(response, "usage", None), self.model)
         if getattr(response, "stop_reason", None) == "refusal":
             return AgentDecision(
                 reasoning="Model declined to answer this cycle; standing down.",

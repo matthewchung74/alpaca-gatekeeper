@@ -165,6 +165,12 @@ def view_structure(spreads: list[dict], closes: dict[tuple, float]) -> dict[str,
 
 def print_report(journal, profile: str, limits) -> None:
     from . import alpaca_cli as cli
+    from . import usage as usage_mod
+    sp = usage_mod.spend(journal, profile)
+    if sp["calls"]:
+        print(f"MODEL SPEND: {sp['calls']} calls, {sp['input']:,} in / {sp['output']:,} out, "
+              f"${sp['cost_usd']:.2f} total, ${sp['per_call']:.3f} per call"
+              + (f" ({sp['unpriced']} calls on an unpriced model)" if sp["unpriced"] else ""))
     docs = journal.settled_shadow(profile)
     rows = [dict(r, expiry=d.get("expiry")) for d in docs for r in (d.get("rows") or [])]
     min_n = getattr(limits, "learn_min_n", 20)

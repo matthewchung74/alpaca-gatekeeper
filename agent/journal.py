@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS cycles (
     gates        TEXT,           -- JSON: [{name, passed, detail}]
     action       TEXT NOT NULL,  -- submitted | blocked | stood_down | error
     order_id     TEXT,
-    error        TEXT
+    error        TEXT,
+    usage        TEXT            -- JSON: tokens and cost of this cycle's model call
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_ts ON cycles(ts);
 
@@ -99,6 +100,11 @@ class SQLiteJournal:
         self.path = path
         with self._conn() as c:
             c.executescript(SCHEMA)
+            # Columns added after a journal was created: CREATE TABLE IF NOT
+            # EXISTS leaves an existing table alone, so add them here.
+            have = {r["name"] for r in c.execute("PRAGMA table_info(cycles)")}
+            if "usage" not in have:
+                c.execute("ALTER TABLE cycles ADD COLUMN usage TEXT")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -123,18 +129,19 @@ class SQLiteJournal:
         equity: float | None = None,
         order_id: str | None = None,
         error: str | None = None,
+        usage: Any = None,
     ) -> int:
         with self._conn() as c:
             cur = c.execute(
                 """INSERT INTO cycles
                    (ts, profile, regime, equity, snapshot, reasoning, proposal,
-                    gates, action, order_id, error)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    gates, action, order_id, error, usage)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     datetime.now().astimezone().isoformat(),
                     profile, regime, equity,
                     _dumps(snapshot), reasoning, _dumps(proposal), _dumps(gates),
-                    action, order_id, error,
+                    action, order_id, error, _dumps(usage),
                 ),
             )
             return cur.lastrowid
