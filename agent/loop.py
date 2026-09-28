@@ -867,7 +867,8 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
                   + (f", ${spent['cost_usd']:.4f}" if spent.get("cost_usd") is not None else ""))
     except Exception as e:  # noqa: BLE001 - a brain failure must not trade
         journal.record_cycle(profile=profile, action="error", snapshot=snapshot,
-                             equity=equity, error=f"brain: {e}")
+                             equity=equity, error=f"brain: {e}",
+                             usage=getattr(brain, "last_usage", None))
         print(f"  brain failed: {e}", file=sys.stderr)
         return 1
 
@@ -908,7 +909,8 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         journal.record_cycle(profile=profile, action="error", snapshot=snapshot,
                              reasoning=decision.reasoning, proposal=p.model_dump(),
                              regime=cycle_regime, equity=equity,
-                             error=f"final observation failed; not submitting on stale data: {e}")
+                             error=f"final observation failed; not submitting on stale data: {e}",
+                             usage=spent)
         print(f"  final observation failed; not submitting: {e}", file=sys.stderr)
         return 1
     obs, equity, tape, open_marks = final["obs"], final["equity"], final["tape"], final["marks"]
@@ -993,6 +995,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
             profile=profile, action="error", snapshot=snapshot,
             reasoning=decision.reasoning, proposal=p.model_dump(),
             gates=gate_payload, regime=cycle_regime, equity=equity, error=str(e),
+            usage=spent,
         )
         print(f"  submit failed: {e}", file=sys.stderr)
         return 1
@@ -1025,6 +1028,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
                 order_id=order_id,
                 error=(f"order {order_id} still {fill['status']} after cancel; "
                        "broker may hold an unjournaled position -- RECONCILE MANUALLY"),
+                usage=spent,
             )
             print(f"  UNSETTLED after cancel ({fill['status']}) -- "
                   "manual reconciliation required", file=sys.stderr)
@@ -1039,6 +1043,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
                 gates=gate_payload, regime=cycle_regime, equity=equity,
                 order_id=order_id,
                 error=f"order {fill['status']} with 0 filled; no spread recorded",
+                usage=spent,
             )
             print(f"  NOT FILLED ({fill['status']}) -- no spread journaled")
             return 0

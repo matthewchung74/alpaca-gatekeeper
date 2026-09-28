@@ -104,3 +104,16 @@ def test_an_older_journal_gains_the_usage_column(tmp_path):
     j.record_cycle(profile="igk", action="submitted", usage={"input": 1, "output": 2, "cost_usd": 0.1})
     rows = j.recent_cycles(limit=2, profile="igk")
     assert json.loads(rows[0]["usage"])["input"] == 1 and rows[1]["usage"] is None
+
+
+def test_every_cycle_outcome_after_a_model_call_records_its_cost(tmp_path, monkeypatch):
+    """A cycle costs the same whether it trades, blocks, stands down or fails
+    to fill. Only 'unfilled' was missing, so a day of no-fills logged $0."""
+    import inspect
+    from agent import loop
+    src = inspect.getsource(loop._cycle_body)
+    after = src.split("spent = getattr(brain,", 1)[1]
+    import re
+    calls = re.findall(r'action=("[a-z_]+"|"dry_run" if dry_run else "submitted")(.*?)\n\s*\)', after, re.S)
+    missing = [a for a, body in calls if "usage=" not in body and a not in ('"intent"',)]
+    assert missing == [], f"these journal writes follow the model call but drop usage: {missing}"
