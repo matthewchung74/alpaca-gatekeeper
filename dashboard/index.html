@@ -97,6 +97,12 @@ figcaption{color:var(--muted);font-size:12px;margin-top:8px}
   </section>
 
   <section class="card">
+    <h2>Recorded, not blocking</h2>
+    <div class="scroll"><table id="redteam"></table></div>
+    <p class="note" id="opnote"></p>
+  </section>
+
+  <section class="card">
     <h2>Regime policy</h2>
     <div class="scroll"><table id="policy"></table></div>
     <p class="note">The regime is computed from the daily bars, never from the model. It sets the budget; in a range, the position of spot inside it decides which side may be sold.</p>
@@ -128,6 +134,8 @@ function tiles(d){
     ["Today", sgn(d.day_pnl), "from "+money(d.day_start_equity), cls(d.day_pnl)],
     ["Realized", sgn(d.realized_pnl), d.closed_spreads.length+" closed", cls(d.realized_pnl)],
     ["Win rate", d.win_rate===null?"--":pct(d.win_rate), d.closed_spreads.length? d.closed_spreads.length+" trades":"no trades yet"],
+    ["Model cost today", d.spend? "$"+d.spend.cost_usd.toFixed(2):"--",
+      d.spend_total? "$"+d.spend_total.cost_usd.toFixed(2)+" over "+d.spend_total.calls+" calls":""],
   ];
   $("#tiles").innerHTML = t.map(([k,v,n,c])=>
     `<div class="tile"><div class="k">${k}</div><div class="v ${c||""}">${v}</div><div class="n">${esc(n)}</div></div>`).join("");
@@ -211,6 +219,24 @@ function closedTable(rows){
         <td><span class="badge">${esc(r.exit_rule||"--")}</span></td></tr>`).join("") + `</tbody>`;
 }
 
+const RT = {
+  event:    "a scheduled macro release lands before expiry",
+  earnings: "a holding of the ETF reports before expiry",
+  crowded:  "the book already leans this way",
+  itm_risk: "the short strike is close enough to be assigned",
+  late_entry: "entered after 14:30 ET, too little time to manage",
+};
+
+function redTeamTable(flags, broker, spend){
+  const t = $("#redteam");
+  if(!flags || !flags.length){ t.innerHTML = `<tr><td class="empty">The hostile second look has flagged nothing in the last 40 cycles.</td></tr>`; }
+  else { t.innerHTML = `<thead><tr><th>Flag</th><th>Cycles</th><th>What it means</th></tr></thead><tbody>`
+    + flags.map(([n,c])=>`<tr><td class="mono">${esc(n)}</td><td>${c}</td><td>${esc(RT[n]||"")}</td></tr>`).join("") + `</tbody>`; }
+  const b = broker ? `Last cycle made ${broker.n} broker calls, median ${broker.ms_median} ms, slowest ${broker.ms_max} ms (${esc(broker.slowest||"")})`
+                   + (broker.errors? `, ${broker.errors} failed.` : ".") : "No broker timings recorded yet.";
+  $("#opnote").innerHTML = `A second deterministic pass argues against every trade the gates allowed. These flags are measured and journalled but do not stop a trade -- until the shadow ledger shows they predict losses, blocking on them would be a guess. ` + b;
+}
+
 function tripsTable(trips){
   if(!trips.length){ $("#trips").innerHTML = `<tr><td class="empty">No gate has blocked a trade yet.</td></tr>`; return; }
   $("#trips").innerHTML = `<thead><tr><th>Gate</th><th>Times it stopped a trade</th></tr></thead><tbody>`
@@ -254,7 +280,8 @@ async function load(){
   $("#hdr").textContent = `account ${d.profile}`;
   $("#sub").textContent = `Target expiry ${d.target_expiry} · profit target ${pct(d.limits.profit_target_pct)} of credit · stop ${d.limits.stop_loss_multiple}× credit · daily halt ${pct(d.limits.max_daily_loss_pct)} · event halt ${pct(d.limits.max_event_drawdown_pct)}`;
   tiles(d); chart(d.curve); openTable(d.open_spreads); closedTable(d.closed_spreads);
-  tripsTable(d.gate_trips); policyTable(d.regime_policy); cycles(d.cycles);
+  tripsTable(d.gate_trips); redTeamTable(d.red_team, d.broker, d.spend);
+  policyTable(d.regime_policy); cycles(d.cycles);
 }
 load(); setInterval(load, 30000);
 addEventListener("resize", ()=>load());

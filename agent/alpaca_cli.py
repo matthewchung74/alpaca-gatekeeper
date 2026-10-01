@@ -39,12 +39,32 @@ def _auth_args(profile: str) -> list[str]:
     return ["-p", profile]
 
 
+# Every broker call is timed. "The orders did not fill" and "the broker was
+# slow" look identical in a trade journal; they do not look identical here.
+CALLS: list[dict] = []
+
+
+def call_stats() -> dict:
+    """Latency and failure summary of the broker calls made this run."""
+    if not CALLS:
+        return {}
+    ms = sorted(c["ms"] for c in CALLS)
+    return {"n": len(CALLS), "errors": sum(1 for c in CALLS if c["rc"]),
+            "ms_median": round(ms[len(ms) // 2]), "ms_max": round(ms[-1]),
+            "ms_total": round(sum(ms)),
+            "slowest": max(CALLS, key=lambda c: c["ms"])["cmd"]}
+
+
 def run(*args: str, profile: str, parse: bool = True, timeout: int = 45) -> Any:
     """Invoke the CLI and return parsed JSON (exit code 2 means auth failure)."""
+    import time as _time
     argv = [*args, *_auth_args(profile)]
+    _t0 = _time.monotonic()
     proc = subprocess.run(
         [BIN, *argv], capture_output=True, text=True, timeout=timeout
     )
+    CALLS.append({"cmd": " ".join(args[:3]), "ms": (_time.monotonic() - _t0) * 1000,
+                  "rc": proc.returncode})
     if proc.returncode != 0:
         raise CLIError(list(argv), proc.returncode, proc.stderr)
     if not parse:

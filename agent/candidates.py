@@ -21,7 +21,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 
-from . import risk
+from . import redteam, risk
 from .config import RiskLimits
 from .models import TradeProposal, parse_strike
 
@@ -123,6 +123,9 @@ def enumerate_candidates(*, chains: dict, quotes: dict, tape: dict, sides: dict,
                         "spot": spot, "fail": risk.failure_codes(shape),
                         "chosen": False, "traded": False,
                     })
+                    rt = redteam.flags(rows[-1], expiry=expiry, now=now, tape=tape.get(sym),
+                                       open_spreads=open_spreads, limits=limits)
+                    rows[-1]["rt"] = rt["flags"]
                     if not live:
                         continue
                     for name in bad:

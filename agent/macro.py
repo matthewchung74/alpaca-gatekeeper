@@ -47,6 +47,46 @@ PCE = (   # BEA publishes upcoming releases only; earlier 2026 dates are past
     date(2026, 9, 30), date(2026, 10, 29), date(2026, 11, 25), date(2026, 12, 23),
 )
 
+# Earnings for the handful of names that actually move these index ETFs. Alpaca
+# has no earnings feed, so this is a hand-kept table, like the macro ones.
+# Dates for Q3 2026 collected 2026-10-01 from published and estimated schedules
+# (TSLA/GOOGL/META are pattern estimates, not confirmed): refresh each quarter.
+#   NVDA moves QQQ and SPY most; none of these are in IWM (small caps).
+EARNINGS: dict[str, tuple[date, ...]] = {
+    "TSLA": (date(2026, 10, 21),),
+    "GOOGL": (date(2026, 10, 28),),
+    "META": (date(2026, 10, 28),),
+    "MSFT": (date(2026, 10, 28),),
+    "AAPL": (date(2026, 10, 29),),
+    "AMZN": (date(2026, 10, 29),),
+    "NVDA": (date(2026, 11, 25),),
+}
+# Which of those sit inside each ETF. IWM is small caps and holds none of them.
+EARNINGS_BY_ETF: dict[str, tuple[str, ...]] = {
+    "SPY": ("NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"),
+    "QQQ": ("NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"),
+    "IWM": (),
+}
+
+
+def earnings_between(underlying: str, start: date, end: date) -> list[tuple[str, date]]:
+    """Megacap results inside [start, end] that move this ETF."""
+    out = []
+    for name in EARNINGS_BY_ETF.get(underlying, ()):
+        for d in EARNINGS.get(name, ()):
+            if start <= d <= end:
+                out.append((name, d))
+    return sorted(out, key=lambda x: x[1])
+
+
+def macro_between(start: date, end: date) -> list[tuple[str, date]]:
+    """Scheduled macro prints inside [start, end], as (kind, date)."""
+    kinds = ((FOMC_DECISIONS, "fomc"), (EMPLOYMENT_SITUATION, "payrolls"),
+             (CPI, "cpi"), (PCE, "pce"))
+    out = [(kind, d) for dates, kind in kinds for d in dates if start <= d <= end]
+    return sorted(out, key=lambda x: x[1])
+
+
 _PUBLISHED = (
     (EMPLOYMENT_SITUATION, "Employment Situation / non-farm payrolls (08:30 ET)",
      "largest recurring scheduled gap risk for short premium"),

@@ -22,6 +22,7 @@ from agent.config import (DEADLINE, KICKOFF, STARTING_EQUITY, TARGET_EXPIRY, Set
 from agent.journal import open_journal
 from agent.manage import mark_to_close, spread_from_row
 from agent.regime import POLICY, effective_tranche_pct
+from agent.usage import spend as model_spend
 
 app = FastAPI(title="Alpaca AI Trading Agent")
 SETTINGS = Settings(profile=os.environ.get("ALPACA_PROFILE", "dev"))
@@ -79,7 +80,7 @@ def _state() -> dict:
 
     cycles = j.recent_cycles(40, profile=profile)
     for c in cycles:
-        for f in ("gates", "proposal"):
+        for f in ("gates", "proposal", "usage", "broker", "red_team"):
             if c.get(f):
                 try:
                     c[f] = json.loads(c[f])
@@ -96,6 +97,15 @@ def _state() -> dict:
         for g in (c.get("gates") or []):
             if not g.get("passed"):
                 trips[g["name"]] = trips.get(g["name"], 0) + 1
+
+    # The hostile second look and the broker's own health. Both are recorded,
+    # neither blocks a trade, so the dashboard is the only place they surface.
+    rt_counts: dict[str, int] = {}
+    for c in cycles:
+        for f in ((c.get("red_team") or {}).get("flags") or []):
+            kind = str(f).split(":")[0]
+            rt_counts[kind] = rt_counts.get(kind, 0) + 1
+    latest_broker = next((c["broker"] for c in cycles if isinstance(c.get("broker"), dict)), None)
 
     realized = sum(s["realized_pnl"] or 0 for s in spreads if s["status"] == "closed")
     closed = [s for s in spreads if s["status"] == "closed"]
@@ -119,6 +129,10 @@ def _state() -> dict:
         "win_rate": (len(wins) / len(closed)) if closed else None,
         "cycles": cycles,
         "gate_trips": sorted(trips.items(), key=lambda kv: -kv[1]),
+        "red_team": sorted(rt_counts.items(), key=lambda kv: -kv[1]),
+        "broker": latest_broker,
+        "spend": model_spend(j, profile, since=day),
+        "spend_total": model_spend(j, profile),
         "regime_policy": {
             r: {
                 "budget_pct": effective_tranche_pct(r, SETTINGS.limits.max_tranche_risk_pct),

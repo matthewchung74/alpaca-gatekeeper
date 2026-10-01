@@ -219,6 +219,7 @@ Cloud Scheduler ──▶ Cloud Run Job ──▶ Alpaca CLI  +  Anthropic API
 | `agent-cycle` (Cloud Run Job) | Full entry cycle. 09:45 / 11:45 / 13:45 / 15:45 ET |
 | `agent-sweep` (Cloud Run Job) | Exit management only, no model call. Every 10 min |
 | `agent-settle` (Cloud Run Job) | Settle the shadow ledger and run the learning step. 16:30 ET |
+| `agent-watch` (Cloud Run Job) | Outside health check. Alerts on a missing cycle, a stalled sweep, an unjournalled position. Every 15 min |
 | `dashboard` (Cloud Run service) | Public decision log, scale-to-zero |
 | Firestore | The journal |
 | Secret Manager | Alpaca and Anthropic credentials, injected at runtime |
@@ -262,8 +263,10 @@ agent/
   rules.py             the tunable dials, their ladders, the rules version
   learning.py          one dial, one rung, on evidence, checked later
   sizing.py            the size ladder
+  redteam.py           a hostile second look at the trade the gates allowed; recorded, not blocking
+  watch.py             the outside health check; alerts do not depend on the agent
 dashboard/             FastAPI + a single self-contained page
-tests/                 97 tests
+tests/                 265 tests
 ```
 
 ## Running it

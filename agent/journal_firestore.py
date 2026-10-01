@@ -57,13 +57,15 @@ class FirestoreJournal:
         reasoning: str | None = None, proposal: Any = None, gates: Any = None,
         regime: str | None = None, equity: float | None = None,
         order_id: str | None = None, error: str | None = None, usage=None,
+        broker=None, red_team=None,
     ) -> str:
         doc = {
             "ts": _now(), "profile": profile, "regime": regime, "equity": equity,
             "snapshot": _jsonify(snapshot), "reasoning": reasoning,
             "proposal": _jsonify(proposal), "gates": _jsonify(gates),
             "action": action, "order_id": order_id, "error": error,
-            "usage": _jsonify(usage),
+            "usage": _jsonify(usage), "broker": _jsonify(broker),
+            "red_team": _jsonify(red_team),
         }
         ref = self.db.collection(CYCLES).document()
         ref.set(doc)

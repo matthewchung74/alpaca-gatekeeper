@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 
 from . import alpaca_cli as cli
 from . import candidates as cand
+from . import redteam
 from . import rules as rules_mod
 from . import sizing
 from . import regime
@@ -33,6 +34,16 @@ from .models import AgentDecision, ExitDecision, TradeProposal, parse_strike
 
 OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
+
+def record_cycle(journal, **kw) -> None:
+    """Journal a cycle, always with how the broker behaved during it.
+
+    Latency and failures are worth having on every row, not only the ones that
+    traded -- a cycle that stood down after four slow quote calls is the thing
+    you want to see before the day the calls start timing out.
+    """
+    kw.setdefault("broker", cli.call_stats())
+    journal.record_cycle(**kw)
 
 def observe(profile: str, expiry: str) -> dict:
     """Pull everything a decision needs, in as few calls as possible."""
@@ -225,7 +236,7 @@ def cancel_stale_orders(journal, profile: str, now, *, dry_run: bool,
         else:
             cancelled.append(oid)
     if cancelled or unresolved:
-        journal.record_cycle(profile=profile, action="error", error=(
+        record_cycle(journal, profile=profile, action="error", error=(
             "orphaned orders from an earlier run -- settled: " + (", ".join(cancelled) or "none")
             + "; unresolved: " + (" | ".join(unresolved) or "none")))
     return cancelled, unresolved
@@ -349,7 +360,7 @@ def reconcile(journal, profile: str, positions: list[dict], now, *, dry_run: boo
                                      realized_pnl=pnl, close_order_id=None)
                 known = (f"P&L {pnl:+,.0f} recovered from the broker's fills" if pnl is not None
                          else "P&L UNKNOWN (null, not zero): exclude from performance statistics")
-                journal.record_cycle(profile=profile, action="error", error=(
+                record_cycle(journal, profile=profile, action="error", error=(
                     f"reconcile: spread {sp.id} {sp.underlying} {sp.short_strike:g}/"
                     f"{sp.long_strike:g} not held at the broker; retired, {known}"))
             continue
@@ -392,8 +403,8 @@ def reconcile(journal, profile: str, positions: list[dict], now, *, dry_run: boo
               f"{adopted.long_strike:g} x{adopted.qty} @ {adopted.net_price:.2f}", file=sys.stderr)
         if not dry_run:
             journal.record_spread(profile=profile, proposal=adopted, order_id=None)
-            journal.record_cycle(profile=profile, action="error", proposal=adopted.model_dump(),
-                                 error=(f"reconcile: adopted unjournaled {root} {right} "
+            record_cycle(journal, profile=profile, action="error", proposal=adopted.model_dump(),
+                                  error=(f"reconcile: adopted unjournaled {root} {right} "
                                         f"{adopted.short_strike:g}/{adopted.long_strike:g} "
                                         f"x{adopted.qty}; now under exit management"))
         for s in syms:
@@ -439,6 +450,41 @@ def final_observation(journal, profile: str, expiry: str, p, now, limits) -> dic
     tape, sides = read_tape(obs, now, limits)
     return {"obs": obs, "equity": obs["equity"], "tape": tape, "sides": sides,
             "marks": current_marks(journal, profile, obs["positions"])}
+
+
+def pending_spreads(profile: str) -> list[dict]:
+    """Our own orders still working at the broker, as spread-shaped rows.
+
+    An unfilled entry is committed capital: it can fill the moment after the
+    gates measure exposure. Half of this account's first week's proposals
+    rested unfilled, so this is not hypothetical.
+    """
+    try:
+        orders = cli.open_orders(profile)
+    except cli.CLIError:
+        return []
+    out = []
+    for o in orders:
+        if not str(o.get("client_order_id") or "").startswith("hack-"):
+            continue
+        legs = o.get("legs") or []
+        shorts = [l for l in legs if str(l.get("side", "")).startswith("sell")]
+        longs = [l for l in legs if str(l.get("side", "")).startswith("buy")]
+        if not shorts or not longs:
+            continue
+        m, n = OCC.match(str(shorts[0].get("symbol", ""))), OCC.match(str(longs[0].get("symbol", "")))
+        if not m or not n:
+            continue
+        try:
+            qty = int(float(o.get("qty") or 0))
+        except (TypeError, ValueError):
+            qty = 0
+        out.append({"underlying": m[1], "right": m[3], "sleeve": "core", "qty": qty,
+                    "short_strike": parse_strike(shorts[0]["symbol"]),
+                    "long_strike": parse_strike(longs[0]["symbol"]),
+                    "entry_credit": abs(float(o.get("limit_price") or 0)),
+                    "expiry": f"20{m[2][:2]}-{m[2][2:4]}-{m[2][4:]}", "pending": True})
+    return out
 
 
 def size_multiplier(journal, profile: str, equity: float) -> tuple[float, str]:
@@ -492,8 +538,8 @@ def halted_today(journal, profile: str, now) -> bool:
 
 
 def record_halt(journal, profile: str, reason: str, equity: float | None = None) -> None:
-    journal.record_cycle(profile=profile, action="halt", equity=equity,
-                         reasoning=f"{reason}; book flattened, no entries until tomorrow")
+    record_cycle(journal, profile=profile, action="halt", equity=equity,
+                          reasoning=f"{reason}; book flattened, no entries until tomorrow")
 
 
 def manage_open_spreads(
@@ -577,8 +623,8 @@ def manage_open_spreads(
             )
         except cli.CLIError as e:
             print(f"        close FAILED: {e}", file=sys.stderr)
-            journal.record_cycle(profile=profile, action="error",
-                                 error=f"close spread {sp.id}: {e}")
+            record_cycle(journal, profile=profile, action="error",
+                                  error=f"close spread {sp.id}: {e}")
             continue
 
         if dry_run:
@@ -616,7 +662,7 @@ def manage_open_spreads(
                 journal.reduce_spread(sp.id, qty=qty - fill["qty"], realized_pnl=banked)
             print(f"        close INCOMPLETE ({what}); spread stays open",
                   file=sys.stderr)
-            journal.record_cycle(
+            record_cycle(journal,
                 profile=profile, action="error",
                 error=(f"close of spread {sp.id} {what}; still held, "
                        "next sweep will retry from the broker's size"))
@@ -669,8 +715,8 @@ def run_cycle(settings: Settings, *, dry_run: bool = False,
         if manage_only:
             print("  another job holds the account lock; this sweep stands aside")
             return 0
-        journal.record_cycle(profile=profile, action="error",
-                             error="account lock still held after 90s; cycle skipped")
+        record_cycle(journal, profile=profile, action="error",
+                              error="account lock still held after 90s; cycle skipped")
         print("  account lock still held after 90s; cycle skipped", file=sys.stderr)
         return 1
     try:
@@ -725,15 +771,15 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
             brain = Brain(model=settings.model)
             brain.preflight()
         except Exception as e:  # noqa: BLE001 - any failure here means no cycle
-            journal.record_cycle(profile=profile, action="error",
-                                 error=f"anthropic preflight: {e}")
+            record_cycle(journal, profile=profile, action="error",
+                                  error=f"anthropic preflight: {e}")
             print(f"  anthropic preflight failed: {e}", file=sys.stderr)
             return 1
 
     try:
         obs = observe(profile, expiry)
     except cli.CLIError as e:
-        journal.record_cycle(profile=profile, action="error", error=str(e))
+        record_cycle(journal, profile=profile, action="error", error=str(e))
         print(f"  observe failed: {e}", file=sys.stderr)
         return 1
 
@@ -770,8 +816,8 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     for msg in unexplained:
         print(f"  RECONCILE: {msg}", file=sys.stderr)
     if unexplained and not manage_only and not dry_run:
-        journal.record_cycle(profile=profile, action="error", equity=equity,
-                             error="reconcile: " + " | ".join(unexplained))
+        record_cycle(journal, profile=profile, action="error", equity=equity,
+                              error="reconcile: " + " | ".join(unexplained))
 
     # Ex-dividend dates, only for names where we are short calls. Alpaca
     # announces these a couple of days ahead, so ask every time.
@@ -799,8 +845,8 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         return 0
 
     if halted:
-        journal.record_cycle(profile=profile, action="stood_down", equity=equity,
-                             reasoning="Halted for the day by the daily loss limit; no entries.")
+        record_cycle(journal, profile=profile, action="stood_down", equity=equity,
+                              reasoning="Halted for the day by the daily loss limit; no entries.")
         print("  halted for the day; no entry considered")
         return 0
     if unexplained:
@@ -866,16 +912,16 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
             print(f"  model {spent['model']}: {spent['input']:,} in / {spent['output']:,} out"
                   + (f", ${spent['cost_usd']:.4f}" if spent.get("cost_usd") is not None else ""))
     except Exception as e:  # noqa: BLE001 - a brain failure must not trade
-        journal.record_cycle(profile=profile, action="error", snapshot=snapshot,
-                             equity=equity, error=f"brain: {e}",
-                             usage=getattr(brain, "last_usage", None))
+        record_cycle(journal, profile=profile, action="error", snapshot=snapshot,
+                              equity=equity, error=f"brain: {e}",
+                              usage=getattr(brain, "last_usage", None))
         print(f"  brain failed: {e}", file=sys.stderr)
         return 1
 
     print(f"  reasoning: {decision.reasoning[:300]}")
 
     if decision.proposal is None:
-        journal.record_cycle(
+        record_cycle(journal,
             profile=profile, action="stood_down", snapshot=snapshot,
             reasoning=decision.reasoning, regime=cycle_regime, equity=equity,
            usage=spent,
@@ -906,11 +952,11 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     try:
         final = final_observation(journal, profile, expiry, p, now, settings.limits)
     except cli.CLIError as e:
-        journal.record_cycle(profile=profile, action="error", snapshot=snapshot,
-                             reasoning=decision.reasoning, proposal=p.model_dump(),
-                             regime=cycle_regime, equity=equity,
-                             error=f"final observation failed; not submitting on stale data: {e}",
-                             usage=spent)
+        record_cycle(journal, profile=profile, action="error", snapshot=snapshot,
+                              reasoning=decision.reasoning, proposal=p.model_dump(),
+                              regime=cycle_regime, equity=equity,
+                              error=f"final observation failed; not submitting on stale data: {e}",
+                              usage=spent)
         print(f"  final observation failed; not submitting: {e}", file=sys.stderr)
         return 1
     obs, equity, tape, open_marks = final["obs"], final["equity"], final["tape"], final["marks"]
@@ -933,10 +979,13 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     cycle_regime = tape[p.underlying].regime if p.underlying in tape else cycle_regime
     book_regime = min((t.regime for t in tape.values()),
                       key=lambda r: regime.policy_for(r).size_multiplier)
+    pending = pending_spreads(profile)
+    if pending:
+        print(f"  {len(pending)} order(s) still working at the broker; counted as committed")
     room, room_note = risk.room_for_trade(
         equity=equity, regime=cycle_regime, book_regime=book_regime,
         open_spreads=journal.open_spreads(profile), right=p.right, sleeve=p.sleeve,
-        limits=settings.limits)
+        limits=settings.limits, pending=pending)
     mult, why = size_multiplier(journal, profile, equity)
     room *= mult
     print(f"  {room_note}; size ladder x{mult:g} ({why}) -> room {room:,.0f}")
@@ -954,17 +1003,27 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         open_spreads=journal.open_spreads(profile),
         tape=tape.get(p.underlying), open_marks=open_marks,
         recent_spreads=recent_spreads, session=session, book_regime=book_regime,
+        pending=pending,
     )
+    # The hostile second look. Recorded, never blocking (agent/redteam.py).
+    rt = redteam.flags({"u": p.underlying, "r": p.right, "d": None, "ks": p.short_strike},
+                       expiry=expiry, now=now, tape=tape.get(p.underlying),
+                       open_spreads=journal.open_spreads(profile) + pending,
+                       limits=settings.limits)
+    if rt["flags"]:
+        print(f"  red team (recorded, not blocking): {', '.join(rt['flags'])} -- {rt['detail']}")
+
     for g in gates:
         print(f"    {g}")
 
     gate_payload = [g.model_dump() for g in gates]
 
     if not risk.all_passed(gates):
-        journal.record_cycle(
+        record_cycle(journal,
             profile=profile, action="blocked", snapshot=snapshot,
             reasoning=decision.reasoning, proposal=p.model_dump(),
             gates=gate_payload, regime=cycle_regime, equity=equity, usage=spent,
+            red_team=rt,
         )
         print(f"  BLOCKED by {len(risk.blockers(gates))} gate(s)")
         return 0
@@ -981,8 +1040,8 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         # between submit and journal, reconciliation adopts the position and
         # the orphan-order sweep cancels anything still working; this row is
         # what explains, afterwards, where either came from.
-        journal.record_cycle(profile=profile, action="intent", regime=cycle_regime,
-                             equity=equity, proposal=requested.model_dump(), order_id=coid)
+        record_cycle(journal, profile=profile, action="intent", regime=cycle_regime,
+                              equity=equity, proposal=requested.model_dump(), order_id=coid)
     try:
         result = cli.submit_mleg(
             # Signed net price: negative for a credit we require, positive for
@@ -991,7 +1050,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
             profile=profile, client_order_id=coid, dry_run=dry_run,
         )
     except cli.CLIError as e:
-        journal.record_cycle(
+        record_cycle(journal,
             profile=profile, action="error", snapshot=snapshot,
             reasoning=decision.reasoning, proposal=p.model_dump(),
             gates=gate_payload, regime=cycle_regime, equity=equity, error=str(e),
@@ -1021,7 +1080,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
             # Neither polling nor cancelling settled it. This is the one state
             # where the broker and the journal can still disagree, so claim
             # nothing and say so loudly.
-            journal.record_cycle(
+            record_cycle(journal,
                 profile=profile, action="error", snapshot=snapshot,
                 reasoning=decision.reasoning, proposal=requested.model_dump(),
                 gates=gate_payload, regime=cycle_regime, equity=equity,
@@ -1037,13 +1096,13 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
         if fill["qty"] == 0:
             # Nothing filled. Journaling a spread we do not hold would make the
             # sweep chase a phantom position for the rest of the week.
-            journal.record_cycle(
+            record_cycle(journal,
                 profile=profile, action="unfilled", snapshot=snapshot,
                 reasoning=decision.reasoning, proposal=p.model_dump(),
                 gates=gate_payload, regime=cycle_regime, equity=equity,
                 order_id=order_id,
                 error=f"order {fill['status']} with 0 filled; no spread recorded",
-                usage=spent,
+                usage=spent, red_team=rt,
             )
             print(f"  NOT FILLED ({fill['status']}) -- no spread journaled")
             return 0
@@ -1060,12 +1119,12 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
             journal.mark_shadow(shadow_id, traded=(p.underlying, p.right, p.short_strike, p.long_strike))
     elif not dry_run:
         journal.record_spread(profile=profile, proposal=p, order_id=order_id)
-    journal.record_cycle(
+    record_cycle(journal,
         profile=profile, action="dry_run" if dry_run else "submitted",
         snapshot=snapshot, reasoning=decision.reasoning,
         proposal=requested.model_dump(),
         gates=gate_payload, regime=cycle_regime, equity=equity, order_id=order_id,
-        usage=spent,
+        usage=spent, red_team=rt,
     )
     print(f"  {'DRY RUN' if dry_run else 'SUBMITTED'}  order_id={order_id}  coid={coid}")
     return 0

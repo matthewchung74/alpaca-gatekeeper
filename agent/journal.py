@@ -32,7 +32,9 @@ CREATE TABLE IF NOT EXISTS cycles (
     action       TEXT NOT NULL,  -- submitted | blocked | stood_down | error
     order_id     TEXT,
     error        TEXT,
-    usage        TEXT            -- JSON: tokens and cost of this cycle's model call
+    usage        TEXT,           -- JSON: tokens and cost of this cycle's model call
+    broker       TEXT,           -- JSON: broker-call latency and failures
+    red_team     TEXT            -- JSON: hostile flags on the chosen trade (recorded, not blocking)
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_ts ON cycles(ts);
 
@@ -103,8 +105,9 @@ class SQLiteJournal:
             # Columns added after a journal was created: CREATE TABLE IF NOT
             # EXISTS leaves an existing table alone, so add them here.
             have = {r["name"] for r in c.execute("PRAGMA table_info(cycles)")}
-            if "usage" not in have:
-                c.execute("ALTER TABLE cycles ADD COLUMN usage TEXT")
+            for col in ("usage", "broker", "red_team"):
+                if col not in have:
+                    c.execute(f"ALTER TABLE cycles ADD COLUMN {col} TEXT")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -129,19 +132,19 @@ class SQLiteJournal:
         equity: float | None = None,
         order_id: str | None = None,
         error: str | None = None,
-        usage: Any = None,
+        usage: Any = None, broker: Any = None, red_team: Any = None,
     ) -> int:
         with self._conn() as c:
             cur = c.execute(
                 """INSERT INTO cycles
                    (ts, profile, regime, equity, snapshot, reasoning, proposal,
-                    gates, action, order_id, error, usage)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    gates, action, order_id, error, usage, broker, red_team)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     datetime.now().astimezone().isoformat(),
                     profile, regime, equity,
                     _dumps(snapshot), reasoning, _dumps(proposal), _dumps(gates),
-                    action, order_id, error, _dumps(usage),
+                    action, order_id, error, _dumps(usage), _dumps(broker), _dumps(red_team),
                 ),
             )
             return cur.lastrowid

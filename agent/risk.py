@@ -44,6 +44,7 @@ def evaluate(
     recent_spreads: list[dict] | None = None,
     session: tuple | None = None,
     book_regime: str | None = None,
+    pending: list[dict] | None = None,
 ) -> list[GateResult]:
     """Run every gate. Order matters only for readability; all of them run."""
     g: list[GateResult] = []
@@ -166,7 +167,9 @@ def evaluate(
     # --- Gate 11: position count -----------------------------------------
     # Spreads, from the journal. This counted broker LEGS, so a limit of 8
     # silently meant four spreads.
-    n_open = len(open_spreads or [])
+    # An order still working is committed: it can fill the moment after this.
+    committed = list(open_spreads or []) + list(pending or [])
+    n_open = len(committed)
     ok = n_open < limits.max_concurrent_positions
     g.append(GateResult(
         name="position_count", passed=ok,
@@ -196,9 +199,9 @@ def evaluate(
     g.append(_credit_floor_gate(proposal, limits))
 
     # --- Gates 18-21: the shape of the whole book ------------------------
-    g.append(_book_risk_gate(proposal, open_spreads or [], equity,
+    g.append(_book_risk_gate(proposal, committed, equity,
                              book_regime or regime, limits))
-    g.append(_same_direction_gate(proposal, open_spreads or [], limits))
+    g.append(_same_direction_gate(proposal, committed, limits, n_pending=len(pending or [])))
     g.append(_losing_side_gate(proposal, open_spreads or [], open_marks or {}, limits))
     g.append(_cadence_gate(proposal, recent_spreads or [], now, limits))
 
@@ -553,7 +556,8 @@ def _leg_overlap_gate(proposal: TradeProposal, open_spreads: list[dict]) -> Gate
 
 
 def room_for_trade(*, equity: float, regime: str, book_regime: str, open_spreads: list[dict],
-                   right: str, sleeve: str, limits: RiskLimits) -> tuple[float, str]:
+                   right: str, sleeve: str, limits: RiskLimits,
+                   pending: list[dict] | None = None) -> tuple[float, str]:
     """Dollars of max loss a new trade may carry: the tightest of three budgets.
 
     The tranche budget, what is left of the book budget, and what is left on
@@ -562,7 +566,7 @@ def room_for_trade(*, equity: float, regime: str, book_regime: str, open_spreads
     by book_risk instead of being cut to fit. Downsizing beats blocking.
     """
     held = rally = selloff = 0.0
-    for row in open_spreads:
+    for row in list(open_spreads) + list(pending or []):
         try:
             loss = _spread_max_loss(row)
             up = _hurt_by_a_rally(row["right"], row.get("sleeve"))
@@ -583,7 +587,9 @@ def room_for_trade(*, equity: float, regime: str, book_regime: str, open_spreads
     }
     name, room = min(budgets.items(), key=lambda kv: kv[1])
     room = max(room, 0.0)
-    return room, (f"room {room:,.0f}, set by the {name} budget (tranche {budgets['tranche']:,.0f}, "
+    return room, (f"room {room:,.0f}"
+                  + (f" after {len(pending or [])} pending order(s)" if pending else "")
+                  + f", set by the {name} budget (tranche {budgets['tranche']:,.0f}, "
                   f"book {max(budgets['book'], 0):,.0f} left, "
                   f"{'rally' if up else 'selloff'} side "
                   f"{max(budgets[('rally' if up else 'selloff') + ' side'], 0):,.0f} left)")
@@ -614,8 +620,9 @@ def _book_risk_gate(proposal: TradeProposal, open_spreads: list[dict], equity: f
 
 
 def _same_direction_gate(proposal: TradeProposal, open_spreads: list[dict],
-                         limits: RiskLimits) -> GateResult:
-    """SPY, QQQ and IWM are one bucket. Count open core spreads on this right."""
+                         limits: RiskLimits, n_pending: int = 0) -> GateResult:
+    """SPY, QQQ and IWM are one bucket. Count open core spreads on this right,
+    including any order of ours still working."""
     same = [r for r in open_spreads
             if r.get("right") == proposal.right and (r.get("sleeve") or "core") == "core"]
     ok = proposal.sleeve != "core" or len(same) < limits.max_same_direction
@@ -624,7 +631,8 @@ def _same_direction_gate(proposal: TradeProposal, open_spreads: list[dict],
     return GateResult(
         name="same_direction", passed=ok,
         detail=(f"{len(same)} open core {proposal.right} spread(s) across the universe "
-                f"({names}) vs max {limits.max_same_direction}"))
+                f"({names}) vs max {limits.max_same_direction}"
+                + (f"; {n_pending} of them still working at the broker" if n_pending else "")))
 
 
 def _losing_side_gate(proposal: TradeProposal, open_spreads: list[dict],

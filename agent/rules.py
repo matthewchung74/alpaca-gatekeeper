@@ -31,11 +31,30 @@ def empty_doc() -> dict:
     return {"version": 0, "overrides": {}, "in_flight": None, "locks": {}, "history": []}
 
 
-def limits_for(journal, profile: str, base: RiskLimits) -> tuple[RiskLimits, int]:
-    """The base limits with this account's valid overrides applied, and the version."""
+def limits_for(journal, profile: str, base: RiskLimits,
+               today=None) -> tuple[RiskLimits, int]:
+    """The base limits with this account's valid overrides applied, and the version.
+
+    An override listed in `manual` carries the day it was set and expires
+    overnight: a hand-set loosening should never outlive the session that
+    needed it, and widening risk permanently belongs in code. Learned
+    overrides have no expiry; they answer to the evidence instead.
+    """
+    from datetime import date as _date
     doc = journal.get_rules(profile) or empty_doc()
+    today = today or _date.today()
+    manual = doc.get("manual") or {}
     valid = {}
     for name, value in (doc.get("overrides") or {}).items():
+        set_on = manual.get(name)
+        if set_on:
+            try:
+                if _date.fromisoformat(str(set_on)) < today:
+                    print(f"  rules: manual override {name}={value} set {set_on} has expired",
+                          file=sys.stderr)
+                    continue
+            except ValueError:
+                continue
         ladder = PARAMS.get(name)
         if ladder is None:
             print(f"  warn: rules override for non-tunable {name!r} ignored", file=sys.stderr)

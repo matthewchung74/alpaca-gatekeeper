@@ -152,3 +152,15 @@ def test_learning_can_be_switched_off(tmp_path):
     j = journal_with(tmp_path, docs)
     from dataclasses import replace
     assert learning.step(j, "igk", replace(BASE, learn_enabled=False), NOW) == []
+
+
+def test_a_hand_set_override_expires_overnight_but_a_learned_one_does_not(tmp_path):
+    """Autobelay's rule: runtime loosening dies daily; widening risk needs code."""
+    j = SQLiteJournal(str(tmp_path / "j.db"))
+    j.put_rules("igk", {"version": 3, "overrides": {"min_open_interest": 300, "credit_floor_x": 0},
+                        "manual": {"min_open_interest": "2026-10-01"}, "in_flight": None,
+                        "locks": {}, "history": []})
+    lim, _ = rules.limits_for(j, "igk", BASE, today=datetime(2026, 10, 1, 9, 0, tzinfo=ET).date())
+    assert lim.min_open_interest == 300                      # still its day
+    lim, _ = rules.limits_for(j, "igk", BASE, today=datetime(2026, 10, 2, 9, 0, tzinfo=ET).date())
+    assert lim.min_open_interest == BASE.min_open_interest    # expired overnight

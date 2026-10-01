@@ -643,3 +643,29 @@ def test_the_dashboard_measures_pnl_from_the_accounts_own_start(monkeypatch):
     importlib.reload(app)
     assert app.starting_equity() == 100_000.0
     os.environ.pop("ALPACA_PROFILE", None)
+
+
+def test_an_order_still_working_counts_against_the_book():
+    """An unfilled entry is committed capital: it can fill a second after the
+    gates measure exposure. Half this week's proposals rested unfilled."""
+    from agent.risk import room_for_trade
+    # the rally side is nearly full, so it is the binding budget, not the tranche
+    held = [row(id="a", right="C", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=40)]
+    pending = [{"underlying": "SPY", "right": "C", "short_strike": 780.0, "long_strike": 785.0,
+                "qty": 10, "entry_credit": 0.5, "sleeve": "core"}]
+    free, _ = room_for_trade(equity=100_000.0, regime="sideways", book_regime="sideways",
+                             open_spreads=held, right="C", sleeve="core", limits=LIMITS)
+    less, note = room_for_trade(equity=100_000.0, regime="sideways", book_regime="sideways",
+                                open_spreads=held, right="C", sleeve="core", limits=LIMITS,
+                                pending=pending)
+    assert less < free and "pending" in note
+
+
+def test_a_working_order_fills_a_position_slot_and_a_side():
+    p = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    held = [row(id=str(i), right="C") for i in range(4)]
+    pending = [{"underlying": "SPY", "right": "C", "short_strike": 790.0, "long_strike": 795.0,
+                "qty": 1, "entry_credit": 0.4, "sleeve": "core"}]
+    assert gate(evaluate(p, open_spreads=held), "same_direction").passed
+    g = gate(evaluate(p, open_spreads=held, pending=pending), "same_direction")
+    assert not g.passed and "working" in g.detail

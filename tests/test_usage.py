@@ -117,3 +117,15 @@ def test_every_cycle_outcome_after_a_model_call_records_its_cost(tmp_path, monke
     calls = re.findall(r'action=("[a-z_]+"|"dry_run" if dry_run else "submitted")(.*?)\n\s*\)', after, re.S)
     missing = [a for a, body in calls if "usage=" not in body and a not in ('"intent"',)]
     assert missing == [], f"these journal writes follow the model call but drop usage: {missing}"
+
+
+def test_no_cycle_write_bypasses_the_broker_summary():
+    """Latency belongs on every row, so loop.py writes through its own helper.
+
+    Calling journal.record_cycle directly would silently drop the broker stats,
+    which is how stood-down cycles came to have none.
+    """
+    from pathlib import Path
+    src = Path("agent/loop.py").read_text()
+    body = src.split("def record_cycle(journal", 1)[1].split("\ndef ", 1)[1]
+    assert "journal.record_cycle(" not in body
