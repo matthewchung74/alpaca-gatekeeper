@@ -92,8 +92,15 @@ def main() -> int:
     from . import alpaca_cli as cli
     from .journal import open_journal
     settings = Settings()
-    journal = open_journal(settings.journal_path)
     now = now_et()
+    # Runs hourly around the clock as well as every 15 min during the session.
+    # The off-hours runs exist only to leave a log line: a Monitoring policy
+    # alerts when these stop, which is the one failure the watchdog cannot
+    # otherwise report -- the scheduler dying, so that nothing runs at all.
+    if not in_session(now):
+        print(f"watch {now:%Y-%m-%d %H:%M %Z}: heartbeat (market closed; nothing expected)")
+        return 0
+    journal = open_journal(settings.journal_path)
     try:
         positions = cli.positions(settings.profile)
         orders = cli.open_orders(settings.profile)
