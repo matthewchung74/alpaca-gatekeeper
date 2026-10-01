@@ -17,13 +17,19 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from agent import alpaca_cli as cli
-from agent.config import DEADLINE, KICKOFF, STARTING_EQUITY, TARGET_EXPIRY, Settings, now_et
+from agent.config import (DEADLINE, KICKOFF, STARTING_EQUITY, TARGET_EXPIRY, Settings,
+                          now_et, starting_equity_for)
 from agent.journal import open_journal
 from agent.manage import mark_to_close, spread_from_row
 from agent.regime import POLICY, effective_tranche_pct
 
 app = FastAPI(title="Alpaca AI Trading Agent")
 SETTINGS = Settings(profile=os.environ.get("ALPACA_PROFILE", "dev"))
+
+
+def starting_equity() -> float:
+    """What THIS account opened with; the old constant was the judged account's."""
+    return starting_equity_for(SETTINGS.profile)
 TEMPLATE = Path(__file__).parent / "index.html"
 
 
@@ -67,7 +73,7 @@ def _state() -> dict:
         for o in objs:
             marks[o.id] = mark_to_close(o, quotes)
 
-    equity = curve[-1]["equity"] if curve else STARTING_EQUITY
+    equity = curve[-1]["equity"] if curve else starting_equity()
     day = now.strftime("%Y-%m-%d")
     day_start = j.day_start_equity(day) or equity
 
@@ -102,9 +108,9 @@ def _state() -> dict:
         "deadline": DEADLINE.isoformat(),
         "target_expiry": TARGET_EXPIRY,
         "equity": equity,
-        "starting_equity": STARTING_EQUITY,
+        "starting_equity": starting_equity(),
         "day_start_equity": day_start,
-        "total_pnl": equity - STARTING_EQUITY,
+        "total_pnl": equity - starting_equity(),
         "day_pnl": equity - day_start,
         "realized_pnl": realized,
         "curve": curve,

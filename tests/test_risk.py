@@ -629,3 +629,17 @@ def test_delta_band_says_which_way_it_failed():
     assert gate(evaluate(p, chain=ch), "delta_band").codes == ["delta_band:low"]
     ch[sym]["greeks"] = {"delta": -0.41}
     assert gate(evaluate(p, chain=ch), "delta_band").codes == ["delta_band:high"]
+
+
+def test_the_dashboard_measures_pnl_from_the_accounts_own_start(monkeypatch):
+    """The dashboard hardcoded $100,000. On the $50,000 account that reads as
+    a 50% loss on day one."""
+    import importlib, os
+    os.environ["ALPACA_PROFILE"] = "igk"
+    import dashboard.app as app
+    importlib.reload(app)
+    assert app.starting_equity() == 50_000.0
+    os.environ["ALPACA_PROFILE"] = "comp"
+    importlib.reload(app)
+    assert app.starting_equity() == 100_000.0
+    os.environ.pop("ALPACA_PROFILE", None)
