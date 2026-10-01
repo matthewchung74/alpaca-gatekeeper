@@ -81,26 +81,34 @@ def budget_pct_for(regime: str, sleeve: str, limits) -> float:
     return effective_tranche_pct(regime, base)
 
 
-def resize_to_budget(
+def fit_to_budget(
     proposal: TradeProposal, *, equity: float, effective_pct: float
 ) -> tuple[int, str]:
-    """Shrink quantity to fit the regime-adjusted budget.
+    """Set quantity to what the regime-adjusted budget funds -- up or down.
 
-    Returns (qty, note). Downsizing beats blocking: a good trade at smaller size
-    is better than a wasted cycle. Zero means the budget cannot fund even one
-    spread, and the gate layer will reject it.
+    This only ever shrank, which made the model's quantity a ceiling. The
+    prompt forbids it from reasoning about dollars, so it had no basis for a
+    number and proposed 2 in every submitted trade: 2 of the 5 the budget
+    funded, on top of a 0.5x size ladder, so each winner was 0.06% of the
+    account. Quantity is a consequence of the budget, not a view. The view is
+    the structure and the direction, and taking less risk is expressed by
+    standing down, not by trading a token size.
+
+    Returns (qty, note). Zero means the budget cannot fund even one spread, and
+    the gate layer will reject it.
     """
     budget = equity * effective_pct
     per_spread = proposal.max_loss_per_spread
     if per_spread <= 0:
         return 0, "invalid spread economics"
     allowed = int(budget // per_spread)
-    if allowed >= proposal.qty:
-        return proposal.qty, f"qty {proposal.qty} fits budget ${budget:,.0f}"
     if allowed <= 0:
         return 0, (f"budget ${budget:,.0f} cannot fund one spread "
                    f"(${per_spread:,.0f} each)")
-    return allowed, (f"resized {proposal.qty} -> {allowed} to fit regime budget "
+    if allowed == proposal.qty:
+        return allowed, f"qty {allowed} fills budget ${budget:,.0f}"
+    return allowed, (f"{'raised' if allowed > proposal.qty else 'cut'} "
+                     f"{proposal.qty} -> {allowed} to fill budget "
                      f"${budget:,.0f} (${per_spread:,.0f} per spread)")
 
 

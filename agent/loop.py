@@ -876,7 +876,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
 
     snap_book_regime = min((t.regime for t in tape.values()),
                            key=lambda r: regime.policy_for(r).size_multiplier)
-    book_lines = ["", "BOOK (binding; a proposal is cut to the room shown):"]
+    book_lines = ["", "BOOK (binding; your trade is sized to fill the room shown):"]
     open_now = journal.open_spreads(profile)
     for right, word in (("C", "short calls (lose on a rally)"), ("P", "short puts (lose on a selloff)")):
         n = sum(1 for r in open_now if r.get("right") == right and (r.get("sleeve") or "core") == "core")
@@ -939,10 +939,11 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
           f"({p.sleeve}); max loss ${p.total_max_loss:,.0f} / "
           f"max profit ${p.total_max_profit:,.0f}")
 
-    # Regime binds the size before the gates see it. Downsizing beats blocking:
-    # a good trade at smaller size beats a wasted cycle.
+    # Regime sets the size before the gates see it, from the tranche budget
+    # alone. The final pass below re-sizes against the book and side budgets
+    # and the size ladder, which is what actually binds.
     eff_pct = regime.budget_pct_for(cycle_regime, p.sleeve, settings.limits)
-    new_qty, note = regime.resize_to_budget(p, equity=equity, effective_pct=eff_pct)
+    new_qty, note = regime.fit_to_budget(p, equity=equity, effective_pct=eff_pct)
     print(f"  regime policy [{cycle_regime}/{p.sleeve}]: {note}")
     if new_qty != p.qty:
         p = p.model_copy(update={"qty": new_qty})
@@ -990,7 +991,7 @@ def _cycle_body(settings: Settings, journal, *, dry_run: bool = False,
     room *= mult
     print(f"  {room_note}; size ladder x{mult:g} ({why}) -> room {room:,.0f}")
     eff_pct = room / equity if equity > 0 else 0.0
-    fresh_qty, note = regime.resize_to_budget(p, equity=equity, effective_pct=eff_pct)
+    fresh_qty, note = regime.fit_to_budget(p, equity=equity, effective_pct=eff_pct)
     if fresh_qty != p.qty:
         print(f"  regime policy on the final observation [{cycle_regime}]: {note}")
         p = p.model_copy(update={"qty": fresh_qty})

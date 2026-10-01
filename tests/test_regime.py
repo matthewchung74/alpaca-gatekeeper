@@ -89,32 +89,40 @@ def test_direction_gate_passes_call_spread_in_bear_regime():
 
 # --- sizing --------------------------------------------------------------
 
-def test_resize_leaves_a_fitting_proposal_alone():
-    p = proposal(qty=8)          # 8 x 453 = 3624 <= 4000
-    qty, note = regime.resize_to_budget(p, equity=100_000.0, effective_pct=0.04)
-    assert qty == 8 and "fits budget" in note
+def test_an_undersized_proposal_is_raised_to_fill_the_budget():
+    """The model proposed 2 in every live trade; the budget funded 5."""
+    p = proposal(qty=2)
+    qty, note = regime.fit_to_budget(p, equity=100_000.0, effective_pct=0.04)
+    assert qty == 8 and "raised 2 -> 8" in note
+    assert p.max_loss_per_spread * qty <= 100_000.0 * 0.04
 
 
-def test_resize_cuts_an_oversized_proposal_rather_than_blocking():
+def test_a_proposal_that_already_fills_the_budget_is_left_alone():
+    p = proposal(qty=8)          # 8 x 453 = 3624 <= 4000, 9 would not fit
+    qty, note = regime.fit_to_budget(p, equity=100_000.0, effective_pct=0.04)
+    assert qty == 8 and "fills budget" in note
+
+
+def test_an_oversized_proposal_is_cut_rather_than_blocked():
     p = proposal(qty=50)
-    qty, note = regime.resize_to_budget(p, equity=100_000.0, effective_pct=0.04)
-    assert qty == 8 and "resized" in note
+    qty, note = regime.fit_to_budget(p, equity=100_000.0, effective_pct=0.04)
+    assert qty == 8 and "cut 50 -> 8" in note
     assert p.max_loss_per_spread * qty <= 100_000.0 * 0.04
 
 
 def test_bear_regime_cuts_size_far_below_sideways():
     p = proposal(qty=20)
-    side_qty, _ = regime.resize_to_budget(
+    side_qty, _ = regime.fit_to_budget(
         p, equity=100_000.0, effective_pct=regime.effective_tranche_pct("sideways", 0.04))
-    bear_qty, _ = regime.resize_to_budget(
+    bear_qty, _ = regime.fit_to_budget(
         p, equity=100_000.0, effective_pct=regime.effective_tranche_pct("bear", 0.04))
     assert bear_qty < side_qty
     assert bear_qty == 3        # explicit 0.04 base above: 0.35 * 4% = 1400; 1400 // 453 = 3
 
 
-def test_resize_returns_zero_when_budget_cannot_fund_one_spread():
+def test_sizing_returns_zero_when_budget_cannot_fund_one_spread():
     p = proposal(qty=1, short_strike=800.0, long_strike=700.0, net_price=1.0)
-    qty, note = regime.resize_to_budget(p, equity=10_000.0, effective_pct=0.04)
+    qty, note = regime.fit_to_budget(p, equity=10_000.0, effective_pct=0.04)
     assert qty == 0 and "cannot fund" in note
 
 
