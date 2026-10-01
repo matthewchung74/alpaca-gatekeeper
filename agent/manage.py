@@ -27,11 +27,19 @@ def held_qty(spread: OpenSpread, positions: list[dict]) -> int:
     Sized off the SHORT leg, and always the broker's number rather than the
     journal's: closing a size we do not hold can open an opposite position.
     """
-    short_sym = spread.short_symbol()
+    by_sym: dict[str, int] = {}
     for p in positions:
-        if p.get("symbol") == short_sym:
-            return abs(int(float(p.get("qty") or 0)))
-    return 0
+        try:
+            by_sym[str(p.get("symbol"))] = int(float(p.get("qty") or 0))
+        except (TypeError, ValueError):
+            continue
+    # Signed, both legs, and never more than this lot. The old version took
+    # abs() of the short leg alone: a position held the wrong way round
+    # counted as held, and two lots sharing a short each tried to close the
+    # whole of it against a hedge only big enough for one (Codex follow-up).
+    short_held = max(0, -by_sym.get(spread.short_symbol(), 0))
+    long_held = max(0, by_sym.get(spread.long_symbol(), 0))
+    return min(spread.qty, short_held, long_held)
 
 
 def is_actually_held(spread: OpenSpread, positions: list[dict]) -> bool:
@@ -51,6 +59,7 @@ def spread_from_row(row: dict) -> OpenSpread:
         right=row["right"], short_strike=row["short_strike"],
         long_strike=row["long_strike"], qty=row["qty"],
         entry_credit=row["entry_credit"], sleeve=row.get("sleeve") or "core",
+        realized_so_far=float(row.get("realized_pnl") or 0.0),
     )
 
 
@@ -68,7 +77,7 @@ def mark_to_close(spread: OpenSpread, quotes: dict) -> float | None:
     short_q = quotes.get(spread.short_symbol()) or {}
     long_q = quotes.get(spread.long_symbol()) or {}
     short_ask = _f(short_q.get("ap"))
-    long_bid = _f(long_q.get("bp"))
+    long_bid = _bid(long_q)
     if short_ask is None or long_bid is None:
         return None
     if spread.is_credit:
@@ -83,10 +92,18 @@ def decide_exit(
     now: datetime,
     spot: float | None,
     limits: RiskLimits,
+    close_t: datetime | None = None,
+    ex_dividend: tuple[str, float] | None = None,
+    next_session: str | None = None,
 ) -> ExitDecision:
-    """Pure function. Given a spread and a mark, should it be closed?"""
+    """Pure function. Given a spread and a mark, should it be closed?
+
+    `close_t` is the exchange's actual close for the day. On an early-close
+    session the 16:00 default would flatten two and a half hours too late.
+    """
     is_expiry_day = now.strftime("%Y-%m-%d") == spread.expiry
-    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if close_t is None:
+        close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
     near_close = now >= close_t - timedelta(minutes=limits.flatten_minutes_before_close)
 
     # 1. Assignment risk -- highest priority, and independent of the mark.
@@ -102,6 +119,24 @@ def decide_exit(
                 reason=(f"expiry day and spot {spot:.2f} is within "
                         f"{limits.itm_flatten_buffer} of the short {spread.short_strike} "
                         f"{spread.right}; closing to avoid assignment"),
+            )
+
+    # 1b. Early assignment for the dividend. A short call that is in or near
+    # the money the night before ex-date can be exercised so the holder
+    # collects the dividend; we wake up short the stock and owing it. The
+    # long leg does not protect against that. Only the LAST session before
+    # ex-date matters, and only calls we are short (Alpaca: options dividend
+    # risk). Far-OTM calls are never exercised and ride through.
+    if (ex_dividend and spread.right == "C" and spread.is_credit and spot is not None):
+        ex_date, cash = ex_dividend
+        today = now.strftime("%Y-%m-%d")
+        last_session_before = today < ex_date and (next_session is None or ex_date <= next_session)
+        if last_session_before and spot >= spread.short_strike - limits.itm_flatten_buffer:
+            return ExitDecision(
+                action="close", rule="dividend_assignment_risk",
+                reason=(f"{spread.underlying} goes ex-dividend {ex_date} ({cash:.2f}/share) and "
+                        f"spot {spot:.2f} is within {limits.itm_flatten_buffer} of the short "
+                        f"{spread.short_strike:g} call; closing to avoid early assignment"),
             )
 
     # 2. Flatten anything still open into the expiry close.
@@ -161,6 +196,24 @@ def decide_exit(
     return ExitDecision(
         action="hold",
         reason=f"value {mark:.2f} between stop {stop_at:.2f} and target {target:.2f}")
+
+
+def _bid(q: dict) -> float | None:
+    """The long leg's bid, where zero is a price and not an absence.
+
+    A far-OTM protective option often has nobody bidding while someone still
+    offers: bid 0, ask 0.03. That option is worth zero to us, and treating it
+    as missing data returned no mark at all, so neither the stop nor the
+    profit target could fire (Codex review, 2026-09-18). Zero counts only
+    when the ask proves the market exists; bid 0 with ask 0 is no quote.
+    """
+    try:
+        bid = float(q.get("bp"))
+    except (TypeError, ValueError):
+        return None
+    if bid > 0:
+        return bid
+    return 0.0 if bid == 0 and _f(q.get("ap")) is not None else None
 
 
 def _f(v) -> float | None:

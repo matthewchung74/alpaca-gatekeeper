@@ -21,7 +21,8 @@ def proposal(**kw) -> TradeProposal:
 def chain_for(p: TradeProposal) -> dict:
     return {
         occ_symbol(p.underlying, p.expiry, p.right, s):
-            {"latestQuote": {"bp": 1.48, "ap": 1.54}, "openInterest": 5000}
+            {"latestQuote": {"bp": 1.48, "ap": 1.54, "bs": 50, "as": 50,
+                             "t": "2026-08-28T16:59:30.123456789Z"}, "openInterest": 5000}
         for s in (p.short_strike, p.long_strike)
     }
 
@@ -137,11 +138,33 @@ def test_tranche_gate_detail_shows_the_regime_math():
 
 # --- macro: only derivable dates, never invented ones ----------------------
 
-def test_nfp_is_the_first_friday():
+def test_payrolls_come_from_the_published_schedule_not_the_first_friday():
+    """Five of 2026's twelve jobs reports were not on a first Friday
+    (Jan 9, Feb 11, May 8, Jul 2, Aug 7). The schedule is published; use it."""
     from datetime import date
-    from agent.macro import _first_friday
-    assert _first_friday(2026, 9) == date(2026, 9, 4)
-    assert _first_friday(2026, 10) == date(2026, 10, 2)
+    from agent.macro import upcoming
+    def jobs(d):
+        return [e for e in upcoming(0, d) if "Employment" in e["event"]]
+    assert jobs(date(2026, 10, 2)) and jobs(date(2026, 7, 2)) and jobs(date(2026, 2, 11))
+    assert not jobs(date(2026, 7, 3)) and not jobs(date(2026, 2, 6))     # the "first Fridays"
+
+
+def test_cpi_and_pce_are_scheduled_events():
+    from datetime import date
+    from agent.macro import upcoming
+    ev = upcoming(within_days=20, today=date(2026, 9, 25))
+    names = {(e["date"], e["event"].split(" (")[0]) for e in ev}
+    assert ("2026-09-30", "PCE / Personal Income and Outlays") in names
+    assert ("2026-10-14", "Consumer Price Index") in names
+    assert ("2026-10-02", "Employment Situation / non-farm payrolls") in names
+
+
+def test_a_year_without_a_published_table_says_so_instead_of_guessing():
+    from datetime import date
+    from agent.macro import upcoming
+    ev = upcoming(within_days=3, today=date(2027, 3, 1))
+    assert any("OUT OF DATE" in e["event"] for e in ev)
+    assert not any("Employment" in e["event"] or "Consumer Price" in e["event"] for e in ev)
 
 
 def test_jobless_claims_land_on_thursdays_only():
@@ -164,8 +187,8 @@ def test_expiry_day_carries_a_claims_print():
 def test_nfp_falls_after_our_expiry():
     """NFP is the window's biggest gap risk and must land after Sep 3."""
     from datetime import date
-    from agent.macro import _first_friday
-    assert _first_friday(2026, 9) > date(2026, 9, 3)
+    from agent.macro import EMPLOYMENT_SITUATION
+    assert date(2026, 9, 4) in EMPLOYMENT_SITUATION and date(2026, 9, 3) not in EMPLOYMENT_SITUATION
 
 
 def test_macro_headlines_filter_picks_out_macro():
@@ -206,7 +229,14 @@ def test_signed_limit_flips_by_sleeve():
     assert satellite(net_price=1.50).signed_limit == pytest.approx(1.50)
 
 
-def test_sleeves_lean_opposite_ways_in_a_bull_tape():
+def test_satellite_is_granted_no_side_in_any_regime():
+    """Switched off 2026-09-17 after four straight fallback losses."""
+    for r in ("bull", "bear", "sideways"):
+        assert not regime.direction_allowed(r, "P", "satellite")
+        assert not regime.direction_allowed(r, "C", "satellite")
+
+
+def _unused_sleeves_lean_opposite_ways_in_a_bull_tape():
     """Core sells puts against the move; satellite buys calls with it."""
     assert regime.direction_allowed("bull", "P", "core")
     assert not regime.direction_allowed("bull", "C", "core")
@@ -214,7 +244,7 @@ def test_sleeves_lean_opposite_ways_in_a_bull_tape():
     assert not regime.direction_allowed("bull", "P", "satellite")
 
 
-def test_sleeves_lean_opposite_ways_in_a_bear_tape():
+def _unused_sleeves_lean_opposite_ways_in_a_bear_tape():
     assert regime.direction_allowed("bear", "C", "core")
     assert regime.direction_allowed("bear", "P", "satellite")
     assert not regime.direction_allowed("bear", "P", "core")
@@ -242,9 +272,10 @@ def test_satellite_blocked_in_sideways_by_the_gate():
     assert not g.passed and "nothing" in g.detail
 
 
-def test_satellite_passes_the_gate_in_a_bull_tape():
-    g = next(x for x in gates_for(satellite(), "bull") if x.name == "regime_direction")
-    assert g.passed
+def test_satellite_is_blocked_by_the_gate_in_every_regime():
+    for r in ("bull", "bear", "sideways"):
+        g = next(x for x in gates_for(satellite(), r) if x.name == "regime_direction")
+        assert not g.passed and "nothing" in g.detail
 
 
 # --- chain rendering must never amputate one wing ------------------------
@@ -303,3 +334,99 @@ def test_small_chain_is_untouched():
     out = _rendered(_fake_chain("SPY", 5, 5))
     assert "omitted" not in out
     assert len([l for l in out.splitlines() if "SPY260903" in l]) == 10
+
+
+# --- the model sees the computed tape; it does not set it -------------------
+
+def test_snapshot_shows_the_computed_tape_and_permitted_sides():
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    from agent.regime import TapeRead
+    read = TapeRead(regime="sideways", range_position=0.03, lookback_high=775.3,
+                    lookback_low=762.04, trend_pct=-0.007, avg_range_pct=0.008, detail="d")
+    out = build_snapshot(
+        now=datetime(2026, 9, 1, 9, 46, tzinfo=ET), equity=100_000.0,
+        day_start_equity=100_000.0, positions=[], quotes={}, chains={}, bars={},
+        news=[], limits=LIMITS, tape={"SPY": read}, sides={"SPY": ("P",)},
+    )
+    assert "TAPE READ" in out and "SPY: sideways" in out
+    assert "range 762.04-775.30" in out and "position 3%" in out
+    assert "core may sell: P" in out
+
+
+def test_decision_has_no_regime_field():
+    from agent.models import AgentDecision
+    assert "regime" not in AgentDecision.model_fields
+
+
+def test_snapshot_prints_the_range_buffer_boundary_from_the_chain():
+    """The gate judges each strike with its own IV; the model must see the
+    same boundary, or it sizes the move from ATM vol and comes up short."""
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    from agent.regime import TapeRead
+    read = TapeRead(regime="sideways", range_position=0.5, lookback_high=770.0,
+                    lookback_low=750.0, trend_pct=0.0, avg_range_pct=0.008, detail="d")
+    chain = {}
+    for k in range(735, 790):
+        right = "P" if k < 760 else "C"
+        chain[occ_symbol("SPY", "2026-09-04", right, float(k))] = {
+            "impliedVolatility": 0.15, "greeks": {"delta": 0.2},
+            "latestQuote": {"bp": 1.0, "ap": 1.05}}
+    out = build_snapshot(
+        now=datetime(2026, 8, 28, 13, 0, tzinfo=ET), equity=100_000.0,
+        day_start_equity=100_000.0, positions=[], quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+        chains={"SPY": chain}, bars={}, news=[], limits=LIMITS, target_expiry="2026-09-04",
+        tape={"SPY": read}, sides={"SPY": ("P", "C")},
+    )
+    # 7 DTE at 15% IV: expected move 15.79 -> puts <= 744.2 and < 750; calls >= 775.8 and > 770
+    assert "puts clear at <= 744" in out and "calls clear at >= 776" in out
+
+
+def test_snapshot_lists_entries_today_and_cooldowns():
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    rows = [dict(id="b", underlying="QQQ", right="C", sleeve="core", short_strike=735.0,
+                 long_strike=740.0, qty=6, entry_credit=0.54, status="closed",
+                 ts_open="2026-09-09T17:46:00+00:00", ts_close="2026-09-10T13:40:50+00:00")]
+    out = build_snapshot(
+        now=datetime(2026, 9, 10, 11, 46, tzinfo=ET), equity=100_000.0,
+        day_start_equity=100_000.0, positions=[], quotes={}, chains={}, bars={},
+        news=[], limits=LIMITS, recent_spreads=rows,
+    )
+    assert "CADENCE" in out and "entries today: 0 of max 4" in out
+    assert "QQQ C until 09-11 09:40 ET" in out
+
+
+def test_fomc_decision_day_is_a_scheduled_event():
+    """2026-09-16 was the target expiry the week of 09-10 and the agent could
+    not see the FOMC decision that afternoon. The Fed publishes the dates."""
+    from datetime import date
+    from agent.macro import upcoming
+    ev = upcoming(within_days=7, today=date(2026, 9, 10))
+    fomc = [e for e in ev if "FOMC" in e["event"]]
+    assert len(fomc) == 1 and fomc[0]["date"] == "2026-09-16"
+    assert not [e for e in upcoming(within_days=3, today=date(2026, 9, 21)) if "FOMC" in e["event"]]
+
+
+def test_snapshot_shows_the_room_left_in_the_book():
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    out = build_snapshot(
+        now=datetime(2026, 9, 21, 9, 46, tzinfo=ET), equity=100_000.0, day_start_equity=100_000.0,
+        positions=[], quotes={}, chains={}, bars={}, news=[], limits=LIMITS,
+        book_lines=["", "BOOK (binding):", "  open max loss 5,853 of book budget 8,400; room 2,547"])
+    assert "BOOK (binding):" in out and "room 2,547" in out
+
+
+def test_snapshot_shows_measured_base_rates_only_with_enough_data():
+    from datetime import datetime
+    from agent.brain import build_snapshot
+    thin = {"0.10-0.20": {"n": 6, "n_eff": 2.0, "implied_hold": 0.85, "realized_hold": 1.0, "edge": 0.15, "mean_ret_hold": 0.2}}
+    out = build_snapshot(now=datetime(2026, 9, 22, 9, 46, tzinfo=ET), equity=50_000.0, day_start_equity=50_000.0,
+                         positions=[], quotes={}, chains={}, bars={}, news=[], limits=LIMITS, base_rates=thin)
+    assert "MEASURED BASE RATES" in out and "not enough data" in out and "85%" not in out
+    solid = {"0.10-0.20": {"n": 90, "n_eff": 24.0, "implied_hold": 0.85, "realized_hold": 0.90, "edge": 0.05, "mean_ret_hold": 0.12}}
+    out = build_snapshot(now=datetime(2026, 9, 22, 9, 46, tzinfo=ET), equity=50_000.0, day_start_equity=50_000.0,
+                         positions=[], quotes={}, chains={}, bars={}, news=[], limits=LIMITS, base_rates=solid)
+    assert "delta 0.10-0.20" in out and "held 90%" in out and "market priced 85%" in out

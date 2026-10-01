@@ -6,10 +6,24 @@ from agent.config import (
     ET, KICKOFF, RiskLimits, TARGET_EXPIRY, AccountGuardError, assert_may_trade,
 )
 from agent.models import TradeProposal, occ_symbol
+from agent.regime import TapeRead
 from agent import risk
 
 LIMITS = RiskLimits()
 MIDDAY = datetime(2026, 8, 28, 13, 0, tzinfo=ET)   # after kickoff, mid-session
+WEEK_OUT = "2026-09-04"       # 7 days after MIDDAY
+QUOTE_T = "2026-08-28T16:59:30.123456789Z"   # 30s before MIDDAY, Alpaca's nanosecond format
+
+
+def tape(**kw) -> TapeRead:
+    base = dict(regime="sideways", range_position=0.5, lookback_high=770.0,
+                lookback_low=750.0, trend_pct=0.0, avg_range_pct=0.008, detail="t")
+    base.update(kw)
+    return TapeRead(**base)
+
+
+def gate(gates, name):
+    return next(g for g in gates if g.name == name)
 
 
 def make_proposal(**kw) -> TradeProposal:
@@ -26,8 +40,16 @@ def make_chain(p: TradeProposal, *, bid=1.48, ask=1.54, oi=5000) -> dict:
     chain = {}
     for strike in (p.short_strike, p.long_strike):
         sym = occ_symbol(p.underlying, p.expiry, p.right, strike)
-        chain[sym] = {"latestQuote": {"bp": bid, "ap": ask}, "openInterest": oi}
+        chain[sym] = {"latestQuote": {"bp": bid, "ap": ask, "bs": 50, "as": 50, "t": QUOTE_T},
+                      "openInterest": oi}
     return chain
+
+
+def chain_with_iv(p: TradeProposal, iv=0.15, **kw) -> dict:
+    ch = make_chain(p, **kw)
+    for snap in ch.values():
+        snap["impliedVolatility"] = iv
+    return ch
 
 
 def evaluate(p, **over):
@@ -58,8 +80,9 @@ def test_max_loss_derived_from_width_not_model():
 # --- happy path ----------------------------------------------------------
 
 def test_clean_proposal_passes_every_gate():
-    p = make_proposal()
-    gates = evaluate(p)
+    p = make_proposal(expiry=WEEK_OUT, short_strike=740.0, long_strike=735.0, net_price=1.10)
+    gates = evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                     tape=tape(), target_expiry=WEEK_OUT)
     assert risk.all_passed(gates), [str(g) for g in risk.blockers(gates)]
 
 
@@ -167,11 +190,15 @@ def test_concentration_gate_counts_existing_exposure():
     assert not next(g for g in gates if g.name == "concentration").passed
 
 
-def test_position_count_gate():
-    p = make_proposal()
-    many = [{"symbol": f"QQQ26090{i}P00500000", "market_value": "100"} for i in range(8)]
-    gates = evaluate(p, open_positions=many)
-    assert not next(g for g in gates if g.name == "position_count").passed
+def test_position_count_counts_spreads_not_legs():
+    """It counted broker LEGS, so "8 concurrent positions" meant four spreads.
+    With smaller tranches the book is meant to hold more than four."""
+    legs = [{"symbol": f"SPY260903P00{700 + i}000", "qty": "1"} for i in range(10)]   # five spreads' legs
+    five = [row(id=str(i)) for i in range(5)]
+    assert gate(evaluate(make_proposal(), open_positions=legs, open_spreads=five), "position_count").passed
+    eight = [row(id=str(i)) for i in range(8)]
+    g = gate(evaluate(make_proposal(), open_positions=legs, open_spreads=eight), "position_count")
+    assert not g.passed and "8 open spreads" in g.detail
 
 
 def test_halt_flag_blocks():
@@ -230,3 +257,389 @@ def test_legs_are_sell_short_buy_long():
     assert legs[0]["position_intent"] == "sell_to_open"
     assert legs[1]["symbol"] == "SPY260903P00747000"
     assert legs[1]["side"] == "buy"
+
+
+# --- post-mortem: strikes lived inside the range at 1-4 DTE ---------------
+
+def test_expiry_floor_is_a_week_out():
+    """Every hackathon trade was 1-4 DTE, where a 0.25-delta strike sits
+    inside one ordinary day's range. Seven days puts it outside."""
+    from agent.config import MIN_DAYS_TO_EXPIRY
+    assert MIN_DAYS_TO_EXPIRY >= 7
+
+
+def test_delta_band_floor_admits_one_expected_move():
+    """One expected move at 7-14 DTE is roughly 0.16 delta; the old 0.20
+    floor would reject every strike the range gate permits."""
+    assert LIMITS.min_short_delta <= 0.10
+
+
+# --- strike placement and premium ------------------------------------------
+
+def test_range_buffer_blocks_a_strike_inside_the_recent_range():
+    # spot 760, 10-session range 750-770: a 752 put is inside it
+    p = make_proposal(expiry=WEEK_OUT, short_strike=752.0, long_strike=747.0)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert not g.passed and "inside" in g.detail
+
+
+def test_range_buffer_blocks_a_strike_inside_one_expected_move():
+    # 7 DTE at 15% IV: expected move = 760 * 0.15 * sqrt(7/365) ~ 15.8
+    # 748 is outside the 750-770 range but only 12 from spot
+    p = make_proposal(expiry=WEEK_OUT, short_strike=748.0, long_strike=743.0)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert not g.passed and "expected move" in g.detail
+
+
+def test_range_buffer_passes_a_strike_beyond_both():
+    p = make_proposal(expiry=WEEK_OUT, short_strike=740.0, long_strike=735.0)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert g.passed, g.detail
+
+
+def test_range_buffer_fails_closed_without_history_or_iv():
+    p = make_proposal(expiry=WEEK_OUT, short_strike=740.0, long_strike=735.0)
+    q = {"SPY": {"bp": 759.9, "ap": 760.1}}
+    no_hist = gate(evaluate(p, chain=chain_with_iv(p), quotes=q,
+                            tape=tape(lookback_high=None, lookback_low=None)), "range_buffer")
+    no_iv = gate(evaluate(p, chain=make_chain(p), quotes=q, tape=tape()), "range_buffer")
+    no_tape = gate(evaluate(p, chain=chain_with_iv(p), quotes=q), "range_buffer")
+    assert not no_hist.passed and not no_iv.passed and not no_tape.passed
+
+
+def test_credit_floor_rejects_thin_premium():
+    p = make_proposal(net_price=0.47)          # 5-wide: 9.4% of width
+    assert not gate(evaluate(p), "credit_floor").passed
+
+
+def test_credit_floor_passes_a_fair_credit():
+    p = make_proposal(net_price=1.10)          # 22% of width
+    assert gate(evaluate(p), "credit_floor").passed
+
+
+def test_credit_floor_ignores_the_satellite():
+    p = make_proposal(sleeve="satellite", short_strike=747.0, long_strike=752.0, net_price=0.47)
+    assert gate(evaluate(p), "credit_floor").passed
+
+
+# --- direction at the edges of a range ---------------------------------------
+
+def test_direction_gate_forbids_short_calls_at_the_bottom_of_a_range():
+    """The 2026-09-01 trade: sideways tape, spot at the range low, sell calls."""
+    p = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    g = gate(evaluate(p, tape=tape(range_position=0.02)), "regime_direction")
+    assert not g.passed and "range" in g.detail
+
+
+def test_direction_gate_forbids_short_puts_at_the_top_of_a_range():
+    p = make_proposal(right="P")
+    g = gate(evaluate(p, tape=tape(range_position=0.95)), "regime_direction")
+    assert not g.passed
+
+
+def test_direction_gate_permits_puts_at_the_bottom_of_a_range():
+    p = make_proposal(right="P")
+    assert gate(evaluate(p, tape=tape(range_position=0.02)), "regime_direction").passed
+
+
+def test_direction_gate_keeps_the_bear_rule_when_the_tape_is_a_trend():
+    p = make_proposal(right="P")
+    g = gate(evaluate(p, tape=tape(regime="bear", range_position=0.02)), "regime_direction")
+    assert not g.passed
+
+
+# --- the shape of the whole book ---------------------------------------------
+
+def row(**kw) -> dict:
+    base = dict(id="r1", underlying="QQQ", right="C", sleeve="core", short_strike=740.0,
+                long_strike=743.0, qty=10, entry_credit=0.60, status="open",
+                ts_open="2026-08-27T15:46:00+00:00", ts_close=None)
+    base.update(kw)
+    return base
+
+
+def test_book_risk_caps_the_whole_book_not_the_tranche():
+    # 24% of 100k = 24,000. Held 20,250; a 4,983 proposal tips it over.
+    held = [row(id="a", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=45)]
+    p = make_proposal(qty=11)
+    g = gate(evaluate(p, open_spreads=held), "book_risk")
+    assert not g.passed and "24%" in g.detail
+
+
+def test_book_risk_scales_with_the_regime_multiplier():
+    held = [row(id="a", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=15)]  # 6,750
+    p = make_proposal(qty=5)                        # 2,265 -> 9,015 total
+    assert gate(evaluate(p, open_spreads=held), "book_risk").passed                     # 24,000
+    assert not gate(evaluate(p, open_spreads=held, regime="bear"), "book_risk").passed  # 8,400
+
+
+def test_same_direction_caps_open_spreads_on_one_right_across_the_universe():
+    held = [row(id=str(i), underlying=u, right="C") for i, u in enumerate(("QQQ", "IWM", "SPY", "QQQ", "IWM"))]
+    p = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    assert gate(evaluate(p, open_spreads=held[:4]), "same_direction").passed        # four is fine
+    g = gate(evaluate(p, open_spreads=held), "same_direction")
+    assert not g.passed and "5 open" in g.detail
+    assert gate(evaluate(make_proposal(right="P"), open_spreads=held), "same_direction").passed
+
+
+def test_losing_side_blocks_adding_to_a_side_already_underwater():
+    """09-02 11:46: QQQ calls added while IWM and SPY calls marked ~2x credit."""
+    held = [row(id="a", underlying="IWM", right="C", entry_credit=0.39)]
+    p = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    losing = gate(evaluate(p, open_spreads=held, open_marks={"a": 0.80}), "losing_side")
+    fine = gate(evaluate(p, open_spreads=held, open_marks={"a": 0.40}), "losing_side")
+    no_mark = gate(evaluate(p, open_spreads=held, open_marks={}), "losing_side")
+    assert not losing.passed and "2.05x" in losing.detail
+    assert fine.passed and no_mark.passed
+
+
+def test_cadence_allows_four_entries_per_day():
+    """1 -> 2 -> 4 on 2026-09-18, all at Matt's call: one entry per scheduled
+    cycle, now that each entry is a third of the size."""
+    def opened(n, day="28"):
+        return [row(id=str(i), underlying="IWM", ts_open=f"2026-08-{day}T1{i}:46:00+00:00") for i in range(n)]
+    assert gate(evaluate(make_proposal(), recent_spreads=opened(3)), "cadence").passed
+    g = gate(evaluate(make_proposal(), recent_spreads=opened(4)), "cadence")
+    assert not g.passed and "4 entries" in g.detail
+    assert gate(evaluate(make_proposal(), recent_spreads=opened(4, day="27")), "cadence").passed
+
+
+def test_cadence_cools_down_after_a_close_in_the_same_name_and_side():
+    closed = [row(id="a", underlying="SPY", right="P", status="closed",
+                  ts_open="2026-08-27T15:46:00+00:00", ts_close="2026-08-28T14:00:00+00:00")]
+    g = gate(evaluate(make_proposal(right="P"), recent_spreads=closed), "cadence")
+    assert not g.passed and "closed" in g.detail
+    other_side = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    assert gate(evaluate(other_side, recent_spreads=closed), "cadence").passed
+    old = [row(id="a", underlying="SPY", right="P", status="closed",
+               ts_open="2026-08-25T15:46:00+00:00", ts_close="2026-08-26T14:00:00+00:00")]
+    assert gate(evaluate(make_proposal(right="P"), recent_spreads=old), "cadence").passed
+
+
+def test_range_buffer_does_not_judge_the_satellite():
+    p = make_proposal(sleeve="satellite", right="P", short_strike=755.0, long_strike=758.0,
+                      net_price=1.0, expiry=WEEK_OUT)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert g.passed and "debit" in g.detail
+
+
+def test_cadence_state_reports_entries_today_and_cooldowns():
+    rows = [row(id="a", ts_open="2026-08-28T15:46:00+00:00"),
+            row(id="b", underlying="SPY", right="P", status="closed",
+                ts_open="2026-08-27T15:46:00+00:00", ts_close="2026-08-28T14:00:00+00:00")]
+    opened, cooling = risk.cadence_state(rows, MIDDAY, LIMITS)
+    assert opened == 1
+    assert [(u, r) for u, r, _ in cooling] == [("SPY", "P")]
+    assert cooling[0][2].astimezone(ET).strftime("%m-%d %H:%M") == "08-29 10:00"
+
+
+def test_range_buffer_ignores_the_stale_range_in_a_trend():
+    """Bear tape: the 10-session high is stale. One expected move is the test."""
+    p = make_proposal(expiry=WEEK_OUT, right="C", short_strike=777.0, long_strike=782.0)
+    q = {"SPY": {"bp": 759.9, "ap": 760.1}}
+    # 777 is 17 from spot (> 15.8 expected move) but inside a range topping at 790
+    inside_range = tape(regime="bear", range_position=0.1, lookback_high=790.0, lookback_low=755.0)
+    sideways = tape(regime="sideways", range_position=0.1, lookback_high=790.0, lookback_low=755.0)
+    assert gate(evaluate(p, chain=chain_with_iv(p), quotes=q, tape=inside_range), "range_buffer").passed
+    assert not gate(evaluate(p, chain=chain_with_iv(p), quotes=q, tape=sideways), "range_buffer").passed
+
+
+# --- Codex review 2026-09-18: market data validity ---------------------------
+
+def _liq(p, **quote_over):
+    ch = make_chain(p)
+    for snap in ch.values():
+        snap["latestQuote"].update(quote_over)
+    return gate(evaluate(p, chain=ch), "liquidity")
+
+
+def test_liquidity_rejects_a_crossed_market():
+    g = _liq(make_proposal(), bp=1.60, ap=1.50)
+    assert not g.passed and "crossed" in g.detail
+
+
+def test_liquidity_rejects_a_stale_quote():
+    g = _liq(make_proposal(), t="2020-01-02T15:00:00Z")
+    assert not g.passed and "stale" in g.detail
+
+
+def test_liquidity_rejects_a_quote_with_no_timestamp_or_no_size():
+    assert not _liq(make_proposal(), t=None).passed
+    g = _liq(make_proposal(), bs=0)
+    assert not g.passed and "size" in g.detail
+
+
+def test_liquidity_fails_closed_when_open_interest_is_missing():
+    p = make_proposal()
+    ch = make_chain(p)
+    for snap in ch.values():
+        snap.pop("openInterest")
+    g = gate(evaluate(p, chain=ch), "liquidity")
+    assert not g.passed and "open interest" in g.detail
+
+
+# --- directional risk must not net one wing against the other ----------------
+
+def test_directional_risk_does_not_cancel_opposite_wings():
+    """A 900 put wing and a 900 call wing used to report 0. A condor still
+    loses a full wing in either tail; each side is measured on its own."""
+    held = [row(id="a", right="P", short_strike=750.0, long_strike=745.0, qty=2, entry_credit=0.5),
+            row(id="b", right="C", short_strike=780.0, long_strike=785.0, qty=2, entry_credit=0.5)]
+    p = make_proposal(right="C", short_strike=790.0, long_strike=795.0, qty=1)
+    g = gate(evaluate(p, open_spreads=held), "directional_risk")
+    assert "rally 1,353" in g.detail and "selloff 900" in g.detail
+
+
+def test_directional_risk_blocks_the_side_that_is_over_even_if_the_other_is_large():
+    big_puts = [row(id="a", right="P", short_strike=750.0, long_strike=745.0, qty=40, entry_credit=0.5)]  # 18,000
+    calls = [row(id="b", right="C", short_strike=780.0, long_strike=785.0, qty=40, entry_credit=0.5)]     # 18,000
+    p = make_proposal(right="C", short_strike=790.0, long_strike=795.0, qty=6)                           # +2,718 -> 20,718
+    assert not gate(evaluate(p, open_spreads=big_puts + calls), "directional_risk").passed
+
+
+def test_book_risk_uses_the_books_regime_not_the_proposed_tickers():
+    """A sideways ticker must not admit risk past the cap a bear book imposes."""
+    held = [row(id="a", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=15)]  # 6,750
+    p = make_proposal(qty=5)                                                              # +2,265
+    assert gate(evaluate(p, open_spreads=held, regime="sideways"), "book_risk").passed
+    g = gate(evaluate(p, open_spreads=held, regime="sideways", book_regime="bear"), "book_risk")
+    assert not g.passed and "bear" in g.detail
+
+
+# --- the session is what the exchange says it is -----------------------------
+
+def test_trading_window_respects_an_early_close():
+    early = (datetime(2026, 11, 27, 9, 30, tzinfo=ET), datetime(2026, 11, 27, 13, 0, tzinfo=ET))
+    at_1258 = datetime(2026, 11, 27, 12, 58, tzinfo=ET)
+    at_1400 = datetime(2026, 11, 27, 14, 0, tzinfo=ET)
+    assert not gate(evaluate(make_proposal(), now=at_1258, session=early), "trading_window").passed
+    assert not gate(evaluate(make_proposal(), now=at_1400, session=early), "trading_window").passed
+    assert gate(evaluate(make_proposal(), now=datetime(2026, 11, 27, 11, 0, tzinfo=ET),
+                         session=early), "trading_window").passed
+
+
+# --- Codex follow-up review 2026-09-18 -----------------------------------------
+
+def test_a_fractional_second_timestamp_keeps_its_timezone():
+    """The parser collected digits from the UTC offset too, lost the zone, and
+    read an hour-old quote as three hours in the FUTURE, which passed."""
+    now = datetime(2026, 9, 18, 14, 0, tzinfo=ET)                      # 18:00Z
+    assert risk._quote_age_minutes("2026-09-18T17:00:00.123456789Z", now) == pytest.approx(60, abs=0.1)
+    assert risk._quote_age_minutes("2026-09-18T17:59:30.123456Z", now) == pytest.approx(0.5, abs=0.1)
+    assert risk._quote_age_minutes("2026-09-18T13:59:00.5-04:00", now) == pytest.approx(1, abs=0.1)
+    p = make_proposal()
+    ch = make_chain(p)
+    for snap in ch.values():
+        snap["latestQuote"]["t"] = "2026-09-18T17:00:00.123456789Z"   # an hour old
+    g = gate(evaluate(p, chain=ch, now=now), "liquidity")
+    assert not g.passed and "stale" in g.detail
+
+
+def test_a_quote_from_the_future_is_not_a_fresh_quote():
+    now = datetime(2026, 9, 18, 14, 0, tzinfo=ET)
+    p = make_proposal()
+    ch = make_chain(p)
+    for snap in ch.values():
+        snap["latestQuote"]["t"] = "2026-09-18T21:00:00Z"             # three hours ahead
+    g = gate(evaluate(p, chain=ch, now=now), "liquidity")
+    assert not g.passed and "future" in g.detail
+
+
+def test_a_proposal_may_not_share_a_contract_with_an_open_spread():
+    """Two lots sharing a short leg pass reconciliation in aggregate but cannot
+    be closed lot by lot. Until the journal allocates per lot, refuse the overlap."""
+    held = [row(id="a", underlying="SPY", right="C", short_strike=770.0, long_strike=775.0)]
+    same_short = make_proposal(right="C", short_strike=770.0, long_strike=780.0)
+    crossed = make_proposal(right="C", short_strike=775.0, long_strike=780.0)     # their long is our short
+    clear = make_proposal(right="C", short_strike=780.0, long_strike=785.0)
+    for p in (same_short, crossed):
+        held[0]["expiry"] = p.expiry
+        g = gate(evaluate(p, open_spreads=held), "leg_overlap")
+        assert not g.passed and "SPY" in g.detail
+    held[0]["expiry"] = clear.expiry
+    assert gate(evaluate(clear, open_spreads=held), "leg_overlap").passed
+
+
+# --- option A: smaller tranches, the same total risk ---------------------------
+
+def test_a_tranche_is_a_third_of_what_it_was_and_the_book_is_not():
+    assert LIMITS.max_tranche_risk_pct == pytest.approx(0.04)
+    assert LIMITS.max_book_risk_pct == pytest.approx(0.24)
+    assert LIMITS.max_directional_risk_pct == pytest.approx(0.20)
+    assert LIMITS.max_daily_loss_pct == pytest.approx(0.04)
+    assert LIMITS.max_same_direction * LIMITS.max_tranche_risk_pct <= LIMITS.max_directional_risk_pct + 1e-9
+
+
+def test_room_is_the_tightest_of_tranche_book_and_side():
+    """Downsizing beats blocking, so size to the room that is actually left
+    rather than to a full tranche the book gate would then refuse."""
+    from agent.risk import room_for_trade
+    eq = 100_000.0
+    assert room_for_trade(equity=eq, regime="sideways", book_regime="sideways", open_spreads=[],
+                          right="C", sleeve="core", limits=LIMITS)[0] == pytest.approx(4_000)
+    # book nearly full: 22,950 of 24,000 held -> 1,050 of room
+    full = [row(id="a", right="P", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=51)]
+    room, note = room_for_trade(equity=eq, regime="sideways", book_regime="sideways", open_spreads=full,
+                                right="C", sleeve="core", limits=LIMITS)
+    assert room == pytest.approx(1_050) and "book" in note
+    # the call side nearly full: 18,900 of 20,000 -> 1,100, tighter than a 4,000 tranche
+    calls = [row(id="a", right="C", entry_credit=0.5, short_strike=740.0, long_strike=745.0, qty=42)]
+    room, note = room_for_trade(equity=eq, regime="sideways", book_regime="sideways", open_spreads=calls,
+                                right="C", sleeve="core", limits=LIMITS)
+    assert room == pytest.approx(1_100) and "rally" in note
+    # a bear book shrinks the whole budget: 24% x 35% = 8,400, tranche 1,400
+    assert room_for_trade(equity=eq, regime="bear", book_regime="bear", open_spreads=[],
+                          right="C", sleeve="core", limits=LIMITS)[0] == pytest.approx(1_400)
+
+
+# --- improved gatekeeper: per-account equity, failure codes --------------------
+
+def test_event_drawdown_is_measured_from_the_accounts_own_start():
+    """The new account starts at 50,000. Against the old hardcoded 100,000 it
+    would have been 'down 50%' and halted on its first cycle."""
+    p = make_proposal()
+    assert gate(evaluate(p, profile="igk", equity=49_000.0, day_start_equity=49_000.0), "event_drawdown").passed
+    assert not gate(evaluate(p, profile="igk", equity=42_400.0, day_start_equity=42_400.0), "event_drawdown").passed
+    assert gate(evaluate(p, profile="dev", equity=90_000.0, day_start_equity=90_000.0), "event_drawdown").passed
+
+
+def test_a_thin_market_fails_with_one_precise_code():
+    p = make_proposal()
+    gates = evaluate(p, chain=make_chain(p, oi=120))
+    assert gate(gates, "liquidity").codes == ["liquidity:oi"]
+    assert risk.failure_codes(gates) == ["credit_floor", "liquidity:oi", "range_buffer:nodata"]
+
+
+def test_range_buffer_names_both_of_its_causes():
+    p = make_proposal(expiry=WEEK_OUT, short_strike=752.0, long_strike=747.0)
+    g = gate(evaluate(p, chain=chain_with_iv(p), quotes={"SPY": {"bp": 759.9, "ap": 760.1}},
+                      tape=tape()), "range_buffer")
+    assert sorted(g.codes) == ["range_buffer:em", "range_buffer:range"]
+
+
+def test_delta_band_says_which_way_it_failed():
+    p = make_proposal()
+    ch = make_chain(p)
+    sym = occ_symbol(p.underlying, p.expiry, p.right, p.short_strike)
+    ch[sym]["greeks"] = {"delta": -0.04}
+    assert gate(evaluate(p, chain=ch), "delta_band").codes == ["delta_band:low"]
+    ch[sym]["greeks"] = {"delta": -0.41}
+    assert gate(evaluate(p, chain=ch), "delta_band").codes == ["delta_band:high"]
+
+
+def test_the_dashboard_measures_pnl_from_the_accounts_own_start(monkeypatch):
+    """The dashboard hardcoded $100,000. On the $50,000 account that reads as
+    a 50% loss on day one."""
+    import importlib, os
+    os.environ["ALPACA_PROFILE"] = "igk"
+    import dashboard.app as app
+    importlib.reload(app)
+    assert app.starting_equity() == 50_000.0
+    os.environ["ALPACA_PROFILE"] = "comp"
+    importlib.reload(app)
+    assert app.starting_equity() == 100_000.0
+    os.environ.pop("ALPACA_PROFILE", None)

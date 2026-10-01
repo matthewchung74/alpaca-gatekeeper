@@ -19,6 +19,9 @@ from typing import Any
 
 from google.cloud import firestore
 
+LOCKS = "locks"
+SHADOW = "shadow"
+RULES = "rules"
 CYCLES = "cycles"
 MARKS = "marks"
 SPREADS = "spreads"
@@ -53,13 +56,14 @@ class FirestoreJournal:
         self, *, profile: str, action: str, snapshot: Any = None,
         reasoning: str | None = None, proposal: Any = None, gates: Any = None,
         regime: str | None = None, equity: float | None = None,
-        order_id: str | None = None, error: str | None = None,
+        order_id: str | None = None, error: str | None = None, usage=None,
     ) -> str:
         doc = {
             "ts": _now(), "profile": profile, "regime": regime, "equity": equity,
             "snapshot": _jsonify(snapshot), "reasoning": reasoning,
             "proposal": _jsonify(proposal), "gates": _jsonify(gates),
             "action": action, "order_id": order_id, "error": error,
+            "usage": _jsonify(usage),
         }
         ref = self.db.collection(CYCLES).document()
         ref.set(doc)
@@ -100,6 +104,109 @@ class FirestoreJournal:
     def set_entry_credit(self, spread_id, credit: float) -> None:
         self.db.collection(SPREADS).document(str(spread_id)).update(
             {"entry_credit": credit})
+
+    # --- one job at a time ------------------------------------------------
+
+    def acquire_lock(self, name: str, holder: str, ttl_s: int) -> bool:
+        """Take the account's lock unless someone else holds a live one.
+
+        A transaction, so the cycle and the sweep cannot both read "free" and
+        both write. The TTL is the backstop for a container that dies holding it.
+        """
+        import time
+        ref = self.db.collection(LOCKS).document(name)
+        txn = self.db.transaction()
+
+        @firestore.transactional
+        def _take(t) -> bool:
+            snap = ref.get(transaction=t)
+            cur = snap.to_dict() if snap.exists else None
+            now = time.time()
+            if cur and cur.get("expires", 0) > now and cur.get("holder") != holder:
+                return False
+            t.set(ref, {"holder": holder, "expires": now + ttl_s, "ts": _now()})
+            return True
+
+        return _take(txn)
+
+    def release_lock(self, name: str, holder: str) -> None:
+        """Let go, but only of a lock that is still ours.
+
+        One transaction. A separate read then delete could remove a lock that
+        expired and was re-taken by someone else between the two calls.
+        """
+        ref = self.db.collection(LOCKS).document(name)
+        txn = self.db.transaction()
+
+        @firestore.transactional
+        def _drop(t) -> None:
+            snap = ref.get(transaction=t)
+            if snap.exists and (snap.to_dict() or {}).get("holder") == holder:
+                t.delete(ref)
+
+        _drop(txn)
+
+    # --- rules versions --------------------------------------------------------
+
+    def get_rules(self, profile: str) -> dict | None:
+        snap = self.db.collection(RULES).document(profile).get()
+        if not snap.exists:
+            return None
+        return json.loads((snap.to_dict() or {}).get("doc") or "null")
+
+    def put_rules(self, profile: str, doc: dict) -> None:
+        self.db.collection(RULES).document(profile).set(
+            {"doc": json.dumps(doc, default=str), "ts": _now()})
+
+    # --- the shadow ledger ---------------------------------------------------
+
+    def record_shadow(self, *, profile: str, ts: str, expiry: str, rules_version: int,
+                      rows: list[dict]) -> str:
+        ref = self.db.collection(SHADOW).document()
+        ref.set({"ts": ts, "profile": profile, "expiry": expiry, "rules_version": rules_version,
+                 "rows": json.dumps(rows, default=str), "settled_at": None})
+        return ref.id
+
+    def mark_shadow(self, shadow_id, *, chosen=None, traded=None) -> None:
+        from .journal import _mark
+        ref = self.db.collection(SHADOW).document(str(shadow_id))
+        snap = ref.get()
+        if not snap.exists:
+            return
+        rows = _mark(json.loads((snap.to_dict() or {}).get("rows") or "[]"), chosen, traded)
+        ref.update({"rows": json.dumps(rows)})
+
+    def unsettled_shadow(self, profile: str, on_or_before: str) -> list[dict]:
+        # Single-field filter, narrowed in Python: no composite index needed.
+        docs = self.db.collection(SHADOW).where(
+            filter=firestore.FieldFilter("profile", "==", profile)).stream()
+        out = []
+        for d in docs:
+            doc = {**d.to_dict(), "id": d.id}
+            if doc.get("settled_at") is None and str(doc.get("expiry")) <= on_or_before:
+                doc["rows"] = json.loads(doc.get("rows") or "[]")
+                out.append(doc)
+        return sorted(out, key=lambda x: x.get("ts") or "")
+
+    def settle_shadow(self, shadow_id, rows: list[dict]) -> None:
+        self.db.collection(SHADOW).document(str(shadow_id)).update(
+            {"rows": json.dumps(rows, default=str), "settled_at": _now()})
+
+    def settled_shadow(self, profile: str, since: str | None = None) -> list[dict]:
+        docs = self.db.collection(SHADOW).where(
+            filter=firestore.FieldFilter("profile", "==", profile)).stream()
+        out = []
+        for d in docs:
+            doc = {**d.to_dict(), "id": d.id}
+            if doc.get("settled_at") and (doc.get("ts") or "") >= (since or ""):
+                doc["rows"] = json.loads(doc.get("rows") or "[]")
+                out.append(doc)
+        return sorted(out, key=lambda x: x.get("ts") or "")
+
+    def reduce_spread(self, spread_id, *, qty: int, realized_pnl: float) -> None:
+        """A partial close: fewer contracts remain, and some P&L is banked."""
+        self.db.collection(SPREADS).document(str(spread_id)).update(
+            {"qty": qty, "realized_pnl": realized_pnl})
 
     def _spreads(self, profile: str) -> list[dict]:
         docs = self.db.collection(SPREADS).where(
@@ -143,9 +250,11 @@ class FirestoreJournal:
         return [{"ts": d.get("ts"), "equity": d.get("equity")} for d in docs
                 if profile is None or d.get("profile") == profile]
 
-    def day_start_equity(self, day: str) -> float | None:
+    def day_start_equity(self, day: str, profile: str | None = None) -> float | None:
         docs = self.db.collection(MARKS).where(
             filter=firestore.FieldFilter("day", "==", day)
         ).stream()
         rows = sorted((d.to_dict() for d in docs), key=lambda r: r.get("ts") or "")
+        if profile is not None:
+            rows = [r for r in rows if r.get("profile") == profile]
         return rows[0]["equity"] if rows else None

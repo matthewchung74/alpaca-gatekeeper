@@ -237,3 +237,84 @@ material here — they are specific, verifiable, and useful to anyone else build
   (they have the longest runway and the least risk of going stale), **3 today or
   tomorrow while the position is intact**, 4 midweek, 5 after the Sep-3 expiry
   settles.
+
+---
+
+## Post — I blamed the wrong half · DRAFT (in the LinkedIn composer, not published)
+
+Covers the hackathon, the 09-08 post-mortem and the first week on the new rules (through 09-17).
+Deliberately excludes everything from 09-18. The earlier cross-model-audit draft is in git history (581b6ad).
+
+Link for the comments: https://github.com/matthewchung74/alpaca-gatekeeper/tree/post-mortem-gates
+(the fixes live on the `post-mortem-gates` branch; `main` is still the submitted version)
+
+### LinkedIn
+
+> My trading bot lost money, and I blamed the wrong half of it.
+>
+> For the Alpaca × lablab.ai hackathon I built an autonomous options agent. An LLM proposes a credit spread, and deterministic Python gates decide whether it is allowed to exist. It traded a paper account for a week and finished down 1.9%. Nine trades, five winners.
+>
+> My first write-up said what most post-mortems say: selling premium needs about 65% winners, I got 56%, call it variance. The stops felt like the culprit. Two losers had blown straight through them on overnight gaps.
+>
+> Then I did the one thing I had skipped. I replayed every trade as if the bot had never exited and had simply held to expiry.
+>
+> Actual result: −$1,843
+> Held to expiry: −$11,358
+>
+> The exits I was blaming had saved about $9,500. Six of my nine short strikes finished in the money. For strikes chosen at 0.25 to 0.30 delta, that should be two or three.
+>
+> The entries were broken, and the replay showed how:
+>
+> • Every trade was 1 to 4 days from expiry. That close in, a 0.25-delta strike sits 0.5 to 1% from spot, inside one ordinary day's move. Eight of nine short strikes were inside the range the market had already traded that week.
+> • The model labeled a 1.2% dip "bear," at the very bottom of a 15-session range. My own rule said bear means sell calls only. So it sold five call spreads in 26 hours, at the low, across three index ETFs that move together. The last three lost together on the bounce.
+> • It proposed a trade in 13 of 13 cycles where it had budget. Nothing in the system ever made doing nothing the attractive choice.
+>
+> The part that stung: that regime rule was my proudest safety feature. "The model's market read can only ever reduce risk." It did reduce the size. Then it pointed the whole book at the wrong side.
+>
+> What changed: the regime is now computed from price bars instead of asked of the model. Strikes must sit outside the recent range and at least one expected move away. Expiries are a week or more out. The book has caps on how many bets can lean the same way.
+>
+> First week on the new rules, still paper: the premium-selling side went 2 for 2. A directional sleeve I had never actually tested went 0 for 4, every one a fallback taken because the main strategy had nothing legal to do. I turned it off. Net: roughly flat, and no claim of an edge yet.
+>
+> What I took from it:
+>
+> 1. Run the counterfactual before you assign blame. "The win rate was too low" is a symptom, not a cause.
+> 2. A rule that forces a direction is a bet, even when it is labeled a safety control.
+> 3. If standing down never wins inside your system, your system will always trade.
+>
+> Repo in the comments.
+>
+> #AITrading #AlpacaMarkets #lablab #Claude #BuildInPublic
+
+
+---
+
+## Post — I read everyone else's code · DRAFT 2026-09-21 (in the LinkedIn composer, not published)
+
+Link in the post: https://github.com/matthewchung74/alpaca-gatekeeper/tree/improved-gatekeeper
+
+### LinkedIn
+
+> My trading bot is losing money, so I did what any engineer would do: read everyone else's code.
+>
+> Quick recap. I built an options-trading agent for the Alpaca × lablab.ai hackathon. An LLM proposes a credit spread, deterministic Python gates decide if it's allowed to exist. Three weeks in, two paper accounts, both down about 2%. The controls work. The strategy has not proven it does.
+>
+> So I went through seven other entries, including the most-voted ones, and read the actual code, not the READMEs. Some highlights:
+>
+> • Three had no AI in the trading loop. The "AI" was if-statements with a nice logo.
+> • One backtested with random numbers. Literally np.random.
+> • Three traded plain stocks. In an options-only competition.
+> • All seven were missing the exact thing mine is missing: any proof the strategy has an edge.
+>
+> But two had ideas good enough to steal.
+>
+> 🔎 VegaGuard's shadow ledger. It journals every trade it considered and rejected, then checks later what those would have done. My bot now records about 250 spreads it did NOT take every cycle and grades them at expiry. For the first time I can ask each safety gate: are you saving me money, or costing me trades that would have won?
+>
+> 🎯 Theo's honesty grid. Every trade gets two grades: was the view right, and was the structure right. A trade that profits despite a wrong view is labeled luck, and luck teaches the bot nothing. Copied verbatim in spirit.
+>
+> Then I went one step further. The bot now tunes its own gates: one dial, one notch, only after roughly a month of evidence, and it reverts the change if the newly admitted trades lose. No LLM anywhere in that loop. Just arithmetic and patience. Size is earned the same way, and lucky wins buy no size.
+>
+> Still paper. Still no edge shown. But now it can measure, which beats guessing.
+>
+> Code: https://github.com/matthewchung74/alpaca-gatekeeper/tree/improved-gatekeeper
+>
+> #AITrading #AlpacaMarkets #lablab #BuildInPublic #Claude

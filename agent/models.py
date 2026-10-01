@@ -126,6 +126,7 @@ class OpenSpread(BaseModel):
     qty: int
     entry_credit: float          # net price paid/received at entry, always positive
     sleeve: Sleeve = "core"
+    realized_so_far: float = 0.0  # P&L already banked by partial closes
 
     @property
     def is_credit(self) -> bool:
@@ -156,15 +157,19 @@ class OpenSpread(BaseModel):
              "position_intent": "sell_to_close"},
         ]
 
-    def realized_pnl(self, exit_price: float) -> float:
-        """P&L in dollars.
+    def realized_pnl(self, exit_price: float, qty: int | None = None) -> float:
+        """P&L in dollars on `qty` contracts (default: the whole position).
 
         Credit spread: we took in `entry_credit` and pay `exit_price` to close.
         Debit spread:  we paid `entry_credit` and receive `exit_price` to close.
+
+        Per-quantity because closes can be partial, at different prices. The
+        caller adds `realized_so_far` for the position's total.
         """
+        n = self.qty if qty is None else qty
         if self.is_credit:
-            return (self.entry_credit - exit_price) * 100.0 * self.qty
-        return (exit_price - self.entry_credit) * 100.0 * self.qty
+            return (self.entry_credit - exit_price) * 100.0 * n
+        return (exit_price - self.entry_credit) * 100.0 * n
 
 
 class ExitDecision(BaseModel):
@@ -174,10 +179,12 @@ class ExitDecision(BaseModel):
 
 
 class AgentDecision(BaseModel):
-    """What the brain returns each cycle. `proposal` is None when it stands down."""
-    regime: Literal["bull", "bear", "sideways"] = Field(
-        description="Your read of the current regime for the traded universe"
-    )
+    """What the brain returns each cycle. `proposal` is None when it stands down.
+
+    No regime field. The regime is computed from the bars in regime.classify
+    and shown to the model; a label the model could set was a control the
+    model could move, and on 2026-09-01 it moved it to the wrong side.
+    """
     reasoning: str = Field(description="Your analysis, for the journal and the demo")
     proposal: TradeProposal | None = Field(
         default=None, description="The trade to open, or null to stand down this cycle"
@@ -188,6 +195,10 @@ class GateResult(BaseModel):
     name: str
     passed: bool
     detail: str
+    # Machine-readable causes, "<gate>:<cause>". `detail` is for people; this is
+    # for the shadow ledger, which has to know WHICH parameter refused a spread
+    # before it can say whether that parameter is earning its keep.
+    codes: list[str] = []
 
     def __str__(self) -> str:
         return f"[{'PASS' if self.passed else 'BLOCK'}] {self.name}: {self.detail}"

@@ -189,20 +189,148 @@ def fill_result(order_id: str, profile: str, tries: int = 24,
 
 
 def list_expiries(underlying: str, profile: str, on_or_after: str,
-                  limit: int = 400) -> list[str]:
-    """Expiries actually listed for an underlying, nearest first.
+                  until: str | None = None) -> list[str]:
+    """Expiries actually listed for an underlying in [on_or_after, until], nearest first.
 
-    The contracts endpoint returns rows sorted by expiry, so a truncated page
-    still contains the nearest dates -- which is all the caller wants. Never
-    guess these from a calendar: SPY, QQQ and IWM do not share one weekly
+    Never guess these from a calendar: SPY, QQQ and IWM do not share one weekly
     pattern, and a guessed date produces an empty chain and a stood-down cycle.
+
+    Calls only, and paged to the end of the window. This used to take one page
+    of 400 contracts sorted by date, on the theory that "a truncated page still
+    contains the nearest dates". Each expiry lists about 300 contracts, so the
+    page held the nearest one or two expiries and nothing else -- enough to
+    find "the nearest", never enough to find the nearest FRIDAY.
     """
-    data = run("api", "GET",
-               f"/v2/options/contracts?underlying_symbols={underlying}"
-               f"&expiration_date_gte={on_or_after}&limit={limit}",
-               profile=profile)
-    rows = (data or {}).get("option_contracts") or []
-    return sorted({r["expiration_date"] for r in rows if r.get("expiration_date")})
+    found: set[str] = set()
+    token = ""
+    for _ in range(20):
+        path = (f"/v2/options/contracts?underlying_symbols={underlying}&type=call"
+                f"&expiration_date_gte={on_or_after}"
+                + (f"&expiration_date_lte={until}" if until else "")
+                + "&limit=1000" + (f"&page_token={token}" if token else ""))
+        data = run("api", "GET", path, profile=profile) or {}
+        found |= {r["expiration_date"] for r in data.get("option_contracts") or []
+                  if r.get("expiration_date")}
+        token = data.get("next_page_token") or ""
+        if not token:
+            break
+    return sorted(found)
+
+
+
+def option_bars(symbols: list[str], start: str, end: str, profile: str) -> dict[str, list[dict]]:
+    """Daily bars per contract over [start, end], in batches of 100, paged.
+
+    Used only by the shadow ledger's settlement. Paper option bars contain
+    absurd prints (a 3-wide spread's short leg printed 15.88 on 2026-09-21),
+    so callers must clamp anything derived from them.
+    """
+    out: dict[str, list[dict]] = {s: [] for s in symbols}
+    for i in range(0, len(symbols), 100):
+        batch = symbols[i:i + 100]
+        token = ""
+        for _ in range(20):
+            args = ["data", "option", "bars", "--symbols", ",".join(batch), "--timeframe", "1Day",
+                    "--start", start, "--end", end, "--limit", "1000"]
+            if token:
+                args += ["--page-token", token]
+            data = run(*args, profile=profile) or {}
+            for sym, bars in (data.get("bars") or {}).items():
+                out.setdefault(sym, []).extend(bars or [])
+            token = data.get("next_page_token") or ""
+            if not token:
+                break
+    return out
+
+
+def daily_close(symbol: str, day: str, profile: str) -> float | None:
+    """The underlying's close on one day, or None if no bar exists for it.
+
+    Asks for a short window ending the day before today: the free data plan
+    returns 403 for any window that reaches into the last fifteen minutes,
+    and a future `day` would do exactly that.
+    """
+    from datetime import date, timedelta
+    try:
+        d = date.fromisoformat(day)
+    except ValueError:
+        return None
+    if d >= date.today():
+        return None
+    start = (d - timedelta(days=6)).isoformat()
+    end = (d + timedelta(days=1)).isoformat()             # --end is exclusive
+    data = run("data", "bars", "--symbol", symbol, "--timeframe", "1Day",
+               "--start", start, "--end", end, profile=profile)
+    # The LAST session at or before `day`. An option's expiration date can fall
+    # on a weekend or holiday (SPY lists a Saturday 2026-09-19), and it then
+    # settles on the prior session's close.
+    last = None
+    for b in (data or {}).get("bars", []) or []:
+        if str(b.get("t", ""))[:10] <= day:
+            try:
+                last = float(b["c"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return last
+
+
+def fills(profile: str, after: str) -> list[dict]:
+    """The broker's own record of executions since `after` (YYYY-MM-DD), oldest first."""
+    return run("account", "activity", "list", "--activity-types", "FILL", "--after", after,
+               "--direction", "asc", "--page-size", "100", profile=profile) or []
+
+
+def open_orders(profile: str) -> list[dict]:
+    """Open parent orders. --nested rolls legs under their multi-leg parent."""
+    return run("order", "list", "--status", "open", "--nested", "--limit", "100",
+               profile=profile) or []
+
+
+def ex_dividend(symbol: str, profile: str, since: str, until: str) -> tuple[str, float] | None:
+    """The next cash ex-dividend date for a symbol in [since, until], with the amount.
+
+    Alpaca only announces these a couple of days ahead (SPY's 2026-09-18
+    ex-date was declared 09-16), so this is asked every cycle, not tabulated.
+    """
+    rows = run("corporate-action", "list", "--symbol", symbol, "--ca-types", "Dividend",
+               "--since", since, "--until", until, "--date-type", "ex_date",
+               profile=profile) or []
+    best = None
+    for r in rows:
+        if r.get("ca_sub_type") != "cash" or not r.get("ex_date"):
+            continue
+        try:
+            item = (r["ex_date"], float(r.get("cash") or 0))
+        except (TypeError, ValueError):
+            continue
+        if best is None or item[0] < best[0]:
+            best = item
+    return best
+
+
+def contracts_oi(underlying: str, expiry: str, profile: str) -> dict[str, int]:
+    """Open interest for every contract of one underlying and expiry.
+
+    The chain snapshot does not carry it; only the contracts endpoint does,
+    and it returns a whole expiry per call. Fetched in observe(), BEFORE the
+    model chooses, so it can see which strikes are liquid rather than learn
+    at the gate that its pick was not.
+    """
+    out: dict[str, int] = {}
+    token = ""
+    for _ in range(10):
+        path = (f"/v2/options/contracts?underlying_symbols={underlying}"
+                f"&expiration_date={expiry}&limit=1000" + (f"&page_token={token}" if token else ""))
+        data = run("api", "GET", path, profile=profile) or {}
+        for c in data.get("option_contracts") or []:
+            try:
+                out[c["symbol"]] = int(float(c.get("open_interest") or 0))
+            except (KeyError, TypeError, ValueError):
+                continue
+        token = data.get("next_page_token") or ""
+        if not token:
+            break
+    return out
 
 
 def news(symbols: list[str], profile: str, limit: int = 12) -> list[dict]:

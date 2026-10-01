@@ -26,6 +26,7 @@ GCLOUD = "/Users/mattc/google-cloud-sdk/bin/gcloud"
 ALPACA = "/opt/homebrew/bin/alpaca"
 PROFILE = "dev"
 PROJECT = "alpaca-ai-agent-2026"
+ANTHROPIC_MODEL = "claude-opus-5"          # the model the agent trades with
 REGION = "us-east1"
 FIRESTORE = (f"https://firestore.googleapis.com/v1/projects/{PROJECT}"
              "/databases/(default)/documents")
@@ -316,6 +317,11 @@ def check_journal_errors(state: dict, now_utc: datetime, *,
         if not ts or (now_utc - ts) >= timedelta(hours=24):
             continue
         recovered = reconciled and later_ok is not None and ts < later_ok
+        # An unfilled entry carries an error string because the loop wants
+        # the reason on record, but it is a chosen outcome: the order rested,
+        # did not fill, and was cancelled with nothing held. Worth seeing,
+        # not worth paging every 15 minutes (2026-09-10, IWM 284/280).
+        benign = c.get("action") == "unfilled"
         # While entries are paused no later cycle can ever run, so `recovered`
         # can never become true and these would page forever. Still worth
         # seeing; not worth waking anyone.
@@ -324,11 +330,46 @@ def check_journal_errors(state: dict, now_utc: datetime, *,
                     "agrees with the journal]")
         elif entries_paused:
             note = " [entries paused; cannot clear until the agent resumes]"
+        elif benign:
+            note = " [unfilled entry; nothing held]"
         else:
             note = ""
-        report("WARN" if (recovered or entries_paused) else "CRIT", "journal",
+        report("WARN" if (recovered or entries_paused or benign) else "CRIT", "journal",
                f"cycle {ts.astimezone(ET):%m-%d %H:%M ET} recorded error: "
                f"{str(c['error'])[:220]}" + note)
+
+
+# --- check 6b: the model the agent depends on, called for real -----------
+
+def check_anthropic_api() -> None:
+    """One one-token call to the agent's own model, every wake-up.
+
+    On 2026-09-07 the API balance hit zero and the first anyone knew was a
+    journaled brain error after the cycle had already fetched the market.
+    Reading the key from Secret Manager is a GET; the call itself costs a
+    fraction of a cent.
+    """
+    key = gcloud("secrets", "versions", "access", "latest", "--secret=anthropic-api-key")
+    if not key:
+        report("WARN", "anthropic", "API key unreadable from Secret Manager; check skipped")
+        return
+    body = json.dumps({
+        "model": ANTHROPIC_MODEL, "max_tokens": 1,
+        "thinking": {"type": "disabled"}, "output_config": {"effort": "low"},
+        "messages": [{"role": "user", "content": "ping"}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body, method="POST",
+        headers={"x-api-key": key.strip(), "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:200]
+        report("CRIT", "anthropic", f"{ANTHROPIC_MODEL} call failed HTTP {e.code}: {detail}")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        report("WARN", "anthropic", f"could not reach the API: {e}")
 
 
 # --- check 7: risk limits, from the equity the agent itself reported ---
@@ -479,6 +520,7 @@ def main() -> int:
             print(f"    [note] state dump failed: {e}")
     entries_paused = check_schedulers()
     check_executions(now_utc, now_et, entries_paused=entries_paused)
+    check_anthropic_api()
     if state is not None:
         # Reconciliation first: it is the evidence that decides whether a past
         # journal error still matters or is already repaired.

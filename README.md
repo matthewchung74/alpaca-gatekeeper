@@ -17,7 +17,7 @@ The usual answer is to put the risk rules in the prompt. That fails quietly. A m
 Gatekeeper takes the opposite position. **Claude decides what to trade. Deterministic Python decides whether that trade is allowed to exist.** The two are separate processes with a hard boundary between them:
 
 ```
-observe ──▶ reason (Claude Opus 5) ──▶ 16 gates (pure Python) ──▶ Alpaca CLI ──▶ journal
+observe ──▶ reason (Claude Opus 5) ──▶ 23 gates (pure Python) ──▶ Alpaca CLI ──▶ journal
              proposes                    disposes                  executes
 ```
 
@@ -50,6 +50,8 @@ Every cycle is journaled this way — the market snapshot, the model's full reas
 
 The core sleeve sells premium **against** the direction of the move. The satellite buys defined-risk exposure **with** it. That is what makes this a barbell rather than the same bet twice, and it is why a range-bound tape permits no satellite at all: with no trend to buy, paying a debit for convexity is burning premium.
 
+**The satellite is switched off as of 2026-09-17.** Its first four live trades were all put debit spreads bought at the bottom of a range because the core had no legal strike that day, and all four stopped out at the next open, −$1,500 together. The code stays; the regime policy grants it no side in any regime.
+
 The economics genuinely invert. On a 5-wide spread at 1.50 net price:
 
 ```
@@ -73,29 +75,27 @@ This is a risk control and a credibility control at once. Alpaca's paper environ
 
 ---
 
-## Regime is a control, not a label
+## Regime is computed, not asked
 
-The agent classifies the tape as bull, bear or sideways. That classification is **not advisory** — it mechanically sets the risk budget and forbids trade directions:
+The hackathon version let the model label the tape and bound the risk budget and the permitted direction to that label. On 2026-09-01 it labelled a 1.2% dip to the bottom of a 15-session band "bear", the bear rule permitted calls only, and the book sold four call spreads at the range low. They lost together on the rally two days later.
 
-| Regime | Core budget | Core may sell | Satellite budget | Satellite may buy |
-|---|---|---|---|---|
-| sideways | 12.00% | puts or calls | — | **nothing** |
-| bull | 10.20% | **puts** only | 3.40% | **calls** |
-| bear | 4.20% | **calls** only | 1.40% | **puts** |
+Now `regime.classify` reads the last ten completed sessions: a trend if spot has moved more than twice the mean daily range since the session ten back, otherwise sideways, plus where spot sits inside the ten-session high-low.
 
-Two properties matter here:
+| Read | Core budget | Core may sell |
+|---|---|---|
+| sideways, middle of range | 4.00% | puts or calls |
+| sideways, bottom quarter | 4.00% | **puts** only |
+| sideways, top quarter | 4.00% | **calls** only |
+| bull | 3.40% | **puts** only |
+| bear | 1.40% | **calls** only |
 
-**A regime can only ever reduce risk.** The configured budget is a ceiling no market read can raise. An unrecognised regime string falls back to the most defensive policy.
+The model sees the read in its snapshot and cannot change it.
 
-**The bear rule forbids selling puts into a downtrend** — precisely how short-premium accounts die. The agent's own analysis is what triggers that lockout, and the prompt tells it so: inflating the regime to unlock size is the one thing that would actually lose the money.
-
-You can watch it comply. From a live decision:
-
-> *"Neither the up-tape needed for a 'bull' call nor the sequence of lower lows needed for 'bear' is present, so I report sideways honestly and take the direction the chop favours."*
+Budgets are per trade and deliberately small. The hackathon ran 12% tranches, where two positions filled the 24% book and nothing else could be entered until one closed. A tranche is now a third of that inside the same book cap, directional cap and daily limit: the same total risk in more, smaller positions, each proposal cut to whatever room the tranche, the book and its side have left.
 
 ---
 
-## The 16 gates
+## The 23 gates
 
 Every gate is a pure function of the proposal plus observed account and market state. A proposal must clear **all** of them.
 
@@ -112,13 +112,20 @@ Every gate is a pure function of the proposal plus observed account and market s
 | 8 | `regime_direction` | The sleeve may only lean the way the regime permits |
 | 9 | `tranche_risk` | Max loss within the sleeve's regime-adjusted budget |
 | 10 | `concentration` | 35% of equity per underlying |
-| 11 | `position_count` | 8 concurrent positions |
+| 11 | `position_count` | 8 open spreads |
 | 12 | `trading_window` | Not in the first or last 5 minutes of a session |
 | 13 | `liquidity` | Both legs quoted, spread ≤ 10% of mid, OI ≥ 500 |
-| 14 | `delta_band` | Short-leg \|delta\| within 0.20–0.35 |
-| 15 | `portfolio_delta` | Net directional exposure across the whole book ≤ 2.0× equity |
+| 14 | `delta_band` | Short-leg \|delta\| within 0.10–0.35 |
+| 15 | `directional_risk` | Max loss signed by direction across the book ≤ 20% of equity |
+| 16 | `range_buffer` | Short strike ≥ 1 expected move from spot; in a sideways tape also outside the 10-session high-low |
+| 17 | `credit_floor` | Credit ≥ 10% of width |
+| 18 | `book_risk` | Open max loss + proposal ≤ 24% of equity × regime multiplier |
+| 19 | `same_direction` | ≤ 5 open core spreads on one right across SPY/QQQ/IWM |
+| 20 | `losing_side` | No new spread on a right where an open spread marks ≥ 1.5× its credit |
+| 21 | `cadence` | 4 entries per day; 24h cooldown per underlying and right after a close |
+| 22 | `leg_overlap` | A new spread may not reuse a contract an open spread already holds |
 
-Gate 15 is the answer to how this event was lost: three short call spreads in three tickers, each inside every other limit, were one bet that fell together. `concentration` caps exposure per underlying and nothing aggregated direction across the book. Its 2.0× threshold is calibrated on a single week and is a starting point, not a validated constant.
+Gates 16 to 21 come from the post-mortem. Six of nine hackathon short strikes finished in the money; held to expiry the book would have lost about $11,400 against the $1,843 it did lose. The strikes sat inside the prior week's range at one to four days to expiry, the book stacked three same-direction spreads in three tickers that move together, and the model proposed a trade in every cycle it had budget for. Each of those is now a gate.
 
 Gate 14 exists because the prompt had asked for a 0.25–0.30 short delta since day one and nothing enforced it — a 0.304-delta call cleared every gate on 28 Aug because none of them looked. The enforced band is deliberately wider than the instruction: strikes are a point apart and delta moves 0.03–0.05 per strike, so a literal 0.25–0.30 gate leaves one legal strike per wing and, on the live 3 Sep chain, none at all for QQQ puts. It is also the one gate that passes when its input is missing, because it governs strategy conformance rather than solvency — max loss is bounded by `defined_risk` and `tranche_risk` whatever the delta.
 
@@ -133,6 +140,8 @@ Exits are as deterministic as entries — the model has no say in when a positio
 | Rule | Core (credit) | Satellite (debit) |
 |---|---|---|
 | `assignment_risk` | Expiry day, spot within $0.50 of the short strike | same |
+| `dividend_assignment_risk` | Last session before an ex-dividend date, short **call** within $0.50 of spot | n/a |
+| `daily_loss_flatten` | Day's loss from the prior close reaches 4%: close everything, halt until tomorrow | same |
 | `expiry_flatten` | Expiry day, 30 min before the close | same |
 | `stop_loss` | Cost to close ≥ 3× the credit (capped below the width) | Value ≤ 50% of the debit paid |
 | `profit_target` | Cost to close ≤ 50% of the credit | Value ≥ 60% of max profit |
@@ -146,6 +155,31 @@ Three details that took a live position to get right:
 **Degraded data holds, except when it can't.** Losing quotes returns `hold` — but `expiry_flatten` and `assignment_risk` still fire without a mark, so a data outage cannot strand the book into assignment.
 
 ---
+
+## The model chooses from what can pass
+
+Before the model is asked anything, `agent/candidates.py` walks every vertical up to five points wide on the permitted sides and runs the same per-trade gate functions the final verdict uses: liquidity including open interest, delta band, range buffer, credit floor, leg overlap. The survivors go into the snapshot with their mid and natural credit, short delta and open interest, and the model is told to choose from that list or stand down. The count of pairs each gate rejected is journaled with every cycle, so whether a threshold is too tight is a number in the log.
+
+The expiry is the nearest **Friday** weekly at least seven days out. "Nearest expiry" kept landing on Monday and Wednesday weeklies listed days earlier: on 2026-09-18 the 09-28 Monday weekly had 1 surviving vertical out of 115 across all three names, and the 10-02 Friday had 26 of 183.
+
+## How it measures itself
+
+Nobody has shown this strategy has an edge, and its rules were tuned off a handful of trades. So the agent now keeps a **shadow ledger**: every entry cycle journals every vertical it enumerated, traded or not, with the claim each one makes ("at expiry the underlying closes beyond the short strike") and the gate codes that refused it. A daily job after the close settles each claim two ways: held to expiry, which is exact from the underlying's close, and managed by the agent's own 50% target and 3x stop, which is approximate from daily option bars.
+
+`python -m agent.shadow report` prints four things, each with an **effective sample size** (neighbouring strikes on one underlying, side and expiry share a terminal price and count as one observation):
+
+- **Gate regret**, per gate: what the spreads it alone refused went on to do, against what it admitted.
+- **Calibration** by short delta: the market's implied hold rate (1 − delta) against the realized one. Positive edge means the premium was rich. This is the edge test.
+- **Model versus field**: the model's pick against the mean eligible candidate in the same cycle.
+- **View × structure** on real closed trades: was the claim right, and did the exits do their job. A lucky win, where the view failed but the trade profited, is named and counts for nothing.
+
+## How it learns
+
+After each settlement the learning step may move **one** tunable gate parameter **one** rung on its ladder, and only one change is ever in flight. Tunable: the open-interest floor, the bid-ask width, the expected-move multiple, the credit floor, and the delta band. Never tunable: tranche, book, directional and daily-loss caps, position count, leg overlap, quote validity, direction, cadence.
+
+A gate is loosened when the spreads it alone refused have at least 20 effective observations, a positive mean return, and beat the admitted set with one-sided 95% confidence. It is tightened when the marginal band it admits loses money by the same test. Every change is then judged on data collected after it, and reverted and locked for eight weeks if the newly admitted band loses. With six clusters a week, the first change cannot come for about four weeks.
+
+Position size is earned the same way: half a tranche until ten attributable closed trades with a positive mean, then three quarters, then full at twenty-five. A drawdown steps it back down. Lucky wins buy no size.
 
 ## What the model actually sees
 
@@ -165,7 +199,7 @@ RISK LIMITS IN FORCE
 
 The bars are load-bearing. Without them the agent produced confident claims — *"near the upper end of its range"*, *"grinding higher"* — that nothing in its input supported, and that ungrounded read was setting the risk budget. With them it cites specific closes and is explicitly forbidden from asserting a trend the bars don't show.
 
-The scheduled-release list contains **only events whose timing is derivable from the calendar** (weekly jobless claims on Thursdays, non-farm payrolls on the first Friday). Everything else — CPI, PCE, ISM, FOMC — arrives through the news feed as it actually prints. An invented date is worse than no date, because the agent treats it as fact and sizes on it.
+The scheduled-release list contains **only dates that are structural or published in advance by the agency itself**: weekly jobless claims on Thursdays, and the BLS, BEA and Fed schedules for payrolls, CPI, PCE and FOMC decisions. Payrolls used to be "the first Friday", which was wrong for five of 2026's twelve reports. Everything else arrives through the news feed as it actually prints. An invented date is worse than no date, because the agent treats it as fact and sizes on it, so a year with no table tells the model the calendar is out of date rather than guessing.
 
 ---
 
@@ -184,6 +218,7 @@ Cloud Scheduler ──▶ Cloud Run Job ──▶ Alpaca CLI  +  Anthropic API
 |---|---|
 | `agent-cycle` (Cloud Run Job) | Full entry cycle. 09:45 / 11:45 / 13:45 / 15:45 ET |
 | `agent-sweep` (Cloud Run Job) | Exit management only, no model call. Every 10 min |
+| `agent-settle` (Cloud Run Job) | Settle the shadow ledger and run the learning step. 16:30 ET |
 | `dashboard` (Cloud Run service) | Public decision log, scale-to-zero |
 | Firestore | The journal |
 | Secret Manager | Alpaca and Anthropic credentials, injected at runtime |
@@ -214,13 +249,19 @@ Four bugs that only a real fill could surface, each of which would have cost mon
 agent/
   config.py            limits, event timing, the account guard
   models.py            TradeProposal / OpenSpread; derived risk lives here
-  regime.py            regime -> budget and permitted direction, per sleeve
-  risk.py              the 16 gates
+  regime.py            tape read from the bars; regime -> budget and permitted sides
+  risk.py              the 23 gates
   manage.py            exit rules, structure-aware
   brain.py             Claude Opus 5, structured output
   alpaca_cli.py        the execution boundary
   journal.py           SQLite (local) / Firestore (cloud), one interface
   loop.py              one cycle: observe -> manage -> reason -> gate -> execute
+  candidates.py        every vertical the rules could permit; the model's menu and the ledger rows
+  shadow.py            settle ledger claims against real prices
+  shadow_stats.py      effective n, gate regret, calibration, view x structure
+  rules.py             the tunable dials, their ladders, the rules version
+  learning.py          one dial, one rung, on evidence, checked later
+  sizing.py            the size ladder
 dashboard/             FastAPI + a single self-contained page
 tests/                 97 tests
 ```

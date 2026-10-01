@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import anthropic
 
-from .config import TARGET_EXPIRY, UNIVERSE, RiskLimits
+from .config import ET, TARGET_EXPIRY, UNIVERSE, RiskLimits
+from . import usage as usage_mod
 from .models import AgentDecision, parse_strike
+from .regime import TapeRead
 
 PER_WING_CAP = 30   # per underlying, per side
+_L = RiskLimits()   # the prompt quotes limits from config so the two cannot drift
 
 SYSTEM = f"""\
 You are the reasoning layer of an autonomous options trading agent competing in \
@@ -23,48 +26,55 @@ right and let the gates do their job.
 MANDATE
 - Universe: {', '.join(UNIVERSE)}. Nothing else.
 - Expiry: exactly the TARGET EXPIRY given in the snapshot, and nothing else.
-  It is chosen to sit a few days out, so the position is never left to a 0DTE
-  pin. A proposal for any other date is rejected before it reaches the broker.
+  It is chosen to sit at least a week out, so a strike one expected move away
+  clears the recent range. A proposal for any other date is rejected before
+  it reaches the broker.
 - Instrument: defined-risk vertical credit spreads. For puts the short strike is
   ABOVE the long strike; for calls it is BELOW.
-- TWO SLEEVES. Pick one per cycle and set `sleeve` accordingly.
-  * core (CREDIT spread): sell premium at roughly 0.25-0.30 delta on the short
-    strike; short strike NEARER the money than the long. Deliberately
-    aggressive: more credit, and a short strike that will be tested. Do not
-    drift back to 0.15. This is the workhorse and wins slowly and often.
-    Aim at 0.25-0.30, but note this is now ENFORCED in code: the delta_band
-    gate rejects any short leg outside 0.20-0.35, whichever way it drifts.
-  * satellite (DEBIT spread): buy a defined-risk directional spread WITH the
-    trend; long strike NEARER the money than the short. It loses the debit
-    more often than it wins, and pays multiples when a trend actually runs.
-    It exists to give the book convexity the core sleeve cannot produce.
-    Keep it small and only take it on real conviction.
-- `net_price` is always a POSITIVE number: the credit you require for core, or
-  the debit you will pay for satellite.
-  Satellite sleeve: directional, smaller, only on a clear catalyst.
+- ONE SLEEVE: `sleeve` is always "core", a CREDIT vertical spread. The
+  satellite (debit) sleeve is switched off in every regime; a satellite
+  proposal is rejected outright, so never propose one and never use it as a
+  fallback when the core has no legal strike -- stand down instead.
+  * core: sell premium with the short strike at least one expected move from
+    spot, and in a sideways tape also outside the recent range. The TAPE
+    READ section prints, per underlying, the range and the first strike on
+    each side that clears the range_buffer gate, judged with that strike's
+    own IV. Use that boundary; do not recompute the move from ATM vol,
+    because put skew makes the gate's number larger than yours. The short
+    leg usually lands near 0.10-0.20 delta. The delta_band gate rejects a
+    short leg outside 0.10-0.35. Keep the width tight (2-5 points): credit
+    as a fraction of width falls as the width grows, and the credit_floor
+    gate rejects anything under 10% of width.
+- `net_price` is always a POSITIVE number: the credit you require.
 
-YOUR REGIME CALL IS A BINDING CONTROL, NOT A COMMENT
-Whatever regime you report is applied deterministically before your trade is
-placed. It decides how much risk the tranche may carry and which direction of
-spread is allowed at all:
-  sideways -> core 12.00% (P or C credit). NO satellite: there is no trend to
-              buy, so paying a debit for convexity is burning premium.
-  bull     -> core 10.20% (P credit only; short calls fight the tape).
-              satellite 3.40% (C debit -- buy the uptrend).
-  bear     -> core 4.20% (C credit only; short puts into a downtrend is how
-              premium sellers blow up). satellite 1.40% (P debit).
-The sleeves lean opposite ways ON PURPOSE: core sells premium against the move,
-satellite buys exposure with it. Proposing a satellite trade in a sideways tape
-is rejected outright.
-So call the regime honestly. Saying "sideways" to unlock size you have not
-earned is the one thing that will actually lose this account money. If you
-propose a direction the regime forbids, the trade is rejected outright; if you
-propose a size above the regime budget, it is silently cut to fit.
+THE TAPE READ IS COMPUTED FOR YOU
+The snapshot carries, per underlying, a regime (bull / bear / sideways) read
+from the daily bars, the position of spot inside the recent range, the
+expected move to expiry, and the sides the core sleeve may sell. You do not
+set any of it. The budget and the permitted sides follow from it:
+  sideways -> core {_L.max_tranche_risk_pct * 1.00:.2%} per trade. Bottom quarter of the
+              range: puts only. Top quarter: calls only. Middle: either.
+  bull     -> core {_L.max_tranche_risk_pct * 0.85:.2%} per trade (P credit only).
+  bear     -> core {_L.max_tranche_risk_pct * 0.35:.2%} per trade (C credit only).
+Trades are deliberately small: up to {_L.max_same_direction} open spreads per side and
+{_L.max_entries_per_day} entries a day, inside a book capped at {_L.max_book_risk_pct:.0%} of equity (scaled down
+by the most defensive read in the universe). The BOOK section shows the room
+that is left; a proposal is cut to fit it.
+A side the read forbids is rejected outright; a size above the budget is
+silently cut to fit. If no side is permitted in the name you like, stand down
+or pick another name.
 
 HOW TO THINK
-- Read the regime first. In a sideways or mildly bullish tape, put credit
-  spreads are the bread and butter. In a sharp downtrend, either stand down or
-  move to call spreads above resistance.
+- The snapshot ends with ELIGIBLE CANDIDATES: every vertical on the permitted
+  sides that already passes the per-trade gates (liquidity including open
+  interest, delta band, range buffer, credit floor, leg overlap), computed
+  by the same code that will judge your proposal. Choose from that list, and
+  use its strikes exactly. If it is empty, stand down. Your judgement is which
+  candidate, what size, what credit to ask between natural and mid, and
+  whether to trade at all -- not whether a strike is legal.
+- Read the tape section first. Sell the side it permits, at a strike beyond
+  the range and the expected move. A range that has just moved to one edge
+  is a mean-reversion risk, not a trend to lean on.
 - Prefer strikes with tight bid-ask and real open interest. A theoretical edge
   on an illiquid contract is not an edge.
 - Standing down is a valid and often correct decision. Propose null rather than
@@ -89,10 +99,66 @@ WHAT YOU MUST NOT DO
 """
 
 
+def _boundary_line(sym: str, read: TapeRead, quote: dict, chain: dict, now,
+                   target_expiry: str, limits: RiskLimits) -> str:
+    """Where the range_buffer gate starts passing, per side, from the chain itself.
+
+    Each strike is judged with its own IV, exactly as the gate will judge it,
+    so put skew is already in the number the model reads.
+    """
+    from datetime import date
+    from .risk import range_clearance
+    bid, ask = quote.get("bp"), quote.get("ap")
+    if not (bid and ask):
+        return "range_buffer boundary: no quote"
+    spot = (float(bid) + float(ask)) / 2
+    dte = max((date.fromisoformat(target_expiry) - now.date()).days, 1)
+    best: dict[str, tuple[float, float | None]] = {}
+    for osym, snap in chain.items():
+        iv = snap.get("impliedVolatility")
+        if iv is None:
+            continue
+        right = osym[len(sym) + 6]
+        strike = parse_strike(osym)
+        if not range_clearance(right, strike, spot, float(iv), dte, read, limits).ok:
+            continue
+        cur = best.get(right)
+        # puts: the highest clearing strike; calls: the lowest
+        if cur is None or (strike > cur[0] if right == "P" else strike < cur[0]):
+            best[right] = (strike, (snap.get("greeks") or {}).get("delta"))
+    parts = []
+    for right, word, op in (("P", "puts", "<="), ("C", "calls", ">=")):
+        if right in best:
+            k, d = best[right]
+            dd = f", delta {abs(float(d)):.2f}" if d is not None else ""
+            parts.append(f"{word} clear at {op} {k:g}{dd}")
+        else:
+            parts.append(f"no {word[:-1]} strike in the chain clears")
+    return f"range_buffer boundary ({dte} DTE, each strike at its own IV): " + "; ".join(parts)
+
+
 class Brain:
-    def __init__(self, model: str = "claude-opus-5", client: anthropic.Anthropic | None = None):
+    def __init__(self, model: str = "claude-opus-5-5", client: anthropic.Anthropic | None = None):
         self.model = model
         self.client = client or anthropic.Anthropic()
+        self.last_usage: dict | None = None      # tokens and cost of the most recent call
+
+    def preflight(self) -> None:
+        """One cheap call so a dead key or an empty balance fails loudly and early.
+
+        On 2026-09-07 the entry cycle fetched every quote, chain and headline,
+        then died on 'credit balance is too low'. Check the API before paying
+        for any of that. Raises the SDK's own exception on failure.
+        """
+        # Adaptive thinking at low effort, one token out: Opus 5.5 rejects
+        # thinking.type "disabled" outright, and the point here is only to
+        # prove the key and the balance, not to get an answer.
+        response = self.client.messages.create(
+            model=self.model, max_tokens=1,
+            thinking={"type": "adaptive"}, output_config={"effort": "low"},
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        self.last_usage = usage_mod.summarise(getattr(response, "usage", None), self.model)
 
     def decide(self, snapshot: str, limits: RiskLimits) -> AgentDecision:
         """Return a structured decision, or a stand-down if the model declines."""
@@ -105,9 +171,9 @@ class Brain:
             messages=[{"role": "user", "content": snapshot}],
             output_format=AgentDecision,
         )
+        self.last_usage = usage_mod.summarise(getattr(response, "usage", None), self.model)
         if getattr(response, "stop_reason", None) == "refusal":
             return AgentDecision(
-                regime="sideways",
                 reasoning="Model declined to answer this cycle; standing down.",
                 proposal=None,
             )
@@ -126,6 +192,12 @@ def build_snapshot(
     bars: dict[str, list] | None = None,
     news: list[dict] | None = None,
     target_expiry: str = TARGET_EXPIRY,
+    tape: dict[str, TapeRead] | None = None,
+    sides: dict[str, tuple] | None = None,
+    recent_spreads: list[dict] | None = None,
+    candidate_lines: list[str] | None = None,
+    book_lines: list[str] | None = None,
+    base_rates: dict | None = None,
 ) -> str:
     """Render the market state as text for the model.
 
@@ -172,6 +244,34 @@ def build_snapshot(
             f"{b['t'][5:10]} o{b['o']:.2f} h{b['h']:.2f} l{b['l']:.2f} c{b['c']:.2f}"
             for b in series[-8:]))
 
+    lines += ["", "TAPE READ (computed from the bars; binding):"]
+    if tape:
+        for sym, read in tape.items():
+            allowed = "/".join((sides or {}).get(sym, ())) or "none"
+            if read.range_position is None:
+                lines.append(f"  {sym}: {read.regime} -- {read.detail}; core may sell: {allowed}")
+                continue
+            lines.append(
+                f"  {sym}: {read.regime}, range {read.lookback_low:.2f}-{read.lookback_high:.2f}, "
+                f"position {read.range_position:.0%}, {read.trend_pct:+.2%} vs "
+                f"{limits.range_lookback} sessions ago; core may sell: {allowed}")
+            lines.append("    " + _boundary_line(sym, read, quotes.get(sym) or {},
+                                                 chains.get(sym) or {}, now, target_expiry, limits))
+    else:
+        lines.append("  (unavailable)")
+
+    from .risk import cadence_state
+    opened_today, cooling = cadence_state(recent_spreads or [], now, limits)
+    lines += ["", "CADENCE (binding):",
+              f"  entries today: {opened_today} of max {limits.max_entries_per_day}"
+              + (" -- NO further entries today; stand down" if opened_today >= limits.max_entries_per_day else "")]
+    if cooling:
+        lines.append("  cooling down (do not propose these; the cadence gate rejects them):")
+        for u, r, until in sorted(cooling, key=lambda x: x[2]):
+            lines.append(f"    {u} {r} until {until.astimezone(ET):%m-%d %H:%M ET}")
+    else:
+        lines.append("  no cooldowns in force")
+
     lines += ["", f"OPTION CHAINS ({target_expiry}), tradeable delta band:"]
     for sym, chain in chains.items():
         lines.append(f"  --- {sym} ---")
@@ -210,8 +310,15 @@ def build_snapshot(
             lines.append(f"    ({dropped} far-OTM contracts omitted; both wings shown)")
 
     from .macro import macro_headlines, upcoming
-    events = upcoming(within_days=3, today=now.date())
-    lines += ["", "SCHEDULED RELEASES (next 3 days) -- short premium is short gamma:"]
+    from datetime import date as _date
+    # Look through the whole holding period, not a fixed three days: with a
+    # week-out expiry a three-day window hid the 2026-09-16 FOMC decision.
+    try:
+        horizon = max(3, (_date.fromisoformat(target_expiry) - now.date()).days)
+    except ValueError:
+        horizon = 3
+    events = upcoming(within_days=horizon, today=now.date())
+    lines += ["", f"SCHEDULED RELEASES (next {horizon} days, through expiry) -- short premium is short gamma:"]
     if events:
         for e in events:
             when = "TODAY" if e["days_away"] == 0 else f"in {e['days_away']}d"
@@ -219,9 +326,9 @@ def build_snapshot(
             lines.append(f"       {e['impact']}")
     else:
         lines.append("  (none in the next 3 days)")
-    lines.append("  NOTE: only structurally-dated releases are listed (weekly claims,"
-                 " first-Friday payrolls). Other prints -- PCE, CPI, ISM, FOMC -- are not"
-                 " scheduled here; infer them from the headlines below.")
+    lines.append("  NOTE: listed from published schedules: weekly claims, payrolls, CPI,"
+                 " PCE, FOMC decision days. Other prints -- ISM, retail sales, GDP -- are"
+                 " not scheduled here; infer them from the headlines below.")
 
     macro = macro_headlines(news or [])
     lines += ["", "MACRO HEADLINES (what has actually printed, and Fed tone):"]
@@ -237,6 +344,24 @@ def build_snapshot(
             lines.append(f"  [{(n.get('created_at') or '')[:16]}] {n.get('headline','')}")
     else:
         lines.append("  (none available)")
+
+    lines += book_lines or []
+    lines += candidate_lines or []
+
+    # What this account's own settled ledger says about claims like these.
+    # Information for the model; no gate reads it.
+    if base_rates is not None:
+        lines += ["", "MEASURED BASE RATES (this account's settled shadow ledger; information, not a rule):"]
+        shown = 0
+        for bucket, c in base_rates.items():
+            if c.get("n_eff", 0) < limits.learn_min_n:
+                continue
+            shown += 1
+            lines.append(f"  delta {bucket}: claims held {c['realized_hold']:.0%} of the time, market priced "
+                         f"{c['implied_hold']:.0%} (edge {c['edge']:+.0%}); mean return per $ risked "
+                         f"{c['mean_ret_hold']:+.2f}; effective n {c['n_eff']:.0f}")
+        if not shown:
+            lines.append("  not enough data yet to say anything")
 
     lines += [
         "",

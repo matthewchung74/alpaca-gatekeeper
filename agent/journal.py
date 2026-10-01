@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS cycles (
     gates        TEXT,           -- JSON: [{name, passed, detail}]
     action       TEXT NOT NULL,  -- submitted | blocked | stood_down | error
     order_id     TEXT,
-    error        TEXT
+    error        TEXT,
+    usage        TEXT            -- JSON: tokens and cost of this cycle's model call
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_ts ON cycles(ts);
 
@@ -66,6 +67,30 @@ CREATE TABLE IF NOT EXISTS spreads (
     close_order_id TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_spreads_status ON spreads(profile, status);
+
+CREATE TABLE IF NOT EXISTS locks (
+    name     TEXT PRIMARY KEY,
+    holder   TEXT NOT NULL,
+    expires  REAL NOT NULL           -- unix seconds
+);
+
+-- The shadow ledger: every candidate spread each entry cycle saw, traded or
+-- not, with the claim it registered, settled later against real prices.
+CREATE TABLE IF NOT EXISTS shadow (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    profile       TEXT NOT NULL,
+    expiry        TEXT NOT NULL,
+    rules_version INTEGER NOT NULL DEFAULT 0,
+    rows          TEXT NOT NULL,      -- JSON list
+    settled_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_open ON shadow(profile, settled_at, expiry);
+
+CREATE TABLE IF NOT EXISTS rules (
+    profile  TEXT PRIMARY KEY,
+    doc      TEXT NOT NULL            -- JSON: version, overrides, in_flight, locks, history
+);
 """
 
 
@@ -75,6 +100,11 @@ class SQLiteJournal:
         self.path = path
         with self._conn() as c:
             c.executescript(SCHEMA)
+            # Columns added after a journal was created: CREATE TABLE IF NOT
+            # EXISTS leaves an existing table alone, so add them here.
+            have = {r["name"] for r in c.execute("PRAGMA table_info(cycles)")}
+            if "usage" not in have:
+                c.execute("ALTER TABLE cycles ADD COLUMN usage TEXT")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -99,18 +129,19 @@ class SQLiteJournal:
         equity: float | None = None,
         order_id: str | None = None,
         error: str | None = None,
+        usage: Any = None,
     ) -> int:
         with self._conn() as c:
             cur = c.execute(
                 """INSERT INTO cycles
                    (ts, profile, regime, equity, snapshot, reasoning, proposal,
-                    gates, action, order_id, error)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    gates, action, order_id, error, usage)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     datetime.now().astimezone().isoformat(),
                     profile, regime, equity,
                     _dumps(snapshot), reasoning, _dumps(proposal), _dumps(gates),
-                    action, order_id, error,
+                    action, order_id, error, _dumps(usage),
                 ),
             )
             return cur.lastrowid
@@ -164,6 +195,82 @@ class SQLiteJournal:
                  realized_pnl, close_order_id, spread_id),
             )
 
+    # --- one job at a time ------------------------------------------------
+
+    def acquire_lock(self, name: str, holder: str, ttl_s: int) -> bool:
+        """Take the account's lock unless someone else holds a live one."""
+        import time
+        now = time.time()
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT holder, expires FROM locks WHERE name = ?", (name,)).fetchone()
+            if row and row["expires"] > now and row["holder"] != holder:
+                return False
+            c.execute("INSERT OR REPLACE INTO locks (name, holder, expires) VALUES (?,?,?)",
+                      (name, holder, now + ttl_s))
+            return True
+
+    def release_lock(self, name: str, holder: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM locks WHERE name = ? AND holder = ?", (name, holder))
+
+    # --- rules versions --------------------------------------------------------
+
+    def get_rules(self, profile: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT doc FROM rules WHERE profile = ?", (profile,)).fetchone()
+        return json.loads(row["doc"]) if row else None
+
+    def put_rules(self, profile: str, doc: dict) -> None:
+        with self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO rules (profile, doc) VALUES (?, ?)",
+                      (profile, json.dumps(doc, default=str)))
+
+    # --- the shadow ledger ---------------------------------------------------
+
+    def record_shadow(self, *, profile: str, ts: str, expiry: str, rules_version: int,
+                      rows: list[dict]) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO shadow (ts, profile, expiry, rules_version, rows) VALUES (?,?,?,?,?)",
+                (ts, profile, expiry, rules_version, json.dumps(rows, default=str)))
+            return cur.lastrowid
+
+    def mark_shadow(self, shadow_id, *, chosen=None, traded=None) -> None:
+        """Flag the row matching (u, r, ks, kl) as the model's pick, or as filled."""
+        with self._conn() as c:
+            row = c.execute("SELECT rows FROM shadow WHERE id = ?", (shadow_id,)).fetchone()
+            if not row:
+                return
+            rows = _mark(json.loads(row["rows"]), chosen, traded)
+            c.execute("UPDATE shadow SET rows = ? WHERE id = ?", (json.dumps(rows), shadow_id))
+
+    def unsettled_shadow(self, profile: str, on_or_before: str) -> list[dict]:
+        with self._conn() as c:
+            found = c.execute(
+                "SELECT * FROM shadow WHERE profile = ? AND settled_at IS NULL AND expiry <= ? "
+                "ORDER BY id", (profile, on_or_before)).fetchall()
+        return [_shadow_doc(r) for r in found]
+
+    def settle_shadow(self, shadow_id, rows: list[dict]) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE shadow SET rows = ?, settled_at = ? WHERE id = ?",
+                      (json.dumps(rows, default=str), datetime.now().astimezone().isoformat(),
+                       shadow_id))
+
+    def settled_shadow(self, profile: str, since: str | None = None) -> list[dict]:
+        with self._conn() as c:
+            found = c.execute(
+                "SELECT * FROM shadow WHERE profile = ? AND settled_at IS NOT NULL "
+                "AND ts >= ? ORDER BY id", (profile, since or "")).fetchall()
+        return [_shadow_doc(r) for r in found]
+
+    def reduce_spread(self, spread_id, *, qty: int, realized_pnl: float) -> None:
+        """A partial close: fewer contracts remain, and some P&L is banked."""
+        with self._conn() as c:
+            c.execute("UPDATE spreads SET qty = ?, realized_pnl = ? WHERE id = ?",
+                      (qty, realized_pnl, spread_id))
+
     def all_spreads(self, profile: str) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(
@@ -197,14 +304,39 @@ class SQLiteJournal:
                 ).fetchall()
         return [dict(r) for r in rows]
 
-    def day_start_equity(self, day: str) -> float | None:
-        """First recorded equity on a given YYYY-MM-DD, for the daily-loss gate."""
+    def day_start_equity(self, day: str, profile: str | None = None) -> float | None:
+        """First recorded equity on a given YYYY-MM-DD. A fallback only: the
+        daily-loss baseline is the broker's prior close (loop.day_start_equity)."""
         with self._conn() as c:
-            row = c.execute(
-                "SELECT equity FROM marks WHERE ts LIKE ? ORDER BY id ASC LIMIT 1",
-                (f"{day}%",),
-            ).fetchone()
+            if profile is None:
+                row = c.execute(
+                    "SELECT equity FROM marks WHERE ts LIKE ? ORDER BY id ASC LIMIT 1",
+                    (f"{day}%",),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT equity FROM marks WHERE ts LIKE ? AND profile = ? "
+                    "ORDER BY id ASC LIMIT 1", (f"{day}%", profile),
+                ).fetchone()
         return row["equity"] if row else None
+
+
+def _mark(rows: list[dict], chosen, traded) -> list[dict]:
+    for flag, key in (("chosen", chosen), ("traded", traded)):
+        if key is None:
+            continue
+        u, r, ks, kl = key
+        for row in rows:
+            if (row.get("u"), row.get("r"), float(row.get("ks")), float(row.get("kl"))) == \
+                    (u, r, float(ks), float(kl)):
+                row[flag] = True
+    return rows
+
+
+def _shadow_doc(r) -> dict:
+    d = dict(r)
+    d["rows"] = json.loads(d["rows"]) if isinstance(d.get("rows"), str) else (d.get("rows") or [])
+    return d
 
 
 def _dumps(v: Any) -> str | None:

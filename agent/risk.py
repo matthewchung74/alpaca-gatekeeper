@@ -7,12 +7,14 @@ broker. Gate zero is the account guard, which cannot be reached by any prompt.
 """
 from __future__ import annotations
 
+import math
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from typing import NamedTuple
 
 from . import regime as regime_mod
 from .config import (
-    COMPETITION_PROFILE, TARGET_EXPIRY, UNIVERSE, RiskLimits,
+    COMPETITION_PROFILE, ET, TARGET_EXPIRY, UNIVERSE, RiskLimits,
     AccountGuardError, assert_may_trade, in_no_trade_window,
 )
 from .models import GateResult, TradeProposal, occ_symbol
@@ -37,9 +39,17 @@ def evaluate(
     quotes: dict | None = None,
     target_expiry: str | None = None,
     open_spreads: list[dict] | None = None,
+    tape: regime_mod.TapeRead | None = None,
+    open_marks: dict | None = None,
+    recent_spreads: list[dict] | None = None,
+    session: tuple | None = None,
+    book_regime: str | None = None,
 ) -> list[GateResult]:
     """Run every gate. Order matters only for readability; all of them run."""
     g: list[GateResult] = []
+    if tape is not None:
+        regime = tape.regime
+    spot = _mid((quotes or {}).get(proposal.underlying) or {})
 
     # --- Gate 0: account guard -------------------------------------------
     try:
@@ -65,8 +75,9 @@ def evaluate(
     ))
 
     # --- Gate 3: event drawdown ------------------------------------------
-    from .config import STARTING_EQUITY
-    dd = (equity - STARTING_EQUITY) / STARTING_EQUITY
+    from .config import starting_equity_for
+    start = starting_equity_for(profile)
+    dd = (equity - start) / start
     ok = dd > -limits.max_event_drawdown_pct
     g.append(GateResult(
         name="event_drawdown", passed=ok,
@@ -109,16 +120,24 @@ def evaluate(
     ))
 
     # --- Gate 8: regime direction ----------------------------------------
-    # Selling puts into a downtrend is how short-premium accounts die. The
-    # agent's own regime call is what forbids it.
-    ok = regime_mod.direction_allowed(regime, proposal.right, proposal.sleeve)
+    # Selling puts into a downtrend is how short-premium accounts die. In a
+    # range, selling the side the tape just moved away from is how the
+    # 2026-09-01 book died: bottom of the range forbids short calls, top
+    # forbids short puts. Computed from the bars, never from the model.
     pol = regime_mod.policy_for(regime)
-    permitted = (pol.satellite_rights if proposal.sleeve == "satellite"
-                 else pol.allowed_rights)
+    if tape is not None and proposal.sleeve == "core":
+        permitted = regime_mod.core_sides(tape, limits)
+        why = (pol.rationale if tape.regime != "sideways" or tape.range_position is None
+               else f"range position {tape.range_position:.0%}")
+    else:
+        permitted = (pol.satellite_rights if proposal.sleeve == "satellite"
+                     else pol.allowed_rights)
+        why = pol.rationale
+    ok = proposal.right in permitted
     g.append(GateResult(
         name="regime_direction", passed=ok,
         detail=(f"{regime} permits {'/'.join(permitted) or 'nothing'} for the "
-                f"{proposal.sleeve} sleeve; proposal is {proposal.right} -- {pol.rationale}"),
+                f"{proposal.sleeve} sleeve; proposal is {proposal.right} -- {why}"),
     ))
 
     # --- Gate 9: sleeve risk budget (regime-adjusted) --------------------
@@ -145,21 +164,24 @@ def evaluate(
     ))
 
     # --- Gate 11: position count -----------------------------------------
-    ok = len(open_positions) < limits.max_concurrent_positions
+    # Spreads, from the journal. This counted broker LEGS, so a limit of 8
+    # silently meant four spreads.
+    n_open = len(open_spreads or [])
+    ok = n_open < limits.max_concurrent_positions
     g.append(GateResult(
         name="position_count", passed=ok,
-        detail=f"{len(open_positions)} open vs max {limits.max_concurrent_positions}",
+        detail=f"{n_open} open spreads vs max {limits.max_concurrent_positions}",
     ))
 
     # --- Gate 12: no-trade window ----------------------------------------
-    blocked = in_no_trade_window(now, limits)
+    blocked = in_no_trade_window(now, limits, session)
     g.append(GateResult(
         name="trading_window", passed=not blocked,
         detail=f"{now:%H:%M} {'inside' if blocked else 'outside'} the no-trade window",
     ))
 
     # --- Gate 13: liquidity ----------------------------------------------
-    g.append(_liquidity_gate(proposal, chain, limits))
+    g.append(_liquidity_gate(proposal, chain, limits, now))
 
     # --- Gate 14: short-leg delta ----------------------------------------
     g.append(_delta_gate(proposal, chain, limits))
@@ -167,10 +189,50 @@ def evaluate(
     # --- Gate 15: directional risk ---------------------------------------
     g.append(_directional_risk_gate(proposal, open_spreads or [], equity, limits))
 
+    # --- Gate 16: strike placement --------------------------------------
+    g.append(_range_buffer_gate(proposal, tape, chain, spot, now, limits))
+
+    # --- Gate 17: premium floor -----------------------------------------
+    g.append(_credit_floor_gate(proposal, limits))
+
+    # --- Gates 18-21: the shape of the whole book ------------------------
+    g.append(_book_risk_gate(proposal, open_spreads or [], equity,
+                             book_regime or regime, limits))
+    g.append(_same_direction_gate(proposal, open_spreads or [], limits))
+    g.append(_losing_side_gate(proposal, open_spreads or [], open_marks or {}, limits))
+    g.append(_cadence_gate(proposal, recent_spreads or [], now, limits))
+
+    # --- Gate 22: no shared contracts ------------------------------------
+    g.append(_leg_overlap_gate(proposal, open_spreads or []))
+
     return g
 
 
-def _liquidity_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits) -> GateResult:
+_TS = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)?$")
+
+
+def _quote_age_minutes(t, now: datetime) -> float | None:
+    """Age of an Alpaca quote timestamp (RFC 3339, nanosecond fraction, UTC).
+
+    Parsed by pattern, not by stripping characters. The first version pulled
+    "digits" out of everything after the dot, which swallowed the UTC offset,
+    lost the zone, and read an hour-old quote as three hours in the future --
+    and a negative age passed the freshness check (Codex follow-up, 2026-09-18).
+    """
+    m = _TS.match(str(t or "").strip())
+    if not m:
+        return None
+    head, frac, zone = m.groups()
+    zone = "+00:00" if zone in (None, "Z") else zone       # Alpaca stamps UTC
+    try:
+        ts = datetime.fromisoformat(head + (f".{frac[:6]}" if frac else "") + zone)
+    except ValueError:
+        return None
+    return (now - ts).total_seconds() / 60.0
+
+
+def _liquidity_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits,
+                    now: datetime) -> GateResult:
     """Both legs must be real, quoted, and tight.
 
     Doubles as P&L credibility: Alpaca paper can fill wide-spread illiquid
@@ -178,29 +240,62 @@ def _liquidity_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits) ->
     would spot a P&L built on that.
     """
     problems: list[str] = []
+    codes: set[str] = set()
     for label, strike in (("short", proposal.short_strike), ("long", proposal.long_strike)):
         sym = occ_symbol(proposal.underlying, proposal.expiry, proposal.right, strike)
         snap = chain.get(sym)
         if not snap:
             problems.append(f"{label} leg {sym} not in chain")
+            codes.add("missing")
             continue
         q = snap.get("latestQuote") or {}
         bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
         if bid <= 0 or ask <= 0:
             problems.append(f"{label} leg {sym} unquoted (bid={bid}, ask={ask})")
+            codes.add("unquoted")
             continue
+        # Codex review 2026-09-18: a crossed market stamped 2020 with no open
+        # interest used to pass. A quote is only a market if it is ordered,
+        # recent, and someone is actually there.
+        if ask < bid:
+            problems.append(f"{label} leg {sym} crossed (bid {bid} > ask {ask})")
+            codes.add("crossed")
+            continue
+        age = _quote_age_minutes(q.get("t"), now)
+        if age is None:
+            problems.append(f"{label} leg {sym} quote has no timestamp")
+            codes.add("notime")
+        elif age < -1.0:
+            problems.append(f"{label} leg {sym} quote is timestamped {-age:.0f} min in the "
+                            "future; clock or parse error, not a fresh quote")
+            codes.add("future")
+        elif age > limits.max_quote_age_minutes:
+            problems.append(f"{label} leg {sym} quote is stale ({age:.0f} min old)")
+            codes.add("stale")
+        if float(q.get("bs") or 0) <= 0 or float(q.get("as") or 0) <= 0:
+            problems.append(f"{label} leg {sym} has no displayed size")
+            codes.add("size")
         mid = (bid + ask) / 2
         if mid > 0 and (ask - bid) / mid > limits.max_spread_pct_of_mid:
             problems.append(
                 f"{label} leg {sym} spread {(ask - bid) / mid:.1%} > "
                 f"{limits.max_spread_pct_of_mid:.0%} of mid"
             )
+            codes.add("spread")
+        # The chain snapshot never carries open interest; the loop fetches it
+        # from the contracts endpoint before the gates. Missing fails closed:
+        # for two weeks this check passed because the number was never there.
         oi = snap.get("openInterest")
-        if oi is not None and int(oi) < limits.min_open_interest:
-            problems.append(f"{label} leg {sym} OI {oi} < {limits.min_open_interest}")
+        if oi is None:
+            problems.append(f"{label} leg {sym} open interest unknown")
+            codes.add("oi")
+        elif int(oi) < limits.min_open_interest:
+            problems.append(f"{label} leg {sym} open interest {oi} < {limits.min_open_interest}")
+            codes.add("oi")
 
     if problems:
-        return GateResult(name="liquidity", passed=False, detail="; ".join(problems))
+        return GateResult(name="liquidity", passed=False, detail="; ".join(problems),
+                          codes=sorted(f"liquidity:{c}" for c in codes))
     return GateResult(name="liquidity", passed=True,
                       detail="both legs quoted with acceptable spreads")
 
@@ -237,6 +332,7 @@ def _delta_gate(proposal: TradeProposal, chain: dict, limits: RiskLimits) -> Gat
     inside = lo <= d <= hi
     return GateResult(
         name="delta_band", passed=inside,
+        codes=[] if inside else [f"delta_band:{'low' if d < lo else 'high'}"],
         detail=(f"short {proposal.short_strike:g}{proposal.right} delta {d:.3f} "
                 f"{'within' if inside else 'OUTSIDE'} [{lo:.2f}, {hi:.2f}]"
                 + ("" if inside else
@@ -293,29 +389,343 @@ def _directional_risk_gate(
         return GateResult(name="directional_risk", passed=True,
                           detail="no equity reported; exposure unmeasurable")
 
-    held = 0.0
+    # Each tail on its own. This used to subtract the put wing from the call
+    # wing, so a 900 put spread and a 900 call spread reported zero -- but a
+    # condor still loses a whole wing whichever way the market runs, and
+    # across three tickers and two expiries the wings do not even share a
+    # payoff. Opposite sides never offset here.
+    rally = selloff = 0.0
     for row in open_spreads:
         try:
             loss = _spread_max_loss(row)
             up = _hurt_by_a_rally(row["right"], row.get("sleeve"))
         except (KeyError, TypeError, ValueError):
             continue
-        held += loss if up else -loss
+        if up:
+            rally += loss
+        else:
+            selloff += loss
 
-    mine = proposal.total_max_loss
-    marginal = mine if _hurt_by_a_rally(proposal.right, proposal.sleeve) else -mine
-    total = held + marginal
-    ratio = abs(total) / equity
+    mine_up = _hurt_by_a_rally(proposal.right, proposal.sleeve)
+    if mine_up:
+        rally += proposal.total_max_loss
+    else:
+        selloff += proposal.total_max_loss
+    side, amount = ("a rally", rally) if mine_up else ("a selloff", selloff)
+    ratio = amount / equity
     ok = ratio <= limits.max_directional_risk_pct
-    side = "a rally" if total > 0 else "a selloff"
 
     return GateResult(
         name="directional_risk", passed=ok,
-        detail=(f"{abs(total):,.0f} of {equity:,.0f} equity = {ratio:.1%} at risk on "
-                f"{side}, {'within' if ok else 'OVER'} "
+        detail=(f"{amount:,.0f} of {equity:,.0f} equity = {ratio:.1%} at risk on "
+                f"{side} with this trade, {'within' if ok else 'OVER'} "
                 f"{limits.max_directional_risk_pct:.0%} "
-                f"(held {held:+,.0f}, this trade {marginal:+,.0f})"),
+                f"(book after: rally {rally:,.0f}, selloff {selloff:,.0f}; sides never net)"),
     )
+
+def _mid(q: dict) -> float | None:
+    try:
+        bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (bid + ask) / 2 if bid > 0 and ask > 0 else None
+
+
+class Clearance(NamedTuple):
+    ok: bool
+    dist: float        # short strike's distance from spot, signed so OTM is positive
+    need: float        # expected_move_multiple x expected move
+    em: float          # one expected move to expiry, in points
+    inside: bool       # strike inside the lookback high-low
+
+
+def range_clearance(right: str, strike: float, spot: float, iv: float, dte: int,
+                    tape, limits: RiskLimits) -> Clearance:
+    """Does a short strike clear the range AND one expected move?
+
+    One function, used by the gate and by the snapshot, so the number the
+    model is shown is the number the gate checks. On 2026-09-09 the model
+    sized the move from ATM vol and the gate from the put's own skewed vol;
+    the strike was two points short and the cycle was wasted.
+    """
+    em = spot * float(iv) * math.sqrt(max(dte, 1) / 365.0)
+    need = limits.expected_move_multiple * em
+    dist = (strike - spot) if right == "C" else (spot - strike)
+    # The range veto only makes sense in a range. In a trend the old extreme
+    # is stale: after a 3-4% decline the 10-session high sits so far above
+    # spot that no call strike under it clears the delta floor, and the core
+    # had no legal trade for a week (2026-09-10 to 09-17). One expected move
+    # is the whole test there.
+    if tape.regime == "sideways":
+        inside = (strike <= tape.lookback_high) if right == "C" else (strike >= tape.lookback_low)
+    else:
+        inside = False
+    return Clearance(dist >= need and not inside, dist, need, em, inside)
+
+
+def _range_buffer_gate(proposal: TradeProposal, tape, chain: dict,
+                       spot: float | None, now: datetime, limits: RiskLimits) -> GateResult:
+    """The short strike must sit outside the recent range AND one expected move out.
+
+    Eight of nine hackathon short strikes were inside the prior five sessions'
+    high-low, 0.5-1.0% from spot at 1-4 DTE. Six finished in the money. Delta
+    alone cannot place a strike outside the noise at short DTE; this can.
+
+    Fails closed. A strike we cannot place relative to the tape is a strike
+    we do not sell.
+    """
+    if not proposal.is_credit:
+        # The satellite buys direction and can only lose its debit, which
+        # tranche_risk already bounds. Judging its far leg against an expected
+        # move is a credit-spread rule applied to the wrong structure.
+        return GateResult(name="range_buffer", passed=True, detail="debit spread; not applied")
+    if tape is None or tape.lookback_high is None or tape.lookback_low is None:
+        return GateResult(name="range_buffer", passed=False, codes=["range_buffer:nodata"],
+                          detail="no completed-session range available; cannot place the strike")
+    if spot is None:
+        return GateResult(name="range_buffer", passed=False, codes=["range_buffer:nodata"],
+                          detail=f"no quote for {proposal.underlying}; cannot measure distance")
+    sym = occ_symbol(proposal.underlying, proposal.expiry, proposal.right, proposal.short_strike)
+    iv = (chain.get(sym) or {}).get("impliedVolatility")
+    if iv is None:
+        return GateResult(name="range_buffer", passed=False, codes=["range_buffer:nodata"],
+                          detail=f"no IV published for short leg {sym}; cannot size the expected move")
+    dte = max((date.fromisoformat(proposal.expiry) - now.date()).days, 1)
+    k = proposal.short_strike
+    c = range_clearance(proposal.right, k, spot, float(iv), dte, tape, limits)
+    dist, need = c.dist, c.need
+    problems: list[str] = []
+    codes: list[str] = []
+    if dist < need:
+        problems.append(f"{dist:.2f} from spot < {limits.expected_move_multiple:g}x "
+                        f"expected move {c.em:.2f} ({dte} DTE, IV {float(iv):.1%})")
+        codes.append("range_buffer:em")
+    if c.inside:
+        codes.append("range_buffer:range")
+        problems.append(f"short {k:g} inside the {limits.range_lookback}-session range "
+                        f"{tape.lookback_low:.2f}-{tape.lookback_high:.2f}")
+    if problems:
+        return GateResult(name="range_buffer", passed=False, detail="; ".join(problems),
+                          codes=codes)
+    return GateResult(name="range_buffer", passed=True,
+                      detail=(f"short {k:g} is {dist:.2f} from spot {spot:.2f} "
+                              f"(>= {need:.2f}) and outside {tape.lookback_low:.2f}-"
+                              f"{tape.lookback_high:.2f}"))
+
+
+def _credit_floor_gate(proposal: TradeProposal, limits: RiskLimits) -> GateResult:
+    """Premium must be worth the width. Satellite pays a debit; not its concern."""
+    if not proposal.is_credit:
+        return GateResult(name="credit_floor", passed=True, detail="debit spread; no floor")
+    frac = proposal.net_price / proposal.width if proposal.width > 0 else 0.0
+    ok = frac >= limits.min_credit_pct_of_width
+    return GateResult(
+        name="credit_floor", passed=ok,
+        detail=(f"credit {proposal.net_price:.2f} is {frac:.0%} of width {proposal.width:g} "
+                f"({'>=' if ok else '<'} {limits.min_credit_pct_of_width:.0%})"))
+
+
+def _leg_overlap_gate(proposal: TradeProposal, open_spreads: list[dict]) -> GateResult:
+    """A new spread may not reuse a contract an open spread already holds.
+
+    The broker nets positions per contract, the journal tracks them per
+    spread. Two lots sharing a leg reconcile in aggregate but cannot be sized
+    or closed lot by lot, and a close on one silently eats the other's hedge.
+    Until the journal allocates per lot, the overlap is refused at the door.
+    """
+    mine = {occ_symbol(proposal.underlying, proposal.expiry, proposal.right, k)
+            for k in (proposal.short_strike, proposal.long_strike)}
+    for r in open_spreads:
+        try:
+            theirs = {occ_symbol(r["underlying"], r["expiry"], r["right"], float(r[k]))
+                      for k in ("short_strike", "long_strike")}
+        except (KeyError, TypeError, ValueError):
+            continue
+        shared = mine & theirs
+        if shared:
+            return GateResult(
+                name="leg_overlap", passed=False,
+                detail=(f"{', '.join(sorted(shared))} is already a leg of open "
+                        f"{r['underlying']} {float(r['short_strike']):g}/{float(r['long_strike']):g}; "
+                        "spreads may not share a contract"))
+    return GateResult(name="leg_overlap", passed=True,
+                      detail="no contract shared with an open spread")
+
+
+def room_for_trade(*, equity: float, regime: str, book_regime: str, open_spreads: list[dict],
+                   right: str, sleeve: str, limits: RiskLimits) -> tuple[float, str]:
+    """Dollars of max loss a new trade may carry: the tightest of three budgets.
+
+    The tranche budget, what is left of the book budget, and what is left on
+    this trade's side of the directional cap. Sizing used to look at the
+    tranche alone, so a full-size proposal into a nearly full book was refused
+    by book_risk instead of being cut to fit. Downsizing beats blocking.
+    """
+    held = rally = selloff = 0.0
+    for row in open_spreads:
+        try:
+            loss = _spread_max_loss(row)
+            up = _hurt_by_a_rally(row["right"], row.get("sleeve"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        held += loss
+        if up:
+            rally += loss
+        else:
+            selloff += loss
+    up = _hurt_by_a_rally(right, sleeve)
+    budgets = {
+        "tranche": equity * regime_mod.budget_pct_for(regime, sleeve, limits),
+        "book": equity * limits.max_book_risk_pct
+                * regime_mod.policy_for(book_regime).size_multiplier - held,
+        ("rally" if up else "selloff") + " side": equity * limits.max_directional_risk_pct
+                                                  - (rally if up else selloff),
+    }
+    name, room = min(budgets.items(), key=lambda kv: kv[1])
+    room = max(room, 0.0)
+    return room, (f"room {room:,.0f}, set by the {name} budget (tranche {budgets['tranche']:,.0f}, "
+                  f"book {max(budgets['book'], 0):,.0f} left, "
+                  f"{'rally' if up else 'selloff'} side "
+                  f"{max(budgets[('rally' if up else 'selloff') + ' side'], 0):,.0f} left)")
+
+
+def _book_risk_gate(proposal: TradeProposal, open_spreads: list[dict], equity: float,
+                    regime: str, limits: RiskLimits) -> GateResult:
+    """Open max loss plus this trade, against a book budget the regime scales.
+
+    tranche_risk caps one trade; nothing capped the sum. Under "bear" the
+    tranche budget fell to 35% and the book simply opened four tranches.
+    """
+    held = 0.0
+    for row in open_spreads:
+        try:
+            held += _spread_max_loss(row)
+        except (KeyError, TypeError, ValueError):
+            continue
+    mult = regime_mod.policy_for(regime).size_multiplier
+    cap = equity * limits.max_book_risk_pct * mult
+    total = held + proposal.total_max_loss
+    ok = total <= cap
+    return GateResult(
+        name="book_risk", passed=ok,
+        detail=(f"open max loss {held:,.0f} + this trade {proposal.total_max_loss:,.0f} = "
+                f"{total:,.0f} vs book budget {cap:,.0f} "
+                f"({limits.max_book_risk_pct:.0%} of equity x {mult:.0%} {regime})"))
+
+
+def _same_direction_gate(proposal: TradeProposal, open_spreads: list[dict],
+                         limits: RiskLimits) -> GateResult:
+    """SPY, QQQ and IWM are one bucket. Count open core spreads on this right."""
+    same = [r for r in open_spreads
+            if r.get("right") == proposal.right and (r.get("sleeve") or "core") == "core"]
+    ok = proposal.sleeve != "core" or len(same) < limits.max_same_direction
+    names = ", ".join(f"{r.get('underlying')} {float(r.get('short_strike')):g}/"
+                      f"{float(r.get('long_strike')):g}" for r in same) or "none"
+    return GateResult(
+        name="same_direction", passed=ok,
+        detail=(f"{len(same)} open core {proposal.right} spread(s) across the universe "
+                f"({names}) vs max {limits.max_same_direction}"))
+
+
+def _losing_side_gate(proposal: TradeProposal, open_spreads: list[dict],
+                      open_marks: dict, limits: RiskLimits) -> GateResult:
+    """No adding to a side that is already being run over.
+
+    On 2026-09-02 at 11:46 ET a third short call spread was opened while the
+    first two marked about twice their credit. The snapshot showed the model
+    those positions; it added anyway. This is the gate that says no.
+    """
+    if proposal.sleeve != "core":
+        return GateResult(name="losing_side", passed=True, detail="satellite; not applied")
+    for r in open_spreads:
+        if r.get("right") != proposal.right or (r.get("sleeve") or "core") != "core":
+            continue
+        mark = open_marks.get(r.get("id"))
+        credit = float(r.get("entry_credit") or 0)
+        if mark is None or credit <= 0:
+            continue
+        ratio = float(mark) / credit
+        if ratio >= limits.losing_side_multiple:
+            return GateResult(
+                name="losing_side", passed=False,
+                detail=(f"{r.get('underlying')} {float(r.get('short_strike')):g}/"
+                        f"{float(r.get('long_strike')):g} {proposal.right} marks {float(mark):.2f} = "
+                        f"{ratio:.2f}x its {credit:.2f} credit (>= {limits.losing_side_multiple:g}x); "
+                        "not adding to a losing side"))
+    return GateResult(name="losing_side", passed=True,
+                      detail=f"no open {proposal.right} spread at or beyond "
+                             f"{limits.losing_side_multiple:g}x its credit")
+
+
+def _ts(s) -> datetime | None:
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(str(s))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=ET)
+
+
+def cadence_state(recent: list[dict], now: datetime, limits: RiskLimits) -> tuple[int, list[tuple[str, str, datetime]]]:
+    """Entries made today, and (underlying, right, cooldown-ends) for recent closes.
+
+    Shared with the snapshot so the model can route around a cooldown instead
+    of walking into it: on 2026-09-10 two of five cycles re-proposed the name
+    that had just closed.
+    """
+    today = now.astimezone(ET).date()
+    opened_today = sum(1 for r in recent
+                       if (t := _ts(r.get("ts_open"))) and t.astimezone(ET).date() == today)
+    window = timedelta(hours=limits.reentry_cooldown_hours)
+    cooling: list[tuple[str, str, datetime]] = []
+    for r in recent:
+        closed = _ts(r.get("ts_close"))
+        if closed and now - closed < window:
+            cooling.append((str(r.get("underlying")), str(r.get("right")), closed + window))
+    return opened_today, cooling
+
+
+def _cadence_gate(proposal: TradeProposal, recent: list[dict], now: datetime,
+                  limits: RiskLimits) -> GateResult:
+    """One entry a day, and no re-entry where a spread just closed.
+
+    Four cycles a day produced a proposal in every cycle with budget, and each
+    50% target exit was recycled the same day into a closer, shorter-dated
+    spread. Frequency was the strategy's variance, not its edge.
+    """
+    today = now.astimezone(ET).date()
+    opened_today = [r for r in recent
+                    if (t := _ts(r.get("ts_open"))) and t.astimezone(ET).date() == today]
+    if len(opened_today) >= limits.max_entries_per_day:
+        return GateResult(
+            name="cadence", passed=False,
+            detail=(f"{len(opened_today)} entr{'y' if len(opened_today) == 1 else 'ies'} "
+                    f"already today vs max {limits.max_entries_per_day}"))
+    window = timedelta(hours=limits.reentry_cooldown_hours)
+    for r in recent:
+        if r.get("underlying") != proposal.underlying or r.get("right") != proposal.right:
+            continue
+        closed = _ts(r.get("ts_close"))
+        if closed and now - closed < window:
+            return GateResult(
+                name="cadence", passed=False,
+                detail=(f"{proposal.underlying} {proposal.right} spread closed "
+                        f"{closed.astimezone(ET):%m-%d %H:%M ET}, inside the "
+                        f"{limits.reentry_cooldown_hours}h cooldown"))
+    return GateResult(name="cadence", passed=True,
+                      detail=(f"{len(opened_today)} entries today; no {proposal.underlying} "
+                              f"{proposal.right} close in the last {limits.reentry_cooldown_hours}h"))
+
+
+def failure_codes(gates: list[GateResult]) -> list[str]:
+    """Every cause a proposal was refused for, sorted. A gate with one possible
+    cause reports its own name; a gate with several reports "<gate>:<cause>"."""
+    out: set[str] = set()
+    for g in gates:
+        if not g.passed:
+            out.update(g.codes or [g.name])
+    return sorted(out)
 
 
 def all_passed(gates: list[GateResult]) -> bool:

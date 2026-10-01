@@ -218,7 +218,10 @@ def _pos(sym, qty="-5"):
 def test_held_when_short_leg_is_in_positions():
     from agent.manage import is_actually_held
     sp = spread()
-    assert is_actually_held(sp, [_pos(sp.short_symbol())])
+    assert is_actually_held(sp, [{"symbol": sp.short_symbol(), "qty": "-5"},
+                                 {"symbol": sp.long_symbol(), "qty": "5"}])
+    # the short alone is a naked leg, not a spread we can close as one
+    assert not is_actually_held(sp, [{"symbol": sp.short_symbol(), "qty": "-5"}])
 
 
 def test_not_held_when_positions_empty():
@@ -247,14 +250,16 @@ def test_not_held_when_a_different_contract_is_open():
 def test_held_qty_reads_the_short_leg():
     from agent.manage import held_qty
     sp = spread(qty=12)
-    assert held_qty(sp, [{"symbol": sp.short_symbol(), "qty": "-12"}]) == 12
+    assert held_qty(sp, [{"symbol": sp.short_symbol(), "qty": "-12"},
+                         {"symbol": sp.long_symbol(), "qty": "12"}]) == 12
 
 
 def test_held_qty_reports_a_partial_fill():
     """Journal says 12, broker says 7. Closing 12 could open a 5-lot short."""
     from agent.manage import held_qty
     sp = spread(qty=12)
-    assert held_qty(sp, [{"symbol": sp.short_symbol(), "qty": "-7"}]) == 7
+    assert held_qty(sp, [{"symbol": sp.short_symbol(), "qty": "-7"},
+                         {"symbol": sp.long_symbol(), "qty": "7"}]) == 7
 
 
 def test_held_qty_zero_when_absent():
@@ -323,3 +328,110 @@ def test_a_rising_mark_means_opposite_things_per_sleeve():
                       now=MIDWEEK, spot=740.0, limits=LIMITS)
     assert dbt.rule == "profit_target"
     assert crd.rule == "stop_loss"
+
+
+# --- a worthless protective leg is a price, not missing data ------------------
+
+def test_zero_bid_on_the_long_leg_still_marks_and_stops():
+    """Codex review 2026-09-18: credit 0.50, short ask 1.50, long bid 0.
+    A one-sided market (nobody bids, someone offers) values the long at zero;
+    the close costs 1.50, exactly the 3x stop. It used to return None and hold."""
+    sp = spread(entry_credit=0.50)
+    q = {sp.short_symbol(): {"ap": 1.50, "bp": 1.45},
+         sp.long_symbol(): {"ap": 0.03, "bp": 0}}
+    mark = mark_to_close(sp, q)
+    assert mark == pytest.approx(1.50)
+    d = decide_exit(sp, mark, now=MIDWEEK, spot=760.0, limits=LIMITS)
+    assert d.action == "close" and d.rule == "stop_loss"
+
+
+def test_zero_bid_on_the_long_leg_lets_the_profit_target_fire():
+    sp = spread(entry_credit=0.50)
+    q = {sp.short_symbol(): {"ap": 0.05, "bp": 0.03},
+         sp.long_symbol(): {"ap": 0.02, "bp": 0}}
+    mark = mark_to_close(sp, q)
+    assert mark == pytest.approx(0.05)
+    assert decide_exit(sp, mark, now=MIDWEEK, spot=790.0, limits=LIMITS).rule == "profit_target"
+
+
+def test_a_long_leg_with_no_market_at_all_is_still_missing():
+    """Bid 0 AND ask 0 is no quote, not a worthless option."""
+    sp = spread()
+    q = {sp.short_symbol(): {"ap": 1.50, "bp": 1.45},
+         sp.long_symbol(): {"ap": 0, "bp": 0}}
+    assert mark_to_close(sp, q) is None
+    assert mark_to_close(sp, {sp.short_symbol(): {"ap": 1.5, "bp": 1.45},
+                              sp.long_symbol(): {"ap": 0.03}}) is None
+
+
+def test_partial_close_pnl_is_per_quantity():
+    sp = spread(qty=10, entry_credit=0.50)
+    assert sp.realized_pnl(1.50, qty=4) == pytest.approx(-400.0)
+    assert sp.realized_pnl(2.00, qty=6) == pytest.approx(-900.0)
+    assert sp.realized_pnl(2.00) == pytest.approx(-1500.0)      # default is the full size
+
+
+def test_expiry_flatten_follows_an_early_close():
+    """13:00 close: a 15:30 flatten is two and a half hours too late."""
+    sp = spread(expiry="2026-11-27")
+    close_t = datetime(2026, 11, 27, 13, 0, tzinfo=ET)
+    at_1235 = datetime(2026, 11, 27, 12, 35, tzinfo=ET)
+    d = decide_exit(sp, 0.30, now=at_1235, spot=790.0, limits=LIMITS, close_t=close_t)
+    assert d.action == "close" and d.rule == "expiry_flatten"
+    assert decide_exit(sp, 0.30, now=at_1235, spot=790.0, limits=LIMITS).action == "hold"
+
+
+# --- early assignment around an ex-dividend date -----------------------------
+
+def _call(**kw):
+    return spread(right="C", short_strike=770.0, long_strike=775.0, entry_credit=0.50,
+                  expiry="2026-09-25", **kw)
+
+EVE = datetime(2026, 9, 17, 12, 0, tzinfo=ET)        # SPY went ex-dividend 2026-09-18, 1.89
+
+
+def test_short_call_near_the_money_is_closed_the_session_before_ex_dividend():
+    """A short call that is in or near the money the night before ex-date can be
+    exercised for the dividend, leaving short stock and the dividend owed."""
+    d = decide_exit(_call(), 0.90, now=EVE, spot=769.8, limits=LIMITS,
+                    ex_dividend=("2026-09-18", 1.89), next_session="2026-09-18")
+    assert d.action == "close" and d.rule == "dividend_assignment_risk"
+    assert "1.89" in d.reason
+
+
+def test_a_far_otm_short_call_rides_through_ex_dividend():
+    d = decide_exit(_call(), 0.30, now=EVE, spot=755.0, limits=LIMITS,
+                    ex_dividend=("2026-09-18", 1.89), next_session="2026-09-18")
+    assert d.action == "hold"
+
+
+def test_dividend_rule_waits_for_the_last_session_and_ignores_puts():
+    early = decide_exit(_call(), 0.90, now=EVE, spot=769.8, limits=LIMITS,
+                        ex_dividend=("2026-09-22", 1.89), next_session="2026-09-18")
+    assert early.rule != "dividend_assignment_risk"
+    over_a_weekend = decide_exit(_call(), 0.90, now=EVE, spot=769.8, limits=LIMITS,
+                                 ex_dividend=("2026-09-19", 1.89), next_session="2026-09-21")
+    assert over_a_weekend.rule == "dividend_assignment_risk"      # ex-date lands before the next session
+    put = spread(right="P", short_strike=770.0, long_strike=765.0, entry_credit=0.50, expiry="2026-09-25")
+    assert decide_exit(put, 0.90, now=EVE, spot=770.2, limits=LIMITS,
+                       ex_dividend=("2026-09-18", 1.89), next_session="2026-09-18").rule != "dividend_assignment_risk"
+
+
+def test_close_size_is_the_lot_not_the_whole_short_leg():
+    """Codex follow-up: a 10-lot 770/775 and a 5-lot 770/780 share the 770
+    short. held_qty returned |-15| for both, so each tried to close 15."""
+    from agent.manage import held_qty
+    positions = [{"symbol": "SPY260925C00770000", "qty": "-15"},
+                 {"symbol": "SPY260925C00775000", "qty": "10"},
+                 {"symbol": "SPY260925C00780000", "qty": "5"}]
+    ten = spread(right="C", short_strike=770.0, long_strike=775.0, qty=10, expiry="2026-09-25")
+    five = spread(right="C", short_strike=770.0, long_strike=780.0, qty=5, expiry="2026-09-25")
+    assert held_qty(ten, positions) == 10 and held_qty(five, positions) == 5
+
+
+def test_a_leg_held_the_wrong_way_round_is_not_a_holding():
+    from agent.manage import held_qty
+    sp = spread(right="C", short_strike=770.0, long_strike=775.0, qty=10, expiry="2026-09-25")
+    long_the_short = [{"symbol": "SPY260925C00770000", "qty": "10"},
+                      {"symbol": "SPY260925C00775000", "qty": "10"}]
+    assert held_qty(sp, long_the_short) == 0
