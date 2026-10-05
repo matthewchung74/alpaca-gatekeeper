@@ -218,8 +218,8 @@ Cloud Scheduler ──▶ Cloud Run Job ──▶ Alpaca CLI  +  Anthropic API
 |---|---|
 | `agent-cycle` (Cloud Run Job) | Full entry cycle. 09:45 / 11:45 / 13:45 / 15:45 ET |
 | `agent-sweep` (Cloud Run Job) | Exit management only, no model call. Every 10 min |
-| `agent-settle` (Cloud Run Job) | Settle the shadow ledger and run the learning step. 16:30 ET |
-| `agent-watch` (Cloud Run Job) | Outside health check. Alerts on a missing cycle, a stalled sweep, an unjournalled position. Every 15 min in session, hourly as a heartbeat |
+| `agent-settle` (Cloud Run Job) | Settle the shadow ledger and run the learning step. 09:15 ET, the morning after. `daily_close` refuses the current session's bar, so an expiry-day run settles nothing |
+| `agent-watch` (Cloud Run Job) | Outside health check. Alerts on a missing cycle, a stalled sweep, an unjournalled position, a ledger that stopped settling. Every 15 min in session, hourly as a heartbeat |
 | Cloud Monitoring | Three policies: a watchdog alert, a job that exited non-zero, and the heartbeat going quiet |
 | `dashboard` (Cloud Run service) | Public decision log, scale-to-zero |
 | Firestore | The journal |
@@ -267,7 +267,7 @@ agent/
   redteam.py           a hostile second look at the trade the gates allowed; recorded, not blocking
   watch.py             the outside health check; alerts do not depend on the agent
 dashboard/             FastAPI + a single self-contained page
-tests/                 265 tests
+tests/                 269 tests
 ```
 
 ## Running it

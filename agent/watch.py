@@ -8,8 +8,15 @@ lines into email, so the alerting path does not depend on the thing it watches.
 
 Checks: an entry cycle in the last ~2.5 hours, a sweep in the last 25 minutes,
 every broker position known to the journal, no journalled error in the last
-hour, and no order of ours working for more than half an hour. Outside the
-session it expects nothing and says so.
+hour, no order of ours working for more than half an hour, and no shadow-ledger
+document left unsettled long after its expiry. Outside the session it expects
+nothing and says so.
+
+That last check exists because the first four only prove things RAN. On
+2026-10-02 the settle job ran on schedule, warned, exited 0 and settled nothing
+-- it was scheduled on expiry day, and `daily_close` refuses to read the
+current session's bar -- and every check above was happy. A learning pipeline
+that quietly accomplishes nothing is the failure this watchdog is for.
 """
 from __future__ import annotations
 
@@ -23,6 +30,7 @@ from .config import ET, Settings, now_et
 CYCLE_STALE_MIN = 150       # entries run every 2h; 2.5h means one was missed
 SWEEP_STALE_MIN = 25        # sweeps run every 10 min
 ORDER_STALE_MIN = 30
+LEDGER_STALE_DAYS = 2       # business days after expiry; settle runs each morning
 OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
 
@@ -35,6 +43,16 @@ def _age(ts, now) -> float | None:
     return (now - d).total_seconds() / 60.0
 
 
+def business_days_ago(now, n: int) -> str:
+    """The date n business days before now. Weekends are not settle days."""
+    d = now.astimezone(ET).date()
+    while n > 0:
+        d -= timedelta(days=1)
+        if d.weekday() < 5:
+            n -= 1
+    return d.isoformat()
+
+
 def in_session(now) -> bool:
     local = now.astimezone(ET)
     if local.weekday() >= 5:
@@ -43,7 +61,8 @@ def in_session(now) -> bool:
 
 
 def check(*, cycles: list[dict], marks: list[dict], positions: list[dict],
-          journal_open: list[dict], open_orders: list[dict], now) -> dict:
+          journal_open: list[dict], open_orders: list[dict], now,
+          stale_ledger: list[dict] | None = None) -> dict:
     """Everything that should be true right now, and what is not."""
     if not in_session(now):
         return {"ok": True, "alerts": [], "note": "market closed; nothing expected"}
@@ -78,6 +97,12 @@ def check(*, cycles: list[dict], marks: list[dict], positions: list[dict],
         if c.get("action") == "error" and a is not None and a <= 60:
             alerts.append(f"journalled error {a:.0f} min ago: {str(c.get('error'))[:140]}")
 
+    if stale_ledger:
+        oldest = min(str(d.get("expiry") or "") for d in stale_ledger)
+        alerts.append(f"shadow ledger: {len(stale_ledger)} document(s) still unsettled more than "
+                      f"{LEDGER_STALE_DAYS} business days after expiry (oldest {oldest}); "
+                      f"the learning step has no new data")
+
     for o in open_orders:
         if not str(o.get("client_order_id") or "").startswith(("hack-", "exit-")):
             continue
@@ -110,7 +135,9 @@ def main() -> int:
     out = check(cycles=journal.recent_cycles(limit=40, profile=settings.profile),
                 marks=journal.equity_curve(settings.profile)[-5:],
                 positions=positions, journal_open=journal.open_spreads(settings.profile),
-                open_orders=orders, now=now)
+                open_orders=orders, now=now,
+                stale_ledger=journal.unsettled_shadow(
+                    settings.profile, on_or_before=business_days_ago(now, LEDGER_STALE_DAYS)))
     for a in out["alerts"]:
         print(f"GATEKEEPER ALERT {a}", file=sys.stderr)
     print(f"watch {now:%Y-%m-%d %H:%M %Z}: {'OK' if out['ok'] else str(len(out['alerts'])) + ' alert(s)'}"

@@ -71,3 +71,22 @@ def test_nothing_is_expected_outside_the_session():
     out = watch.check(cycles=[cyc(5000)], marks=[cyc(5000)], positions=[], journal_open=[],
                       open_orders=[], now=quiet)
     assert out["alerts"] == [] and "closed" in out["note"]
+
+
+def test_a_ledger_left_unsettled_long_after_expiry_is_an_alert():
+    """2026-10-02: settle ran, warned, exited 0 and settled nothing. Every
+    other check was happy, because they only prove things ran."""
+    out = watch.check(cycles=[cyc(70)], marks=[cyc(8)], positions=[], journal_open=[],
+                      open_orders=[], now=NOW,
+                      stale_ledger=[{"id": "a", "expiry": "2026-10-02"},
+                                    {"id": "b", "expiry": "2026-09-25"}])
+    assert any("2 document(s) still unsettled" in a and "oldest 2026-09-25" in a
+               for a in out["alerts"])
+
+
+def test_business_days_ago_steps_over_the_weekend():
+    """Settle runs on weekday mornings, so a Monday is one settle day after
+    the Friday before it, not three."""
+    monday = datetime(2026, 10, 5, 11, 0, tzinfo=ET)
+    assert watch.business_days_ago(monday, 1) == "2026-10-02"
+    assert watch.business_days_ago(monday, 2) == "2026-10-01"
